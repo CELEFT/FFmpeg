@@ -21,28 +21,23 @@ jobs:
       ndk-path: ${{ steps.setup-ndk.outputs.path }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip
-
       - name: Install Python & Meson
         run: pip3 install meson
-
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
-
       - name: Restore NDK Permissions
         if: steps.cache-ndk.outputs.cache-hit == 'true'
         run: chmod -R +x ${{ github.workspace }}/ndk
-
       - name: Download and Unpack NDK
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
@@ -51,11 +46,9 @@ jobs:
           mv android-ndk-r30* ${{ github.workspace }}/ndk
           rm ndk.zip
           chmod -R +x ${{ github.workspace }}/ndk
-
       - name: Set NDK Output Path
         id: setup-ndk
         run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
-
       - name: Upload NDK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -78,7 +71,10 @@ jobs:
               make -j$(nproc) && make install
           - name: x265
             build: |
-              git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git/build/linux
+              git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git
+              # 移除 -lpthread 链接依赖
+              sed -i 's/list(APPEND PLATFORM_LIBS pthread)/# list(APPEND PLATFORM_LIBS pthread)/' source/CMakeLists.txt
+              cd build/linux
               cmake -G "Unix Makefiles" \
                 -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
                 -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 \
@@ -100,10 +96,11 @@ jobs:
               git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
               export CROSS=$TOOLCHAIN/bin/llvm-
               export ASFLAGS="-D__ANDROID__"
+              export LDFLAGS="-Wl,-z,max-page-size=16384"
               ./configure --prefix=$PREFIX --target=arm64-android-gcc --libc=$SYSROOT \
                 --enable-vp8 --enable-vp9 --enable-static --enable-shared \
                 --disable-examples --disable-tools --disable-unit-tests \
-                --extra-cflags="-fPIC" --extra-ldflags="-Wl,-z,max-page-size=16384"
+                --extra-cflags="-fPIC"
               make -j$(nproc) && make install
           - name: libaom
             build: |
@@ -134,8 +131,8 @@ jobs:
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example \
-                --extra-cflags="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
+              export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
+              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example
               make -j$(nproc) && make install
           - name: lame
             build: |
@@ -170,7 +167,6 @@ jobs:
               make -j$(nproc) && make install_sw
           - name: ass-stack
             build: |
-              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no && make -j$(nproc) && make install && cd ..
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
@@ -178,8 +174,8 @@ jobs:
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
+              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install
-
     steps:
       - uses: actions/checkout@v4
       - name: Download NDK
@@ -243,16 +239,12 @@ jobs:
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
           echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
-          # 确保 pkg-config 能找到前置编译好的所有 .pc 文件（特别是 fdk-aac 等）
           echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
-
       - name: Download FFmpeg Source
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
-
-      # ---------- 1. 编译动态版 (Shared Binaries) ----------
       - name: Configure FFmpeg (Shared)
         working-directory: ffmpeg
         run: |
@@ -276,12 +268,9 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
-      
       - name: Build FFmpeg (Shared)
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
-
-      # ---------- 2. 编译纯静态版 (Static Binaries) ----------
       - name: Configure FFmpeg (Static)
         run: |
           cp -r ffmpeg ffmpeg-static
@@ -308,39 +297,24 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lpthread -lm -lz -ldl"
-
       - name: Build FFmpeg Static Binaries
         working-directory: ffmpeg-static
         run: |
-          # 这里只编译生成 ffmpeg 和 ffprobe 两个二进制文件
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
-
-      # ---------- 3. 收集所有产物 ----------
       - name: Collect output artifacts
         run: |
           mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/static/bin artifacts/include
-          
-          # 复制头文件 (通用)
           cp -r $PREFIX/include/* artifacts/include/
-          
-          # 1. 收集动态库 (Shared)
           cp $PREFIX/lib/*.so artifacts/shared/lib/ 2>/dev/null || true
           cp $PREFIX/bin/ffmpeg $PREFIX/bin/ffprobe artifacts/shared/bin/ 2>/dev/null || true
           $STRIP artifacts/shared/bin/* 2>/dev/null || true
-          
-          # 2. 收集静态库 (Static)
           cp $PREFIX/lib/*.a artifacts/static/lib/ 2>/dev/null || true
-          
-          # 3. 收集纯静态的二进制文件 (Static Bin)
           cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe artifacts/static/bin/
-          
-          # 保存构建信息
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > artifacts/BUILD_INFO.txt
           $PREFIX/bin/ffmpeg -buildconf >> artifacts/BUILD_INFO.txt 2>/dev/null || true
           cp artifacts/BUILD_INFO.txt artifacts/shared/
           cp artifacts/BUILD_INFO.txt artifacts/static/
-
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-final
@@ -374,12 +348,8 @@ jobs:
             - **Build Date**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
             - **NDK**: r30 (API 36)
             - **FFmpeg**: 9.0.2
-            
             ### Packages
             - **Shared package**: `lib/*.so`, `include/`, 动态链接的 `bin/ffmpeg` & `bin/ffprobe`
             - **Static package**: `lib/*.a`, `include/`, **纯静态链接的** `bin/ffmpeg` & `bin/ffprobe`
-            
-            ### Enabled External Libraries
-            x264, x265, dav1d, vpx, aom, svt-av1, vvenc, xeve, xevd, **fdk-aac**, lame, opus, vorbis, lc3, openssl, libass (freetype, fribidi, fontconfig)
           files: /tmp/ffmpeg-android-*.zip
           generate_release_notes: true
