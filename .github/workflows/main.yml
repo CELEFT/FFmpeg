@@ -19,7 +19,7 @@ env:
   TARGET_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  # ==================== Job 1: 准备 NDK (带缓存) ====================
+  # ==================== Job 1: 准备 NDK (带缓存与权限修复) ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -34,6 +34,13 @@ jobs:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
+      # ⚠️ 关键修复：恢复缓存后立即赋予执行权限
+      - name: Fix NDK Permissions (After Cache)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: |
+          echo "缓存命中，修复 NDK 执行权限..."
+          chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Download and Unpack NDK (Cache Miss Only)
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
@@ -42,7 +49,8 @@ jobs:
           unzip -q ndk.zip
           mv android-ndk-r30* ${{ github.workspace }}/ndk
           rm ndk.zip
-          echo "NDK 下载并配置完成"
+          chmod -R +x ${{ github.workspace }}/ndk
+          echo "NDK 下载、重命名及权限配置完成"
 
       - name: Set NDK Output Path
         id: setup-ndk
@@ -171,6 +179,10 @@ jobs:
           name: ndk
           path: ${{ github.workspace }}/ndk
       
+      # ⚠️ 双重保险：修复下载 Artifact 后的权限
+      - name: Fix NDK Permissions
+        run: chmod -R +x ${{ github.workspace }}/ndk
+      
       - name: Set environment
         run: |
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
@@ -212,6 +224,10 @@ jobs:
           pattern: prefix-*
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
+          
+      # ⚠️ 双重保险：修复下载 Artifact 后的权限
+      - name: Fix NDK Permissions
+        run: chmod -R +x ${{ github.workspace }}/ndk
           
       - name: Set environment
         run: |
