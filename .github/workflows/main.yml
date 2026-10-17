@@ -17,29 +17,28 @@ env:
   TARGET_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  # ==================== Job 1: 准备环境 ====================
+  # ==================== Job 1: 准备 NDK ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      ndk-dir: ${{ steps.find-ndk.outputs.dir }}
+      ndk-path: ${{ steps.setup-ndk.outputs.path }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential yasm nasm pkg-config wget unzip cmake meson ninja-build git autoconf automake libtool
-      - name: Download NDK
-        id: find-ndk
+      
+      - name: Download and Unpack NDK
+        id: setup-ndk
         run: |
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          NDK_DIR=$(find . -maxdepth 1 -type d -name "android-ndk-r30*" | head -1)
-          echo "dir=$(pwd)/$NDK_DIR" >> $GITHUB_OUTPUT
-      - name: Upload NDK
+          # 强制重命名为 ndk 并放置于绝对路径下，彻底杜绝 "." 和 ".."
+          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
+
+      - name: Upload NDK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ndk
-          path: ${{ steps.find-ndk.outputs.dir }}
+          path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
   # ==================== Job 2: 并行编译外部库 ====================
@@ -134,6 +133,21 @@ jobs:
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
               ./Configure android-arm64 -D__ANDROID_API__=${API_LEVEL} --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
+          - name: ass-stack
+            build: |
+              # 串行编译 libass 的依赖链: freetype -> fribidi -> fontconfig -> libass
+              git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              
+              git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              
+              git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
+              
+              git clone --depth 1 https://github.com/libass/libass.git && cd libass
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install
+
     steps:
       - uses: actions/checkout@v4
       - name: Download NDK
@@ -141,19 +155,22 @@ jobs:
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
+      
       - name: Set environment
         run: |
-          echo "NDK=$(pwd)/ndk" >> $GITHUB_ENV
-          echo "TOOLCHAIN=$(pwd)/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
-          echo "SYSROOT=$(pwd)/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
-          echo "PREFIX=$(pwd)/prefix" >> $GITHUB_ENV
+          echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
+          echo "TOOLCHAIN=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
+          echo "SYSROOT=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
+          echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
           echo "CC=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
           echo "CXX=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
+      
       - name: Build ${{ matrix.name }}
         run: ${{ matrix.build }}
+      
       - name: Upload ${{ matrix.name }}
         uses: actions/upload-artifact@v4
         with:
@@ -167,33 +184,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
+          
       - name: Download all prefixes
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
-          path: ${{ github.workspace }}/prefixes
+          path: ${{ github.workspace }}/prefix
           merge-multiple: true
+          
       - name: Set environment
         run: |
-          echo "NDK=$(pwd)/ndk" >> $GITHUB_ENV
-          echo "TOOLCHAIN=$(pwd)/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
-          echo "SYSROOT=$(pwd)/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
-          echo "PREFIX=$(pwd)/prefixes" >> $GITHUB_ENV
+          echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
+          echo "TOOLCHAIN=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
+          echo "SYSROOT=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
+          echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
           echo "CC=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
           echo "CXX=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
+
       - name: Download FFmpeg
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+
       - name: Configure FFmpeg
         working-directory: ffmpeg
         run: |
@@ -217,17 +239,27 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
+
       - name: Build and install FFmpeg
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
+
       - name: Collect artifacts
         run: |
           mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/include
+          
+          # 复制头文件
           cp -r $PREFIX/include/* artifacts/include/
+          
+          # 动态库与 bin
           cp $PREFIX/lib/*.so artifacts/shared/lib/ 2>/dev/null || true
           cp $PREFIX/bin/ffmpeg $PREFIX/bin/ffprobe artifacts/shared/bin/ 2>/dev/null || true
           $STRIP artifacts/shared/bin/* 2>/dev/null || true
+          
+          # 静态库
           cp $PREFIX/lib/*.a artifacts/static/lib/ 2>/dev/null || true
+          
+          # 生成构建信息
           BUILD_INFO="artifacts/BUILD_INFO.txt"
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $BUILD_INFO
           echo "FFmpeg: ${{ env.FFMPEG_VERSION }}" >> $BUILD_INFO
@@ -235,12 +267,15 @@ jobs:
           echo "ABI: ${{ env.TARGET_ABI }}" >> $BUILD_INFO
           echo "" >> $BUILD_INFO
           $PREFIX/bin/ffmpeg -buildconf >> $BUILD_INFO 2>/dev/null || true
+          
           cp $BUILD_INFO artifacts/shared/
           cp $BUILD_INFO artifacts/static/
+
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-final
           path: artifacts/
+          retention-days: 1
 
   # ==================== Job 4: 发布 Release ====================
   release:
@@ -252,17 +287,20 @@ jobs:
     steps:
       - name: Set Build Date
         run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+      
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
+          name: ffmpeg-final
           path: artifacts
-          merge-multiple: true
+          
       - name: Package assets
         run: |
           cd artifacts
           zip -r /tmp/ffmpeg-android-arm64-v8a-shared.zip shared/
           zip -r /tmp/ffmpeg-android-arm64-v8a-static.zip static/
           ls -la /tmp/*.zip
+
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
@@ -278,6 +316,6 @@ jobs:
             - **Static**: `lib/*.a`, `include/`
             
             ### External Libraries
-            x264, x265, dav1d, vpx, aom, svt-av1, vvenc, xeve, xevd, fdk-aac, lame, opus, vorbis, lc3, openssl, libass, freetype, fribidi, fontconfig
+            x264, x265, dav1d, vpx, aom, svt-av1, vvenc, xeve, xevd, fdk-aac, lame, opus, vorbis, lc3, openssl, libass (with freetype, fribidi, fontconfig)
           files: /tmp/ffmpeg-android-arm64-v8a-*.zip
           generate_release_notes: true
