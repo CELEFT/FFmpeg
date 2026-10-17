@@ -17,7 +17,7 @@ env:
   TARGET_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  # ==================== Job 1: 准备 NDK (带缓存与权限修复) ====================
+  # ==================== Job 1: 准备 NDK 依赖 ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -25,23 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            autoconf \
-            automake \
-            libtool \
-            pkg-config \
-            nasm \
-            yasm \
-            cmake \
-            meson \
-            ninja-build \
-            git \
-            wget \
-            unzip
+            build-essential autoconf automake libtool pkg-config \
+            nasm yasm cmake meson ninja-build git wget unzip
 
       - name: Cache NDK
         id: cache-ndk
@@ -50,27 +39,22 @@ jobs:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
-      - name: Fix NDK Permissions (After Cache)
+      - name: Restore NDK Permissions
         if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: |
-          echo "缓存命中，修复 NDK 执行权限..."
-          chmod -R +x ${{ github.workspace }}/ndk
+        run: chmod -R +x ${{ github.workspace }}/ndk
 
-      - name: Download and Unpack NDK (Cache Miss Only)
+      - name: Download and Unpack NDK
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
-          echo "缓存未命中，开始下载 NDK..."
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
           mv android-ndk-r30* ${{ github.workspace }}/ndk
           rm ndk.zip
           chmod -R +x ${{ github.workspace }}/ndk
-          echo "NDK 下载、重命名及权限配置完成"
 
       - name: Set NDK Output Path
         id: setup-ndk
-        run: |
-          echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
+        run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
 
       - name: Upload NDK Artifact
         uses: actions/upload-artifact@v4
@@ -90,99 +74,101 @@ jobs:
           - name: x264
             build: |
               git clone --depth 1 https://code.videolan.org/videolan/x264.git && cd x264
-              ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --cross-prefix=$TOOLCHAIN/bin/llvm- --enable-static --enable-shared --enable-pic --disable-cli
+              ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --cross-prefix=$TOOLCHAIN/bin/llvm- --enable-static --enable-shared --enable-pic --disable-cli
               make -j$(nproc) && make install
           - name: x265
             build: |
               git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git/build/linux
               cmake -G "Unix Makefiles" \
                 -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-                -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} \
-                -DCMAKE_SYSTEM_NAME=Android \
-                -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-                -DENABLE_ASSEMBLY=OFF \
-                -DCMAKE_INSTALL_PREFIX=$PREFIX \
-                -DENABLE_SHARED=ON -DENABLE_CLI=OFF \
+                -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL \
+                -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                -DCMAKE_ASM_COMPILER=$CC -DENABLE_ASSEMBLY=OFF \
+                -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_CLI=OFF \
                 ../../source
               make -j$(nproc) && make install
           - name: dav1d
             build: |
               git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
-              meson setup build --cross-file <(echo -e "[binaries]\nc='$CC'\ncpp='$CXX'\nar='$AR'\nstrip='$STRIP'\n[host_machine]\nsystem='android'\ncpu_family='${TARGET_ARCH}'\ncpu='${TARGET_CPU}'\nendian='little'") --prefix=$PREFIX --default-library=both
+              meson setup build --cross-file <(echo -e "[binaries]\nc='$CC'\ncpp='$CXX'\nar='$AR'\nstrip='$STRIP'\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='armv8-a'\nendian='little'") --prefix=$PREFIX --default-library=both
               ninja -C build && ninja -C build install
           - name: libvpx
             build: |
               git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
-              ./configure --prefix=$PREFIX --target=arm64-android-gcc --sdk-path=$NDK --enable-vp8 --enable-vp9 --enable-static --enable-shared --disable-examples --disable-tools --disable-unit-tests --as=nasm
+              export CROSS=$TOOLCHAIN/bin/llvm-
+              ./configure --prefix=$PREFIX --target=arm64-android-gcc --libc=$SYSROOT --enable-vp8 --enable-vp9 --enable-static --enable-shared --disable-examples --disable-tools --disable-unit-tests
               make -j$(nproc) && make install
           - name: libaom
             build: |
               git clone --depth 1 https://aomedia.googlesource.com/aom && mkdir -p aom/build && cd aom/build
-              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64
+              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64
               ninja && ninja install
           - name: svt-av1
             build: |
               git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git && cd SVT-AV1 && mkdir build && cd build
-              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
+              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               ninja && ninja install
           - name: vvenc
             build: |
               git clone --depth 1 https://github.com/fraunhoferhhi/vvenc.git && cd vvenc && mkdir build && cd build
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
           - name: xeve
             build: |
               git clone --depth 1 https://github.com/mpeg5/xeve.git && cd xeve && mkdir build && cd build
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
           - name: xevd
             build: |
               git clone --depth 1 https://github.com/mpeg5/xevd.git && cd xevd && mkdir build && cd build
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
           - name: fdk-aac
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared --disable-example
+              ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared --disable-example
               make -j$(nproc) && make install
           - name: lame
             build: |
               wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz && tar xf lame-3.100.tar.gz && cd lame-3.100
-              ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared --disable-frontend
+              ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared --disable-frontend
               make -j$(nproc) && make install
           - name: opus
             build: |
               git clone --depth 1 https://github.com/xiph/opus.git && cd opus
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared
+              ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared
               make -j$(nproc) && make install
           - name: vorbis
             build: |
               git clone --depth 1 https://github.com/xiph/vorbis.git && cd vorbis
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared
+              ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared
               make -j$(nproc) && make install
           - name: lc3
             build: |
               git clone --depth 1 https://android.googlesource.com/platform/external/liblc3 && cd liblc3
-              make -j$(nproc) CC="$CC" LIBC=bionic && make install PREFIX=$PREFIX
+              make -j$(nproc) CC="$CC" LIBC=bionic
+              mkdir -p $PREFIX/lib $PREFIX/include
+              cp bin/liblc3.a $PREFIX/lib/ 2>/dev/null || true
+              cp include/*.h $PREFIX/include/ 2>/dev/null || true
           - name: openssl
             build: |
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
-              export PATH=$TOOLCHAIN/bin:$PATH
-              ./Configure android-arm64 -D__ANDROID_API__=${API_LEVEL} --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
+              export ANDROID_NDK_ROOT=$NDK
+              ./Configure android-arm64 -D__ANDROID_API__=$API_LEVEL --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
           - name: ass-stack
             build: |
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$TARGET_TRIPLE --enable-static --enable-shared && make -j$(nproc) && make install
 
     steps:
       - uses: actions/checkout@v4
@@ -191,26 +177,24 @@ jobs:
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
-      
-      # ⚠️ 双重保险：修复下载 Artifact 后的权限
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
-      
-      - name: Set environment
+      - name: Set toolchain environment
         run: |
+          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
-          echo "TOOLCHAIN=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
-          echo "SYSROOT=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
+          echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
           echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
+          echo "TARGET_TRIPLE=aarch64-linux-android" >> $GITHUB_ENV
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang" >> $GITHUB_ENV
+          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-      
+          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
       - name: Build ${{ matrix.name }}
         run: ${{ matrix.build }}
-      
       - name: Upload ${{ matrix.name }}
         uses: actions/upload-artifact@v4
         with:
@@ -218,7 +202,7 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 3: 编译 FFmpeg ====================
+  # ==================== Job 3: 编译 FFmpeg (动态 + 静态二进制) ====================
   build-ffmpeg:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -229,38 +213,42 @@ jobs:
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
-      - name: Download all prefixes
+      - name: Download all prefix dependencies
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
-      # ⚠️ 双重保险：修复下载 Artifact 后的权限
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
-      - name: Set environment
+      - name: Set FFmpeg environment
         run: |
+          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
-          echo "TOOLCHAIN=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64" >> $GITHUB_ENV
-          echo "SYSROOT=${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> $GITHUB_ENV
+          echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
           echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/${TARGET_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang" >> $GITHUB_ENV
+          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-      - name: Download FFmpeg
+          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
+
+      - name: Download FFmpeg Source
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
-      - name: Configure FFmpeg
+
+      # ---------- 1. 编译动态版 (Shared Binaries) ----------
+      - name: Configure FFmpeg (Shared)
         working-directory: ffmpeg
         run: |
           ./configure \
             --prefix=$PREFIX \
             --enable-cross-compile --target-os=android \
-            --arch=${TARGET_ARCH} --cpu=${TARGET_CPU} \
+            --arch=aarch64 --cpu=armv8-a \
             --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
             --sysroot="$SYSROOT" \
             --enable-shared --enable-static --enable-pic \
@@ -277,26 +265,71 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
-      - name: Build and install FFmpeg
+      
+      - name: Build FFmpeg (Shared)
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
-      - name: Collect artifacts
+
+      # ---------- 2. 编译纯静态版 (Static Binaries) ----------
+      - name: Configure FFmpeg (Static)
         run: |
-          mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/include
+          cp -r ffmpeg ffmpeg-static
+          cd ffmpeg-static
+          make distclean || true
+          ./configure \
+            --prefix=$PREFIX \
+            --enable-cross-compile --target-os=android \
+            --arch=aarch64 --cpu=armv8-a \
+            --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+            --sysroot="$SYSROOT" \
+            --disable-shared --enable-static --enable-pic \
+            --pkg-config-flags="--static" \
+            --enable-gpl --enable-version3 --enable-nonfree \
+            --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+            --enable-libx264 --enable-libx265 --enable-libxvid \
+            --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+            --enable-libvvenc --enable-libxeve --enable-libxevd \
+            --enable-libwebp --enable-libxavs2 \
+            --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+            --enable-liblc3 --enable-libshine \
+            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+            --disable-doc --disable-debug \
+            --extra-cflags="-I$PREFIX/include -fPIC" \
+            --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
+            --extra-libs="-lpthread -lm -lz -ldl"
+
+      - name: Build FFmpeg Static Binaries
+        working-directory: ffmpeg-static
+        run: |
+          # 这里只编译生成 ffmpeg 和 ffprobe 两个二进制文件
+          make -j$(nproc) ffmpeg ffprobe
+          $STRIP ffmpeg ffprobe
+
+      # ---------- 3. 收集所有产物 ----------
+      - name: Collect output artifacts
+        run: |
+          mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/static/bin artifacts/include
+          
+          # 复制头文件 (通用)
           cp -r $PREFIX/include/* artifacts/include/
+          
+          # 1. 收集动态库 (Shared)
           cp $PREFIX/lib/*.so artifacts/shared/lib/ 2>/dev/null || true
           cp $PREFIX/bin/ffmpeg $PREFIX/bin/ffprobe artifacts/shared/bin/ 2>/dev/null || true
           $STRIP artifacts/shared/bin/* 2>/dev/null || true
+          
+          # 2. 收集静态库 (Static)
           cp $PREFIX/lib/*.a artifacts/static/lib/ 2>/dev/null || true
-          BUILD_INFO="artifacts/BUILD_INFO.txt"
-          echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $BUILD_INFO
-          echo "FFmpeg: ${{ env.FFMPEG_VERSION }}" >> $BUILD_INFO
-          echo "NDK: ${{ env.NDK_VERSION }} / API ${{ env.API_LEVEL }}" >> $BUILD_INFO
-          echo "ABI: ${{ env.TARGET_ABI }}" >> $BUILD_INFO
-          echo "" >> $BUILD_INFO
-          $PREFIX/bin/ffmpeg -buildconf >> $BUILD_INFO 2>/dev/null || true
-          cp $BUILD_INFO artifacts/shared/
-          cp $BUILD_INFO artifacts/static/
+          
+          # 3. 收集纯静态的二进制文件 (Static Bin)
+          cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe artifacts/static/bin/
+          
+          # 保存构建信息
+          echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > artifacts/BUILD_INFO.txt
+          $PREFIX/bin/ffmpeg -buildconf >> artifacts/BUILD_INFO.txt 2>/dev/null || true
+          cp artifacts/BUILD_INFO.txt artifacts/shared/
+          cp artifacts/BUILD_INFO.txt artifacts/static/
+
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-final
@@ -311,8 +344,6 @@ jobs:
       contents: write
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Set Build Date
-        run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
       - name: Download final artifacts
         uses: actions/download-artifact@v4
         with:
@@ -323,22 +354,16 @@ jobs:
           cd artifacts
           zip -r /tmp/ffmpeg-android-arm64-v8a-shared.zip shared/
           zip -r /tmp/ffmpeg-android-arm64-v8a-static.zip static/
-          ls -la /tmp/*.zip
-      - name: Create Release and Upload Assets
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
           body: |
             ## FFmpeg Android Build (arm64-v8a)
-            - **Build Date**: ${{ env.BUILD_DATE }}
-            - **NDK**: ${{ env.NDK_VERSION }} (API ${{ env.API_LEVEL }})
-            - **FFmpeg**: ${{ env.FFMPEG_VERSION }}
-            
-            ### Packages
-            - **Shared**: `lib/*.so`, `include/`, `bin/ffmpeg`, `bin/ffprobe`
-            - **Static**: `lib/*.a`, `include/`
-            
-            ### External Libraries
-            x264, x265, dav1d, vpx, aom, svt-av1, vvenc, xeve, xevd, fdk-aac, lame, opus, vorbis, lc3, openssl, libass (with freetype, fribidi, fontconfig)
+            - **Build Date**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+            - **NDK**: r30 (API 36)
+            - **FFmpeg**: 9.0.2
+            - **Shared package**: `lib/*.so`, `include/`, 动态链接的 `bin/ffmpeg` & `bin/ffprobe`
+            - **Static package**: `lib/*.a`, `include/`, **纯静态链接的** `bin/ffmpeg` & `bin/ffprobe`
           files: /tmp/ffmpeg-android-arm64-v8a-*.zip
           generate_release_notes: true
