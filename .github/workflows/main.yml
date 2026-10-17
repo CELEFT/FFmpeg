@@ -1,9 +1,11 @@
 name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job)
 
 on:
+  # 推送代码或 tag 时触发
   push:
     branches: [ main ]
     tags: [ 'v*' ]
+  # 允许在 GitHub 页面上手动点击按钮触发
   workflow_dispatch:
 
 env:
@@ -17,7 +19,7 @@ env:
   TARGET_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  # ==================== Job 1: 准备 NDK ====================
+  # ==================== Job 1: 准备 NDK (带缓存) ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -25,13 +27,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Download and Unpack NDK
-        id: setup-ndk
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
+      - name: Download and Unpack NDK (Cache Miss Only)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
+          echo "缓存未命中，开始下载 NDK..."
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          # 强制重命名为 ndk 并放置于绝对路径下，彻底杜绝 "." 和 ".."
           mv android-ndk-r30* ${{ github.workspace }}/ndk
+          rm ndk.zip
+          echo "NDK 下载并配置完成"
+
+      - name: Set NDK Output Path
+        id: setup-ndk
+        run: |
           echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
 
       - name: Upload NDK Artifact
@@ -135,7 +150,7 @@ jobs:
               make -j$(nproc) && make install_sw
           - name: ass-stack
             build: |
-              # 串行编译 libass 的依赖链: freetype -> fribidi -> fontconfig -> libass
+              # 串行编译 libass 的依赖链
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
               
@@ -248,18 +263,14 @@ jobs:
         run: |
           mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/include
           
-          # 复制头文件
           cp -r $PREFIX/include/* artifacts/include/
           
-          # 动态库与 bin
           cp $PREFIX/lib/*.so artifacts/shared/lib/ 2>/dev/null || true
           cp $PREFIX/bin/ffmpeg $PREFIX/bin/ffprobe artifacts/shared/bin/ 2>/dev/null || true
           $STRIP artifacts/shared/bin/* 2>/dev/null || true
           
-          # 静态库
           cp $PREFIX/lib/*.a artifacts/static/lib/ 2>/dev/null || true
           
-          # 生成构建信息
           BUILD_INFO="artifacts/BUILD_INFO.txt"
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $BUILD_INFO
           echo "FFmpeg: ${{ env.FFMPEG_VERSION }}" >> $BUILD_INFO
@@ -288,7 +299,7 @@ jobs:
       - name: Set Build Date
         run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
       
-      - name: Download all artifacts
+      - name: Download final artifacts
         uses: actions/download-artifact@v4
         with:
           name: ffmpeg-final
@@ -306,7 +317,7 @@ jobs:
         with:
           name: Release ${{ github.ref_name }}
           body: |
-            ## FFmpeg Android Build (arm64-v8a, Multi-Job)
+            ## FFmpeg Android Build (arm64-v8a)
             - **Build Date**: ${{ env.BUILD_DATE }}
             - **NDK**: ${{ env.NDK_VERSION }} (API ${{ env.API_LEVEL }})
             - **FFmpeg**: ${{ env.FFMPEG_VERSION }}
