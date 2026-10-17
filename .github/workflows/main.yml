@@ -1,11 +1,9 @@
 name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job)
 
 on:
-  # 推送代码或 tag 时触发
   push:
     branches: [ main ]
     tags: [ 'v*' ]
-  # 允许在 GitHub 页面上手动点击按钮触发
   workflow_dispatch:
 
 env:
@@ -26,7 +24,25 @@ jobs:
       ndk-path: ${{ steps.setup-ndk.outputs.path }}
     steps:
       - uses: actions/checkout@v4
-      
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            nasm \
+            yasm \
+            cmake \
+            meson \
+            ninja-build \
+            git \
+            wget \
+            unzip
+
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
@@ -34,7 +50,6 @@ jobs:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
-      # ⚠️ 关键修复：恢复缓存后立即赋予执行权限
       - name: Fix NDK Permissions (After Cache)
         if: steps.cache-ndk.outputs.cache-hit == 'true'
         run: |
@@ -85,6 +100,7 @@ jobs:
                 -DANDROID_ABI=${TARGET_ABI} -DANDROID_PLATFORM=android-${API_LEVEL} \
                 -DCMAKE_SYSTEM_NAME=Android \
                 -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                -DENABLE_ASSEMBLY=OFF \
                 -DCMAKE_INSTALL_PREFIX=$PREFIX \
                 -DENABLE_SHARED=ON -DENABLE_CLI=OFF \
                 ../../source
@@ -154,20 +170,17 @@ jobs:
           - name: openssl
             build: |
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
+              export PATH=$TOOLCHAIN/bin:$PATH
               ./Configure android-arm64 -D__ANDROID_API__=${API_LEVEL} --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
           - name: ass-stack
             build: |
-              # 串行编译 libass 的依赖链
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
-              
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
               ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
-              
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
-              
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               ./autogen.sh && ./configure --prefix=$PREFIX --host=${TARGET_TRIPLE} --enable-static --enable-shared && make -j$(nproc) && make install
 
@@ -211,24 +224,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
-          
       - name: Download all prefixes
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
-          
       # ⚠️ 双重保险：修复下载 Artifact 后的权限
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
-          
       - name: Set environment
         run: |
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
@@ -240,13 +249,11 @@ jobs:
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-
       - name: Download FFmpeg
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
-
       - name: Configure FFmpeg
         working-directory: ffmpeg
         run: |
@@ -270,23 +277,17 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
-
       - name: Build and install FFmpeg
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
-
       - name: Collect artifacts
         run: |
           mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/include
-          
           cp -r $PREFIX/include/* artifacts/include/
-          
           cp $PREFIX/lib/*.so artifacts/shared/lib/ 2>/dev/null || true
           cp $PREFIX/bin/ffmpeg $PREFIX/bin/ffprobe artifacts/shared/bin/ 2>/dev/null || true
           $STRIP artifacts/shared/bin/* 2>/dev/null || true
-          
           cp $PREFIX/lib/*.a artifacts/static/lib/ 2>/dev/null || true
-          
           BUILD_INFO="artifacts/BUILD_INFO.txt"
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $BUILD_INFO
           echo "FFmpeg: ${{ env.FFMPEG_VERSION }}" >> $BUILD_INFO
@@ -294,10 +295,8 @@ jobs:
           echo "ABI: ${{ env.TARGET_ABI }}" >> $BUILD_INFO
           echo "" >> $BUILD_INFO
           $PREFIX/bin/ffmpeg -buildconf >> $BUILD_INFO 2>/dev/null || true
-          
           cp $BUILD_INFO artifacts/shared/
           cp $BUILD_INFO artifacts/static/
-
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-final
@@ -314,20 +313,17 @@ jobs:
     steps:
       - name: Set Build Date
         run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
-      
       - name: Download final artifacts
         uses: actions/download-artifact@v4
         with:
           name: ffmpeg-final
           path: artifacts
-          
       - name: Package assets
         run: |
           cd artifacts
           zip -r /tmp/ffmpeg-android-arm64-v8a-shared.zip shared/
           zip -r /tmp/ffmpeg-android-arm64-v8a-static.zip static/
           ls -la /tmp/*.zip
-
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
