@@ -21,23 +21,29 @@ jobs:
       ndk-path: ${{ steps.setup-ndk.outputs.path }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip
+      
+      # 防患于未然，系统级安装 meson 和 ninja
       - name: Install Python & Meson
-        run: pip3 install meson
+        run: pip3 install meson ninja
+
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
       - name: Restore NDK Permissions
         if: steps.cache-ndk.outputs.cache-hit == 'true'
         run: chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Download and Unpack NDK
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
@@ -46,9 +52,11 @@ jobs:
           mv android-ndk-r30* ${{ github.workspace }}/ndk
           rm ndk.zip
           chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Set NDK Output Path
         id: setup-ndk
         run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
+
       - name: Upload NDK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -72,6 +80,7 @@ jobs:
           - name: x265
             build: |
               git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git
+              # 移除 -lpthread 链接依赖 (Android bionic 已将 pthread 合并入 libc)
               sed -i 's/list(APPEND PLATFORM_LIBS pthread)/# list(APPEND PLATFORM_LIBS pthread)/' source/CMakeLists.txt
               cd build/linux
               cmake -G "Unix Makefiles" \
@@ -86,6 +95,7 @@ jobs:
               make -j$(nproc) && make install
           - name: dav1d
             build: |
+              # 确保在子环境中 meson 可用
               pip3 install meson || true
               git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
               printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
@@ -94,6 +104,9 @@ jobs:
           - name: libvpx
             build: |
               git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
+              # 关键修复：将 android 加入共享库支持列表
+              sed -i 's/linux|os2|solaris|darwin\*|iphonesimulator\*)/linux|android|os2|solaris|darwin*|iphonesimulator*)/' configure
+              
               export CROSS=$TOOLCHAIN/bin/llvm-
               export ASFLAGS="-D__ANDROID__"
               export LDFLAGS="-Wl,-z,max-page-size=16384"
@@ -131,6 +144,7 @@ jobs:
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
               ./autogen.sh
+              # 使用环境变量传递编译选项
               export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
               ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example
               make -j$(nproc) && make install
@@ -169,13 +183,18 @@ jobs:
             build: |
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no && make -j$(nproc) && make install && cd ..
+              
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
+              
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
+              # 关键修复：导出 pkg-config 路径
               export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install
+
     steps:
       - uses: actions/checkout@v4
       - name: Download NDK
@@ -207,7 +226,7 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 3: 编译 FFmpeg ====================
+  # ==================== Job 3: 编译 FFmpeg (动态 + 静态二进制) ====================
   build-ffmpeg:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -240,11 +259,13 @@ jobs:
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
           echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
           echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH" >> $GITHUB_ENV
+
       - name: Download FFmpeg Source
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+
       - name: Configure FFmpeg (Shared)
         working-directory: ffmpeg
         run: |
@@ -268,9 +289,11 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
+      
       - name: Build FFmpeg (Shared)
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
+
       - name: Configure FFmpeg (Static)
         run: |
           cp -r ffmpeg ffmpeg-static
@@ -297,11 +320,13 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lpthread -lm -lz -ldl"
+
       - name: Build FFmpeg Static Binaries
         working-directory: ffmpeg-static
         run: |
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
+
       - name: Collect output artifacts
         run: |
           mkdir -p artifacts/shared/lib artifacts/shared/bin artifacts/static/lib artifacts/static/bin artifacts/include
@@ -315,6 +340,7 @@ jobs:
           $PREFIX/bin/ffmpeg -buildconf >> artifacts/BUILD_INFO.txt 2>/dev/null || true
           cp artifacts/BUILD_INFO.txt artifacts/shared/
           cp artifacts/BUILD_INFO.txt artifacts/static/
+
       - uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-final
