@@ -16,16 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install host dependencies
+      - name: Install host dependencies (with system meson)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext
+            gperf gettext python3-pip
             
-      - name: Install Python & Meson
-        run: pip3 install meson ninja
+      - name: Install Python pip Meson
+        run: pip3 install meson ninja || true
 
       - name: Cache NDK
         id: cache-ndk
@@ -84,7 +84,9 @@ jobs:
 
           - name: dav1d
             build: |
-              pip3 install meson || true
+              # 环境兜底
+              export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+              
               git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
               printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
               meson setup _build --cross-file $PWD/android.cross --prefix=$PREFIX --default-library=both --buildtype=release
@@ -100,6 +102,9 @@ jobs:
 
           - name: ass-stack
             build: |
+              # 环境兜底，彻底解决 meson: command not found
+              export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+
               # 1. 编译 FreeType
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
