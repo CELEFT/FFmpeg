@@ -13,7 +13,6 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
-  # Android 上无需 -ldl / -lpthread / -lc++abi（均已并入 libc / libc++_static）
   BASE_PRIVATE_LIBS: "-lc++_static -lm"
 
 jobs:
@@ -81,6 +80,7 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
+          # ========== 不再依赖 x265 的 install 行为：从构建目录直接收集 .a/.so/.h ==========
           - name: x265
             build: |
               set -euo pipefail
@@ -88,31 +88,62 @@ jobs:
               cd x265_git
               sed -i 's/list(APPEND PLATFORM_LIBS pthread)/# list(APPEND PLATFORM_LIBS pthread)/' source/CMakeLists.txt || true
 
-              build_x265() {
-                local shared="$1" bdir="build-${1}"
-                rm -rf "$bdir"
-                cmake -S source -B "$bdir" -G "Unix Makefiles" \
-                  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-                  -DANDROID_ABI="$TARGET_ABI" \
-                  -DANDROID_PLATFORM="android-$API_LEVEL" \
-                  -DANDROID_STL=c++_static \
-                  -DCMAKE_SYSTEM_NAME=Android \
-                  -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-                  -DCMAKE_BUILD_TYPE=Release \
-                  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-                  -DENABLE_ASSEMBLY=OFF -DENABLE_CLI=OFF -DENABLE_SHARED="$shared" \
-                  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-                  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384" \
-                  -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
-                cmake --build "$bdir" -j"$(nproc)"
-                cmake --install "$bdir"
-              }
-              build_x265 ON
-              build_x265 OFF
+              X265_FLAGS=(
+                -G "Unix Makefiles"
+                -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
+                -DANDROID_ABI="$TARGET_ABI"
+                -DANDROID_PLATFORM="android-$API_LEVEL"
+                -DANDROID_STL=c++_static
+                -DCMAKE_SYSTEM_NAME=Android
+                -DCMAKE_SYSTEM_PROCESSOR=aarch64
+                -DCMAKE_BUILD_TYPE=Release
+                -DCMAKE_INSTALL_PREFIX="$PREFIX"
+                -DENABLE_ASSEMBLY=OFF
+                -DENABLE_CLI=OFF
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
+                -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
+              )
+
+              for shared in ON OFF; do
+                rm -rf "build-$shared"
+                cmake -S source -B "build-$shared" "${X265_FLAGS[@]}" -DENABLE_SHARED="$shared"
+                cmake --build "build-$shared" -j"$(nproc)"
+                echo "--- build-$shared artifacts ---"
+                find "build-$shared" -maxdepth 2 -name 'libx265*' -o -maxdepth 2 -name 'x265_config.h' | sort
+              done
+
+              mkdir -p "$PREFIX/lib" "$PREFIX/include"
+
+              # 1) 头文件（x265_config.h 为构建期生成）
+              for h in x265.h x265_config.h; do
+                src=$(find build-ON build-OFF source -maxdepth 1 -name "$h" | head -n1 || true)
+                if [ -n "${src:-}" ]; then cp -f "$src" "$PREFIX/include/$h"; fi
+              done
+
+              # 2) 静态库
+              A=$(find build-OFF build-ON -maxdepth 2 -name 'libx265.a' | head -n1 || true)
+              if [ -z "${A:-}" ]; then A=$(find . -name 'libx265.a' | head -n1 || true); fi
+              if [ -n "${A:-}" ]; then cp -f "$A" "$PREFIX/lib/libx265.a"; fi
+
+              # 3) 动态库：先收共享构建产物，缺失则用 PIC 静态库整体打包
+              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done < <(find build-ON -maxdepth 2 -name 'libx265.so*' 2>/dev/null || true)
+              if [ ! -e "$PREFIX/lib/libx265.so" ]; then
+                real=$(find "$PREFIX/lib" -maxdepth 1 -name 'libx265.so.*' | head -n1 || true)
+                if [ -n "${real:-}" ]; then
+                  cp -f "$real" "$PREFIX/lib/libx265.so"
+                else
+                  echo "::warning::CMake 未产出 libx265.so，改用 PIC 静态库生成"
+                  $CXX -shared -Wl,-soname,libx265.so -o "$PREFIX/lib/libx265.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive \
+                    -lc++_static -lm
+                fi
+              fi
 
               test -f "$PREFIX/lib/libx265.a"  || { echo "libx265.a missing";  exit 1; }
-              test -f "$PREFIX/lib/libx265.so" || { echo "libx265.so missing"; exit 1; }
+              test -e "$PREFIX/lib/libx265.so" || { echo "libx265.so missing"; exit 1; }
               test -f "$PREFIX/include/x265.h" || { echo "x265.h missing";     exit 1; }
+              ls -l "$PREFIX"/lib/libx265* "$PREFIX"/include/x265*
 
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/x265.pc" <<EOF
@@ -310,7 +341,6 @@ jobs:
               make clean
               ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" --prefix="$PREFIX" --openssldir="$PREFIX/ssl" no-shared no-tests
               make -j"$(nproc)" && make install_sw
-              # 上游已自带 openssl.pc / libssl.pc / libcrypto.pc，只修正 prefix，不覆盖
               for f in "$PREFIX"/lib/pkgconfig/*.pc; do
                 [ -e "$f" ] || continue
                 sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
@@ -325,7 +355,6 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic --disable-example
               make -j"$(nproc)" && make install
-              # 上游不装 .pc，FFmpeg 用 require_pkg_config libfdk_aac fdk-aac
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/fdk-aac.pc" <<EOF
               prefix=$PREFIX
@@ -348,7 +377,6 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic --disable-frontend --disable-asm
               make -j"$(nproc)" && make install
-              # 上游不装 .pc，FFmpeg 用 require_pkg_config libmp3lame lame
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/lame.pc" <<EOF
               prefix=$PREFIX
@@ -381,17 +409,21 @@ jobs:
               ./autogen.sh && ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic && make -j"$(nproc)" && make install
 
+          # ========== liblc3 无 lib 目标：直接用 NDK clang 编译源码，产物完全可控 ==========
           - name: lc3
             build: |
               set -euo pipefail
               git clone --depth 1 https://android.googlesource.com/platform/external/liblc3 && cd liblc3
-              # 必须以 PIC 编译，否则 -shared 拼装 .so 会失败
-              make -j"$(nproc)" CC="$CC" AR="$AR" LIBC=bionic CFLAGS="-fPIC -O2" lib
-              mkdir -p "$PREFIX/lib" "$PREFIX/include"
-              cp build/src/liblc3.a "$PREFIX/lib/"
-              $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" \
-                  $(find build/src -name '*.o') -lm
-              cp include/*.h "$PREFIX/include/"
+              mkdir -p obj "$PREFIX/lib" "$PREFIX/include"
+              for f in src/*.c; do
+                $CC -O2 -fPIC -Iinclude -c "$f" -o "obj/$(basename "${f%.c}").o"
+              done
+              $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
+              $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
+              cp -f include/*.h "$PREFIX/include/"
+              test -f "$PREFIX/lib/liblc3.a"  || { echo "liblc3.a missing";  exit 1; }
+              test -e "$PREFIX/lib/liblc3.so" || { echo "liblc3.so missing"; exit 1; }
+              test -f "$PREFIX/include/lc3.h" || { echo "lc3.h missing";     exit 1; }
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/lc3.pc" <<EOF
               prefix=$PREFIX
@@ -636,8 +668,23 @@ jobs:
             [ -e "$f" ] || continue
             sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
           done
+          # 若 x265.pc 丢失则补一份，避免历史 artifact 缺文件导致 configure 失败
+          if [ ! -f "$PC_DIR/x265.pc" ]; then
+            cat > "$PC_DIR/x265.pc" <<EOF
+          prefix=$PREFIX
+          exec_prefix=\${prefix}
+          libdir=\${exec_prefix}/lib
+          includedir=\${prefix}/include
 
-      # ===== 全量自检：每个库都要有 .so / .a / 头文件 / .pc，且 pkg-config 可解析 =====
+          Name: x265
+          Description: H.265/HEVC video encoder
+          Version: 4.1
+          Libs: -L\${libdir} -lx265
+          Libs.private: $BASE_PRIVATE_LIBS
+          Cflags: -I\${includedir}
+          EOF
+          fi
+
       - name: Verify all external libs
         shell: bash
         run: |
@@ -662,17 +709,14 @@ jobs:
           )
           for m in $(printf '%s\n' "${!H[@]}" | sort); do
             lib=${L[$m]}
-            [ -f "$PREFIX/include/${H[$m]}" ]     || { echo "::error::header missing: $m (${H[$m]})"; fail=1; }
-            [ -f "$PREFIX/lib/pkgconfig/$m.pc" ]  || { echo "::error::pc missing: $m.pc"; fail=1; }
-            ls "$PREFIX/lib/lib${lib}.so"     >/dev/null 2>&1 || ls "$PREFIX/lib/lib${lib}.so".* >/dev/null 2>&1 || { echo "::error::so missing: lib${lib}"; fail=1; }
-            [ -f "$PREFIX/lib/lib${lib}.a" ]      || { echo "::error::static missing: lib${lib}.a"; fail=1; }
-            pkg-config --exists "$m"              || { echo "::error::pkg-config broken: $m"; fail=1; }
+            [ -f "$PREFIX/include/${H[$m]}" ]    || { echo "::error::header missing: $m (${H[$m]})"; fail=1; }
+            [ -f "$PREFIX/lib/pkgconfig/$m.pc" ] || { echo "::error::pc missing: $m.pc"; fail=1; }
+            { ls "$PREFIX/lib/lib${lib}.so" >/dev/null 2>&1 || ls "$PREFIX/lib/lib${lib}.so".* >/dev/null 2>&1; } || { echo "::error::so missing: lib${lib}"; fail=1; }
+            [ -f "$PREFIX/lib/lib${lib}.a" ]     || { echo "::error::static missing: lib${lib}.a"; fail=1; }
+            pkg-config --exists "$m"             || { echo "::error::pkg-config broken: $m"; fail=1; }
           done
-          echo "--- pkg-config --list-all ---"
-          pkg-config --list-all || true
           [ "$fail" -eq 0 ] || exit 1
 
-      # ===== 真实链接测试：shared 与 static 两种姿势都要过 =====
       - name: Link test via pkg-config (shared + static)
         shell: bash
         run: |
@@ -681,17 +725,17 @@ jobs:
           #include <x265.h>
           #include <fdk-aac/aacenc_lib.h>
           #include <lame/lame.h>
+          #include <lc3.h>
           int main(void) {
             const x265_api *a = x265_api_get(8);
             (void)lame_init();
             (void)aacEncGetVersion;
-            return a ? 0 : 1;
+            (void)a;
+            return 0;
           }
           EOF
-          echo "== shared =="; pkg-config --cflags --libs x265 fdk-aac lame
-          $CC /tmp/t.c -o /tmp/t_shared $(pkg-config --cflags --libs x265 fdk-aac lame)
-          echo "== static =="; pkg-config --static --cflags --libs x265 fdk-aac lame
-          $CC /tmp/t.c -o /tmp/t_static $(pkg-config --static --cflags --libs x265 fdk-aac lame)
+          echo "== shared =="; $CC /tmp/t.c -o /tmp/t_shared $(pkg-config --cflags --libs x265 fdk-aac lame lc3)
+          echo "== static =="; $CC /tmp/t.c -o /tmp/t_static $(pkg-config --static --cflags --libs x265 fdk-aac lame lc3)
           echo "==> link tests OK"
 
       - name: Download FFmpeg Source
