@@ -163,8 +163,8 @@ jobs:
               Description: SVT-AV1 Encoder
               Version: 1.8.0
               Libs: -L\${libdir} -lSvtAv1Enc
-              Libs.private: -lstdc++ -lm -lpthread
-              Cflags: -I\${includedir}
+              Libs.private: -lc++ -lm -lpthread
+              Cflags: -I\${includedir} -I\${includedir}/svt-av1
               EOF
           - name: vvenc
             build: |
@@ -185,8 +185,8 @@ jobs:
               Description: Fraunhofer Versatile Video Encoder
               Version: 1.11.0
               Libs: -L\${libdir} -lvvenc
-              Libs.private: -lstdc++ -lm -lpthread
-              Cflags: -I\${includedir}
+              Libs.private: -lc++ -lm -lpthread
+              Cflags: -I\${includedir} -I\${includedir}/vvenc
               EOF
           - name: xeve
             build: |
@@ -207,8 +207,8 @@ jobs:
               Description: MPEG-5 EVC Encoder
               Version: 1.0.0
               Libs: -L\${libdir} -lxeve
-              Libs.private: -lstdc++ -lm -lpthread
-              Cflags: -I\${includedir}
+              Libs.private: -lc++ -lm -lpthread
+              Cflags: -I\${includedir} -I\${includedir}/xeve
               EOF
           - name: xevd
             build: |
@@ -229,8 +229,8 @@ jobs:
               Description: MPEG-5 EVC Decoder
               Version: 1.0.0
               Libs: -L\${libdir} -lxevd
-              Libs.private: -lstdc++ -lm -lpthread
-              Cflags: -I\${includedir}
+              Libs.private: -lc++ -lm -lpthread
+              Cflags: -I\${includedir} -I\${includedir}/xevd
               EOF
           - name: openssl
             build: |
