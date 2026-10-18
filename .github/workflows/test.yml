@@ -1,13 +1,15 @@
-name: Test ass-stack Only
+name: Build libass (static + shared)
 
 on:
   workflow_dispatch:
 
 env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  API_LEVEL: "36"
+  ANDROID_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  test-ass-stack:
+  build-libass:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,70 +30,90 @@ jobs:
           rm ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
 
-      - name: Configure toolchain env
+      - name: Set toolchain env
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          PREFIX="${{ github.workspace }}/prefix"
-          mkdir -p "$PREFIX"
           {
             echo "TOOLCHAIN=$TOOLCHAIN"
-            echo "PREFIX=$PREFIX"
-            echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang"
-            echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++"
+            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
             echo "AR=$TOOLCHAIN/bin/llvm-ar"
             echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
             echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
-            echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig"
-            echo "PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig"
-            # 全局 include / lib 路径：不管各库 pc 文件是否规范，这里都能兜底
-            echo "CFLAGS=-O2 -fPIC -I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/freetype2 -I$PREFIX/include/harfbuzz"
-            echo "CPPFLAGS=-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/freetype2 -I$PREFIX/include/harfbuzz"
-            echo "LDFLAGS=-L$PREFIX/lib"
+            echo "PREFIX_STATIC=${{ github.workspace }}/prefix-static"
+            echo "PREFIX_SHARED=${{ github.workspace }}/prefix-shared"
           } >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      - name: Build FreeType
+      - name: Clone sources
         run: |
-          set -euxo pipefail
           git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git
-          cd freetype
-          ./autogen.sh
-          ./configure \
-            --prefix="$PREFIX" \
-            --host=aarch64-linux-android \
-            --enable-static --disable-shared \
-            --without-zlib --without-png --without-bzip2 --without-harfbuzz
-          make -j"$(nproc)"
-          make install
-          cd ..
-          echo "=== FreeType headers ==="
-          ls "$PREFIX/include/freetype2/freetype"
-
-      - name: Build FriBidi
-        run: |
-          set -euxo pipefail
           git clone --depth 1 https://github.com/fribidi/fribidi.git
-          cd fribidi
-          ./autogen.sh
-          ./configure \
-            --prefix="$PREFIX" \
-            --host=aarch64-linux-android \
-            --build=x86_64-pc-linux-gnu \
-            --enable-static --disable-shared
-          make -j"$(nproc)"
-          make install
-          cd ..
-          echo "=== FriBidi 原始头文件位置 ==="
-          find "$PREFIX/include" -name '*.h' | grep -i fribidi || true
-          echo "=== FriBidi 库 ==="
-          ls "$PREFIX/lib" | grep -i fribidi || true
-
-      - name: Build HarfBuzz
-        run: |
-          set -euxo pipefail
           git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git
-          cd harfbuzz
-          cat > android.cross <<EOF
+          git clone --depth 1 https://github.com/libass/libass.git
+
+      - name: Build stack (static + shared)
+        run: |
+          set -euo pipefail
+
+          build_stack() {
+            local LINK="$1"
+            local PREFIX="$2"
+
+            echo "::group::=== Building $LINK stack into $PREFIX ==="
+            mkdir -p "$PREFIX"
+
+            local LTOPT MESON_LIB CFLAGS_EXTRA
+            if [ "$LINK" = "static" ]; then
+              LTOPT="--enable-static --disable-shared"
+              MESON_LIB="static"
+              CFLAGS_EXTRA="-O2 -fPIC"
+            else
+              LTOPT="--disable-static --enable-shared"
+              MESON_LIB="shared"
+              CFLAGS_EXTRA="-O2"
+            fi
+
+            local BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
+            local BASE_LDFLAGS="-L$PREFIX/lib"
+
+            # 1. FreeType
+            echo "### FreeType ($LINK)"
+            ( cd freetype
+              make distclean >/dev/null 2>&1 || true
+              ./autogen.sh
+              ./configure \
+                --prefix="$PREFIX" \
+                --host="$ANDROID_TRIPLE" \
+                --build=x86_64-pc-linux-gnu \
+                $LTOPT --with-pic \
+                --without-zlib --without-png --without-bzip2 --without-harfbuzz \
+                CFLAGS="$CFLAGS_EXTRA"
+              make -j"$(nproc)"
+              make install
+            )
+
+            # 2. FriBidi  ← 关键修复：autoreconf 代替 autogen.sh
+            echo "### FriBidi ($LINK)"
+            ( cd fribidi
+              make distclean >/dev/null 2>&1 || true
+              rm -rf autom4te.cache config.h.in configure 2>/dev/null || true
+              autoreconf -fiv
+              ./configure \
+                --prefix="$PREFIX" \
+                --host="$ANDROID_TRIPLE" \
+                --build=x86_64-pc-linux-gnu \
+                $LTOPT --with-pic \
+                CFLAGS="$CFLAGS_EXTRA"
+              make -j"$(nproc)"
+              make install
+            )
+
+            # 3. HarfBuzz
+            echo "### HarfBuzz ($LINK)"
+            ( cd harfbuzz
+              rm -rf _build
+              cat > android.cross <<EOF
           [binaries]
           c = '$CC'
           cpp = '$CXX'
@@ -108,74 +130,121 @@ jobs:
           cpu = 'aarch64'
           endian = 'little'
           EOF
-          meson setup _build --cross-file android.cross \
-            --prefix="$PREFIX" \
-            --default-library=static \
-            --buildtype=release \
-            -Dfreetype=enabled \
-            -Dglib=disabled \
-            -Dgobject=disabled \
-            -Dcairo=disabled \
-            -Dicu=disabled \
-            -Dgraphite2=disabled \
-            -Dtests=disabled \
-            -Ddocs=disabled \
-            -Dintrospection=disabled
-          ninja -C _build
-          ninja -C _build install
-          cd ..
-          echo "=== HarfBuzz 头文件 ==="
-          find "$PREFIX/include" -name 'hb.h' || true
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+              meson setup _build --cross-file android.cross \
+                --prefix="$PREFIX" \
+                --default-library="$MESON_LIB" \
+                --buildtype=release \
+                -Db_staticpic=true \
+                -Dfreetype=enabled \
+                -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
+                -Dicu=disabled -Dgraphite2=disabled \
+                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
+              ninja -C _build
+              ninja -C _build install
+            )
 
-      - name: Normalize headers (关键修复)
-        run: |
-          set -euxo pipefail
-          # libass 源码中用 `#include <fribidi.h>` / `#include <hb.h>`，
-          # 而 fribidi / harfbuzz 默认装在 include/<lib>/ 子目录下。
-          # 这里用 symlink 暴露到 $PREFIX/include/ 顶层，配合
-          # CPPFLAGS 里的 -I$PREFIX/include 就能被找到。
-          for sub in fribidi harfbuzz; do
-            if [ -d "$PREFIX/include/$sub" ]; then
-              for h in "$PREFIX/include/$sub"/*.h; do
-                [ -e "$h" ] || continue
-                ln -sf "$h" "$PREFIX/include/$(basename "$h")"
-              done
+            # 4. 头文件归一化：让 `#include <fribidi.h>` / `<hb.h>` 直接命中
+            echo "### Normalizing headers"
+            for sub in fribidi harfbuzz; do
+              if [ -d "$PREFIX/include/$sub" ]; then
+                for h in "$PREFIX/include/$sub"/*.h; do
+                  [ -e "$h" ] || continue
+                  ln -sf "$h" "$PREFIX/include/$(basename "$h")"
+                done
+              fi
+            done
+            if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
+              ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
             fi
-          done
-          # freetype 也用 `#include <ft2build.h>` 形式
-          if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
-            ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
-          fi
-          echo "=== \$PREFIX/include 最终内容 ==="
-          ls "$PREFIX/include"
 
-      - name: Build libass
+            # 5. libass
+            echo "### libass ($LINK)"
+            ( cd libass
+              make distclean >/dev/null 2>&1 || true
+              ./autogen.sh
+              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+              ./configure \
+                --prefix="$PREFIX" \
+                --host="$ANDROID_TRIPLE" \
+                --build=x86_64-pc-linux-gnu \
+                $LTOPT --with-pic \
+                --disable-fontconfig \
+                --disable-require-system-font-provider \
+                CFLAGS="$CFLAGS_EXTRA" \
+                CPPFLAGS="$BASE_CPPFLAGS" \
+                LDFLAGS="$BASE_LDFLAGS"
+              make -j"$(nproc)"
+              make install
+            )
+
+            echo "::endgroup::"
+          }
+
+          build_stack static  "$PREFIX_STATIC"
+          build_stack shared  "$PREFIX_SHARED"
+
+      - name: Verify static libass
         run: |
           set -euxo pipefail
-          git clone --depth 1 https://github.com/libass/libass.git
-          cd libass
-          ./autogen.sh
-          ./configure \
-            --prefix="$PREFIX" \
-            --host=aarch64-linux-android \
-            --enable-static --disable-shared \
-            --disable-fontconfig
-          echo "=== configure 采用的 cflags（用于 debug）==="
-          grep -E "^(FRIBIDI|HARFBUZZ|FREETYPE)_(CFLAGS|LIBS) ?=" config.log || true
-          make -j"$(nproc)" V=1
-          make install
-          cd ..
+          echo "=== libass.a ==="
+          test -s "$PREFIX_STATIC/lib/libass.a"
+          ls -la "$PREFIX_STATIC/lib/libass.a"
+          echo "=== 成员列表（前几项）==="
+          ar t "$PREFIX_STATIC/lib/libass.a" | head -5
+          echo "=== 抽一个 .o 看架构 ==="
+          TMP=$(mktemp -d)
+          ( cd "$TMP" && ar x "$PREFIX_STATIC/lib/libass.a" )
+          file "$TMP"/*.o | head -3 | tee /tmp/arch.txt
+          grep -q "ARM aarch64" /tmp/arch.txt || (echo "❌ 架构不是 aarch64"; exit 1)
+          echo "✅ static libass OK"
 
-      - name: Verify Artifacts
+      - name: Verify shared libass
         run: |
-          echo "=== libass 库产物 ==="
-          ls -la "$PREFIX/lib" | grep -iE "libass" || true
-          echo "=== libass 头文件 ==="
-          ls -la "$PREFIX/include" | grep -iE "ass" || true
-          if ls "$PREFIX/lib/libass.a" 1> /dev/null 2>&1; then
-            echo "✅ libass compiled successfully!"
-            file "$PREFIX/lib/libass.a"
-          else
-            echo "❌ libass compilation failed."
-            exit 1
-          fi
+          set -euxo pipefail
+          echo "=== libass.so* ==="
+          ls -la "$PREFIX_SHARED/lib/libass.so"*
+          REAL=$(readlink -f "$PREFIX_SHARED/lib/libass.so")
+          file "$REAL"
+          echo "=== NEEDED / SONAME ==="
+          readelf -d "$REAL" | grep -E 'NEEDED|SONAME' || true
+          echo
+          echo "⚠️  如果要把 .so 直接打包进 APK 的 libs/arm64-v8a/，"
+          echo "   注意当前 SONAME 通常是 libass.so.9，打包工具可能需要重命名"
+          echo "✅ shared libass OK"
+
+      - name: Collect artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/static/lib artifacts/static/include \
+                   artifacts/shared/lib artifacts/shared/include
+
+          # 静态：.a + .pc + include
+          cp -a "$PREFIX_STATIC"/lib/*.a artifacts/static/lib/
+          mkdir -p artifacts/static/lib/pkgconfig
+          cp -a "$PREFIX_STATIC"/lib/pkgconfig/*.pc artifacts/static/lib/pkgconfig/ 2>/dev/null || true
+          cp -a "$PREFIX_STATIC"/include/. artifacts/static/include/
+
+          # 动态：.so* + .pc + include
+          cp -a "$PREFIX_SHARED"/lib/*.so* artifacts/shared/lib/
+          mkdir -p artifacts/shared/lib/pkgconfig
+          cp -a "$PREFIX_SHARED"/lib/pkgconfig/*.pc artifacts/shared/lib/pkgconfig/ 2>/dev/null || true
+          cp -a "$PREFIX_SHARED"/include/. artifacts/shared/include/
+
+          echo "=== static files ==="
+          find artifacts/static -type f | sort
+          echo "=== shared files ==="
+          find artifacts/shared -type f | sort
+
+      - name: Upload libass static
+        uses: actions/upload-artifact@v4
+        with:
+          name: libass-static-aarch64-api${{ env.API_LEVEL }}
+          path: artifacts/static/
+
+      - name: Upload libass shared
+        uses: actions/upload-artifact@v4
+        with:
+          name: libass-shared-aarch64-api${{ env.API_LEVEL }}
+          path: artifacts/shared/
