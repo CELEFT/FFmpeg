@@ -269,7 +269,7 @@ jobs:
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
               make -j$(nproc) && make install
 
-          # ========== 核心修复：Meson 构建 fontconfig ==========
+          # ========== 核心修复：升级 Meson 构建 fontconfig ==========
           - name: expat-fontconfig
             build: |
               set -euo pipefail
@@ -280,7 +280,10 @@ jobs:
                 --enable-static --enable-shared --with-pic
               make -j$(nproc) && make install && cd ..
 
-              # 2. 编译 fontconfig（使用 Meson，指定 expat 后端）
+              # 2. 升级 Meson 到最新版
+              pip3 install -U meson
+
+              # 3. 编译 fontconfig（使用 Meson，指定 expat 后端）
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               cat > fontconfig.cross <<EOF
               [binaries]
@@ -304,7 +307,7 @@ jobs:
                 -Ddocs=disabled
               ninja -C _build && ninja -C _build install && cd ..
 
-              # 3. 手动修复 fontconfig.pc（补全私有依赖，确保静态链接成功）
+              # 4. 手动修复 fontconfig.pc（补全私有依赖，确保静态链接成功）
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/fontconfig.pc <<EOF
               prefix=$PREFIX
