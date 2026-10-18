@@ -95,31 +95,112 @@ jobs:
                 --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j$(nproc) && make install
+          
+          # ==================== 针对性补全 CMake 库的 .pc 文件 ====================
           - name: libaom
             build: |
               git clone --depth 1 https://aomedia.googlesource.com/aom && mkdir -p aom/build && cd aom/build
               cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64
               ninja && ninja install
+              
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/aom.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: aom
+              Description: AOMedia Project AV1 Codec Library
+              Version: 3.8.0
+              Libs: -L\${libdir} -laom
+              Libs.private: -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
+          # ====================================================
+          
           - name: svt-av1
             build: |
               git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git && cd SVT-AV1 && mkdir build && cd build
               cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               ninja && ninja install
+              
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/SvtAv1Enc.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: SvtAv1Enc
+              Description: SVT-AV1 Encoder
+              Version: 1.8.0
+              Libs: -L\${libdir} -lSvtAv1Enc
+              Libs.private: -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
           - name: vvenc
             build: |
               git clone --depth 1 https://github.com/fraunhoferhhi/vvenc.git && cd vvenc && mkdir build && cd build
               cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
+              
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/libvvenc.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: libvvenc
+              Description: Fraunhofer Versatile Video Encoder
+              Version: 1.11.0
+              Libs: -L\${libdir} -lvvenc
+              Libs.private: -lstdc++ -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
           - name: xeve
             build: |
               git clone --depth 1 https://github.com/mpeg5/xeve.git && cd xeve && mkdir build && cd build
               cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
+              
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/xeve.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: xeve
+              Description: MPEG-5 EVC Encoder
+              Version: 1.0.0
+              Libs: -L\${libdir} -lxeve
+              Libs.private: -lstdc++ -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
           - name: xevd
             build: |
               git clone --depth 1 https://github.com/mpeg5/xevd.git && cd xevd && mkdir build && cd build
               cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install
+              
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/xevd.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: xevd
+              Description: MPEG-5 EVC Decoder
+              Version: 1.0.0
+              Libs: -L\${libdir} -lxevd
+              Libs.private: -lstdc++ -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
+          # ====================================================
+
           - name: fdk-aac
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
@@ -158,26 +239,18 @@ jobs:
               export ANDROID_NDK_ROOT=$NDK
               ./Configure android-arm64 -D__ANDROID_API__=36 --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
-          
-          # ==================== 整合了你提供的终极 ass-stack ====================
           - name: ass-stack
             build: |
               set -euo pipefail
               mkdir -p $PREFIX
-
               export BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
               export BASE_LDFLAGS="-L$PREFIX/lib"
 
-              # 1. FreeType (Autotools)
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu \
-                --enable-static --enable-shared --with-pic \
-                --without-zlib --without-png --without-bzip2 --without-harfbuzz \
-                CFLAGS="-O2 -fPIC"
+              ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --without-zlib --without-png --without-bzip2 --without-harfbuzz CFLAGS="-O2 -fPIC"
               make -j$(nproc) && make install && cd ..
 
-              # 2. FriBidi (Meson)
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
               cat > fribidi.cross <<EOF
               [binaries]
@@ -186,22 +259,15 @@ jobs:
               ar = '$AR'
               strip = '$STRIP'
               pkgconfig = 'pkg-config'
-
               [host_machine]
               system = 'android'
               cpu_family = 'aarch64'
               cpu = 'aarch64'
               endian = 'little'
               EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file fribidi.cross \
-                --prefix=$PREFIX \
-                --default-library=both \
-                --buildtype=release \
-                -Ddocs=false -Ddeprecated=false -Db_staticpic=true
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" meson setup _build --cross-file fribidi.cross --prefix=$PREFIX --default-library=both --buildtype=release -Ddocs=false -Ddeprecated=false -Db_staticpic=true
               ninja -C _build && ninja -C _build install && cd ..
 
-              # 3. HarfBuzz (Meson)
               git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
               cat > android.cross <<EOF
               [binaries]
@@ -210,28 +276,17 @@ jobs:
               ar = '$AR'
               strip = '$STRIP'
               pkgconfig = 'pkg-config'
-
               [properties]
               needs_exe_wrapper = true
-
               [host_machine]
               system = 'android'
               cpu_family = 'aarch64'
               cpu = 'aarch64'
               endian = 'little'
               EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file android.cross \
-                --prefix=$PREFIX \
-                --default-library=both \
-                --buildtype=release \
-                -Db_staticpic=true -Dfreetype=enabled \
-                -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
-                -Dicu=disabled -Dgraphite2=disabled \
-                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" meson setup _build --cross-file android.cross --prefix=$PREFIX --default-library=both --buildtype=release -Db_staticpic=true -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
               ninja -C _build && ninja -C _build install && cd ..
 
-              # 4. 头文件归一化 (完美解决找不到 fribidi.h 的核心)
               for sub in fribidi harfbuzz; do
                 if [ -d "$PREFIX/include/$sub" ]; then
                   for h in "$PREFIX/include/$sub"/*.h; do
@@ -244,19 +299,9 @@ jobs:
                 ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # 5. libass (Autotools)
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               ./autogen.sh
-              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              ./configure \
-                --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu \
-                --enable-static --enable-shared --with-pic \
-                --disable-fontconfig \
-                --disable-require-system-font-provider \
-                CFLAGS="-O2 -fPIC" \
-                CPPFLAGS="$BASE_CPPFLAGS" \
-                LDFLAGS="$BASE_LDFLAGS"
+              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --disable-fontconfig --disable-require-system-font-provider CFLAGS="-O2 -fPIC" CPPFLAGS="$BASE_CPPFLAGS" LDFLAGS="$BASE_LDFLAGS"
               make -j$(nproc) && make install
 
     steps:
@@ -264,10 +309,7 @@ jobs:
       - name: Install host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext libexpat1-dev
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config nasm yasm cmake meson ninja-build git wget unzip gperf gettext libexpat1-dev
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
@@ -398,22 +440,14 @@ jobs:
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
 
-      # ==================== 核心要求：合并动态和静态打包 ====================
       - name: Package entire prefix directory
         run: |
-          # 1. 将纯静态的 ffmpeg/ffprobe 放入 bin_static，避免覆盖原有的动态链接版
           mkdir -p $PREFIX/bin_static
           cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe $PREFIX/bin_static/
-          
-          # 2. 生成 BUILD_INFO.txt 放入 prefix 根目录
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $PREFIX/BUILD_INFO.txt
           $PREFIX/bin/ffmpeg -buildconf >> $PREFIX/BUILD_INFO.txt 2>/dev/null || true
-          
-          # 3. 执行极限压缩打包 (完全包含 lib 下的 .so 和 .a，以及 include)
           cd ${{ github.workspace }}
           tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
-          
-          # 4. 移至 artifacts 目录
           mkdir -p artifacts
           mv ffmpeg-android-arm64-v8a.tar.xz artifacts/
 
