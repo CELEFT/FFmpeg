@@ -1,7 +1,7 @@
 name: Test External Libraries Compilation
 
 on:
-  workflow_dispatch: # 仅允许手动点击触发，方便调试
+  workflow_dispatch:
 
 env:
   NDK_VERSION: "r30"
@@ -68,15 +68,17 @@ jobs:
           - name: libvpx
             build: |
               git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
-              # 核心修复测试：绕过 ELF 检测，允许 Android 编译动态库
-              sed -i 's/if enabled gnu; then/if true; then/' configure
+              
+              # 暴力修复：遍历所有配置文件，把拦截的 die 替换为 echo
+              find . -name "configure*" -type f -exec sed -i 's/die "--enable-shared only supported on ELF, OS\/2, and Darwin for now"/echo "Skipping ELF check for Android"/g' {} +
               
               export CROSS=$TOOLCHAIN/bin/llvm-
               export ASFLAGS="-D__ANDROID__"
               export LDFLAGS="-Wl,-z,max-page-size=16384"
+              
               ./configure --prefix=$PREFIX --target=arm64-android-gcc --libc=$SYSROOT \
-                --enable-gnu --enable-vp8 --enable-vp9 --enable-static --enable-shared \
-                --disable-examples --disable-tools --disable-unit-tests \
+                --enable-vp8 --enable-vp9 --enable-static --enable-shared \
+                --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j$(nproc) && make install
 
@@ -92,7 +94,7 @@ jobs:
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
               ./autogen.sh
-              # 核心修复测试：移除不支持的 --extra-cflags，改用环境变量
+              # 使用环境变量替代无效的 configure 参数
               export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
               ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example
               make -j$(nproc) && make install
@@ -109,19 +111,24 @@ jobs:
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
               
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
-              # 核心修复测试：强制指定依赖路径
+              # 终极修复：不仅导出路径，还强行注入 CFLAGS 和 LIBS，彻底摆脱 pkg-config 失败
               export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
               export FRIBIDI_CFLAGS="-I$PREFIX/include"
               export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
+              export FREETYPE_CFLAGS="-I$PREFIX/include/freetype2"
+              export FREETYPE_LIBS="-L$PREFIX/lib -lfreetype"
+              
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install
 
     steps:
       - uses: actions/checkout@v4
+      
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
+          
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
       
@@ -142,7 +149,7 @@ jobs:
       - name: Build ${{ matrix.name }}
         run: ${{ matrix.build }}
 
-      # 打印产物，直观确认是否成功生成了 .so 和 .a
+      # 直观验证是否成功生成了动态库和静态库
       - name: Verify Artifacts
         run: |
           echo "=== Checking compiled libraries for ${{ matrix.name }} ==="
