@@ -304,7 +304,9 @@ jobs:
                 --default-library=both \
                 --buildtype=release \
                 -Dxml-backend=expat \
-                -Ddocs=disabled
+                -Ddoc=disabled \
+                -Dtests=disabled \
+                -Dtools=disabled
               ninja -C _build && ninja -C _build install && cd ..
 
               # 4. 手动修复 fontconfig.pc（补全私有依赖，确保静态链接成功）
