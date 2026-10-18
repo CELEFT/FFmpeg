@@ -4,8 +4,6 @@ on:
   workflow_dispatch:
 
 env:
-  NDK_VERSION: "r30"
-  API_LEVEL: "36"
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
 
 jobs:
@@ -26,102 +24,158 @@ jobs:
         run: |
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
           rm ndk.zip
-          chmod -R +x ${{ github.workspace }}/ndk
+          chmod -R +x "${{ github.workspace }}/ndk"
 
-      - name: Set toolchain environment
+      - name: Configure toolchain env
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
-          echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
-          echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
-          echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++" >> $GITHUB_ENV
-          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
-          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
-          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
+          PREFIX="${{ github.workspace }}/prefix"
+          mkdir -p "$PREFIX"
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "PREFIX=$PREFIX"
+            echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang"
+            echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++"
+            echo "AR=$TOOLCHAIN/bin/llvm-ar"
+            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
+            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
+            echo "PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig"
+            echo "PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig"
+            # 全局 include / lib 路径：不管各库 pc 文件是否规范，这里都能兜底
+            echo "CFLAGS=-O2 -fPIC -I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/freetype2 -I$PREFIX/include/harfbuzz"
+            echo "CPPFLAGS=-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/freetype2 -I$PREFIX/include/harfbuzz"
+            echo "LDFLAGS=-L$PREFIX/lib"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      - name: Build ass-stack
+      - name: Build FreeType
         run: |
-          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+          set -euxo pipefail
+          git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git
+          cd freetype
+          ./autogen.sh
+          ./configure \
+            --prefix="$PREFIX" \
+            --host=aarch64-linux-android \
+            --enable-static --disable-shared \
+            --without-zlib --without-png --without-bzip2 --without-harfbuzz
+          make -j"$(nproc)"
+          make install
+          cd ..
+          echo "=== FreeType headers ==="
+          ls "$PREFIX/include/freetype2/freetype"
 
-          # 1. 编译 FreeType
-          git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
-          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-            --enable-static --enable-shared \
-            --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no \
-            && make -j$(nproc) && make install && cd ..
-          
-          # 2. 编译 Fribidi
-          git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-          ./autogen.sh && ./configure --prefix=$PREFIX --build=x86_64-pc-linux-gnu --host=aarch64-linux-android \
-            --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
-          
-          # 3. 编译 HarfBuzz
-          git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
-          printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
-          meson setup _build --cross-file $PWD/android.cross --prefix=$PREFIX --default-library=both --buildtype=release -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled -Dtests=disabled -Ddocs=disabled
-          ninja -C _build && ninja -C _build install && cd ..
-          
-          # 4. 编译 Fontconfig
-          git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
-          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-            --enable-static --enable-shared --disable-docs \
-            && make -j$(nproc) && make install && cd ..
-          
-          # 【终极修复】手动伪造 fribidi.pc 和 harfbuzz.pc 以满足 libass 的严格检查
-          mkdir -p $PREFIX/lib/pkgconfig
-          cat > $PREFIX/lib/pkgconfig/fribidi.pc <<EOF
-          prefix=$PREFIX
-          exec_prefix=\${prefix}
-          libdir=\${prefix}/lib
-          includedir=\${prefix}/include
-
-          Name: fribidi
-          Description: GNU FriBidi
-          Version: 1.0.13
-          Libs: -L\${libdir} -lfribidi
-          Cflags: -I\${includedir}/fribidi
-          EOF
-          
-          cat > $PREFIX/lib/pkgconfig/harfbuzz.pc <<EOF
-          prefix=$PREFIX
-          exec_prefix=\${prefix}
-          libdir=\${prefix}/lib
-          includedir=\${prefix}/include
-
-          Name: harfbuzz
-          Description: HarfBuzz text shaping library
-          Version: 8.0.0
-          Libs: -L\${libdir} -lharfbuzz
-          Cflags: -I\${includedir}/harfbuzz
-          EOF
-          
-          # 5. 编译 libass
-          git clone --depth 1 https://github.com/libass/libass.git && cd libass
-          
-          export FRIBIDI_CFLAGS="-I$PREFIX/include/fribidi -I$PREFIX/include"
-          export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
-          export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz -I$PREFIX/include"
-          export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
-          export FREETYPE_CFLAGS="-I$PREFIX/include/freetype2 -I$PREFIX/include"
-          export FREETYPE_LIBS="-L$PREFIX/lib -lfreetype"
-          
-          export CFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2 $CFLAGS"
-          export CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2 $CPPFLAGS"
-          export LDFLAGS="-L$PREFIX/lib $LDFLAGS"
-          
-          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-            --enable-static --enable-shared \
-            --disable-require-system-font-provider \
-            && make -j$(nproc) && make install
-
-      - name: Verify Artifacts and Headers
+      - name: Build FriBidi
         run: |
-          echo "=== Checking libass artifacts ==="
-          ls -la $PREFIX/lib/ | grep libass || true
-          ls -la $PREFIX/include/ | grep ass || true
-          if ls $PREFIX/lib/libass.* 1> /dev/null 2>&1; then echo "✅ libass compiled successfully!"; else echo "❌ libass compilation failed."; fi
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/fribidi/fribidi.git
+          cd fribidi
+          ./autogen.sh
+          ./configure \
+            --prefix="$PREFIX" \
+            --host=aarch64-linux-android \
+            --build=x86_64-pc-linux-gnu \
+            --enable-static --disable-shared
+          make -j"$(nproc)"
+          make install
+          cd ..
+          echo "=== FriBidi 原始头文件位置 ==="
+          find "$PREFIX/include" -name '*.h' | grep -i fribidi || true
+          echo "=== FriBidi 库 ==="
+          ls "$PREFIX/lib" | grep -i fribidi || true
+
+      - name: Build HarfBuzz
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git
+          cd harfbuzz
+          cat > android.cross <<EOF
+          [binaries]
+          c = '$CC'
+          cpp = '$CXX'
+          ar = '$AR'
+          strip = '$STRIP'
+          pkgconfig = 'pkg-config'
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+          meson setup _build --cross-file android.cross \
+            --prefix="$PREFIX" \
+            --default-library=static \
+            --buildtype=release \
+            -Dfreetype=enabled \
+            -Dglib=disabled \
+            -Dgobject=disabled \
+            -Dcairo=disabled \
+            -Dicu=disabled \
+            -Dgraphite2=disabled \
+            -Dtests=disabled \
+            -Ddocs=disabled \
+            -Dintrospection=disabled
+          ninja -C _build
+          ninja -C _build install
+          cd ..
+          echo "=== HarfBuzz 头文件 ==="
+          find "$PREFIX/include" -name 'hb.h' || true
+
+      - name: Normalize headers (关键修复)
+        run: |
+          set -euxo pipefail
+          # libass 源码中用 `#include <fribidi.h>` / `#include <hb.h>`，
+          # 而 fribidi / harfbuzz 默认装在 include/<lib>/ 子目录下。
+          # 这里用 symlink 暴露到 $PREFIX/include/ 顶层，配合
+          # CPPFLAGS 里的 -I$PREFIX/include 就能被找到。
+          for sub in fribidi harfbuzz; do
+            if [ -d "$PREFIX/include/$sub" ]; then
+              for h in "$PREFIX/include/$sub"/*.h; do
+                [ -e "$h" ] || continue
+                ln -sf "$h" "$PREFIX/include/$(basename "$h")"
+              done
+            fi
+          done
+          # freetype 也用 `#include <ft2build.h>` 形式
+          if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
+            ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
+          fi
+          echo "=== \$PREFIX/include 最终内容 ==="
+          ls "$PREFIX/include"
+
+      - name: Build libass
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/libass/libass.git
+          cd libass
+          ./autogen.sh
+          ./configure \
+            --prefix="$PREFIX" \
+            --host=aarch64-linux-android \
+            --enable-static --disable-shared \
+            --disable-fontconfig
+          echo "=== configure 采用的 cflags（用于 debug）==="
+          grep -E "^(FRIBIDI|HARFBUZZ|FREETYPE)_(CFLAGS|LIBS) ?=" config.log || true
+          make -j"$(nproc)" V=1
+          make install
+          cd ..
+
+      - name: Verify Artifacts
+        run: |
+          echo "=== libass 库产物 ==="
+          ls -la "$PREFIX/lib" | grep -iE "libass" || true
+          echo "=== libass 头文件 ==="
+          ls -la "$PREFIX/include" | grep -iE "ass" || true
+          if ls "$PREFIX/lib/libass.a" 1> /dev/null 2>&1; then
+            echo "✅ libass compiled successfully!"
+            file "$PREFIX/lib/libass.a"
+          else
+            echo "❌ libass compilation failed."
+            exit 1
+          fi
