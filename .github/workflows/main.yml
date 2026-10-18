@@ -182,7 +182,6 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
-          # ========== libaom：安装后校验并补齐 libaom.so（版本化软链 / 静态合成双保险）==========
           - name: libaom
             build: |
               set -euo pipefail
@@ -209,7 +208,6 @@ jobs:
                     -Wl,--whole-archive "$PREFIX/lib/libaom.a" -Wl,--no-whole-archive -lc++_static -lm
                 fi
               fi
-              # 若静态库没装（只装了 shared），从构建目录补
               if [ ! -f "$PREFIX/lib/libaom.a" ]; then
                 A=$(find . -name 'libaom.a' | head -n1 || true)
                 [ -n "${A:-}" ] && cp -f "$A" "$PREFIX/lib/libaom.a"
@@ -286,7 +284,6 @@ jobs:
               Cflags: -I\${includedir} -I\${includedir}/vvenc
               EOF
 
-          # ========== xeve：上游无完整 install 规则，全部手动收集 + 缺失则合成 .so ==========
           - name: xeve
             build: |
               set -euo pipefail
@@ -307,12 +304,10 @@ jobs:
               echo "--- xeve 构建产物 ---"
               find . -name 'libxeve*' -o -name 'xeve*.h' | sort || true
 
-              # 头文件
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               while IFS= read -r h; do cp -f "$h" "$PREFIX/include/"; done \
                 < <(find . -maxdepth 3 -name 'xeve*.h' -not -path './build_*/*' 2>/dev/null || true)
 
-              # 静态库 / 动态库
               while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done \
                 < <(find . -maxdepth 4 -name 'libxeve.a'  -o -maxdepth 4 -name 'libxeve.so*' 2>/dev/null || true)
               if [ ! -e "$PREFIX/lib/libxeve.so" ]; then
@@ -343,7 +338,6 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
-          # ========== xevd：同上，手动收集 + 合成缺失的 .so ==========
           - name: xevd
             build: |
               set -euo pipefail
@@ -818,10 +812,13 @@ jobs:
           #include <fdk-aac/aacenc_lib.h>
           #include <lame/lame.h>
           #include <lc3.h>
+
           int main(void) {
             const x265_api *a = x265_api_get(8);
+            HANDLE_AACENCODER h = NULL;
+            (void)aacEncOpen(&h, 0, 0);
             (void)lame_init();
-            (void)aacEncGetVersion;
+            (void)lc3_encoder_frame_lt;
             (void)a;
             return 0;
           }
