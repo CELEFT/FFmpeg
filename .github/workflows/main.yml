@@ -64,15 +64,12 @@ jobs:
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --cross-prefix=$TOOLCHAIN/bin/llvm- \
                 --enable-static --enable-shared --enable-pic --disable-cli
               make -j$(nproc) && make install
-              
-              # 手写 x264.pc
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/x264.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: x264
               Description: H.264 (MPEG4 AVC) encoder library
               Version: 0.164.3095
@@ -113,15 +110,12 @@ jobs:
                 --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j$(nproc) && make install
-              
-              # 手写 vpx.pc
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/vpx.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: vpx
               Description: WebM Project VP8/VP9 Codec Library
               Version: 1.14.0
@@ -164,11 +158,12 @@ jobs:
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
+
               Name: SvtAv1Enc
               Description: SVT-AV1 Encoder
               Version: 1.8.0
               Libs: -L\${libdir} -lSvtAv1Enc
-              Libs.private: -lm -lpthread
+              Libs.private: -lstdc++ -lm -lpthread
               Cflags: -I\${includedir}
               EOF
           - name: vvenc
@@ -318,17 +313,14 @@ jobs:
           - name: expat-fontconfig
             build: |
               set -euo pipefail
-              # 1. 编译 expat
               wget -q https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
               tar xf expat-2.6.2.tar.gz && cd expat-2.6.2
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --build=x86_64-pc-linux-gnu \
                 --enable-static --enable-shared --with-pic
               make -j$(nproc) && make install && cd ..
 
-              # 2. 升级 Meson 到最新版
               pip3 install -U meson
 
-              # 3. 编译 fontconfig（使用 Meson，指定 expat 后端）
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               cat > fontconfig.cross <<EOF
               [binaries]
@@ -354,7 +346,6 @@ jobs:
                 -Dtools=disabled
               ninja -C _build && ninja -C _build install && cd ..
 
-              # 4. 手动修复 fontconfig.pc（补全私有依赖，确保静态链接成功）
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/fontconfig.pc <<EOF
               prefix=$PREFIX
