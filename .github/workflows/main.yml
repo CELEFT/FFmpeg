@@ -64,6 +64,22 @@ jobs:
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --cross-prefix=$TOOLCHAIN/bin/llvm- \
                 --enable-static --enable-shared --enable-pic --disable-cli
               make -j$(nproc) && make install
+              
+              # 手写 x264.pc
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/x264.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: x264
+              Description: H.264 (MPEG4 AVC) encoder library
+              Version: 0.164.3095
+              Libs: -L\${libdir} -lx264
+              Libs.private: -lm -lpthread -ldl
+              Cflags: -I\${includedir}
+              EOF
           - name: x265
             build: |
               git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git
@@ -97,6 +113,22 @@ jobs:
                 --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j$(nproc) && make install
+              
+              # 手写 vpx.pc
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/vpx.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: vpx
+              Description: WebM Project VP8/VP9 Codec Library
+              Version: 1.14.0
+              Libs: -L\${libdir} -lvpx
+              Libs.private: -lm -lpthread
+              Cflags: -I\${includedir}
+              EOF
           - name: libaom
             build: |
               git clone --depth 1 https://aomedia.googlesource.com/aom && mkdir -p aom/build && cd aom/build
@@ -262,6 +294,19 @@ jobs:
               cp bin/liblc3.a $PREFIX/lib/ 2>/dev/null || true
               $CC -shared -o $PREFIX/lib/liblc3.so build/src/*.o -lm
               cp include/*.h $PREFIX/include/ 2>/dev/null || true
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/lc3.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+              Name: lc3
+              Description: Low Complexity Communication Codec
+              Version: 1.1.0
+              Libs: -L\${libdir} -llc3
+              Libs.private: -lm
+              Cflags: -I\${includedir}
+              EOF
           - name: webp
             build: |
               git clone --depth 1 https://github.com/webmproject/libwebp.git && cd libwebp
