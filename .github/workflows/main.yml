@@ -57,7 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ========== 原生双轨（单次编译） ==========
           - name: x264
             build: |
               git clone --depth 1 https://code.videolan.org/videolan/x264.git && cd x264
@@ -70,6 +69,7 @@ jobs:
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
+
               Name: x264
               Description: H.264 (MPEG4 AVC) encoder library
               Version: 0.164.3095
@@ -77,6 +77,8 @@ jobs:
               Libs.private: -lm -lpthread -ldl
               Cflags: -I\${includedir}
               EOF
+
+          # ========== 核心修复：为 x265 手写 .pc 并声明 C++ 依赖 ==========
           - name: x265
             build: |
               git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git
@@ -92,6 +94,23 @@ jobs:
                 -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_CLI=OFF \
                 ../../source
               make -j$(nproc) && make install
+
+              # 手写 x265.pc，关键点：Libs.private 必须包含 -lc++
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/x265.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: x265
+              Description: H.265/HEVC video encoder
+              Version: 4.1
+              Libs: -L\${libdir} -lx265
+              Libs.private: -lc++ -lm -lpthread -ldl
+              Cflags: -I\${includedir}
+              EOF
+
           - name: dav1d
             build: |
               git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
@@ -142,7 +161,6 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
-          # ========== 回退双轨（双次编译：先动态，后静态） ==========
           - name: svt-av1
             build: |
               git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git && cd SVT-AV1
@@ -158,7 +176,6 @@ jobs:
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: SvtAv1Enc
               Description: SVT-AV1 Encoder
               Version: 1.8.0
@@ -255,7 +272,6 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
-          # ========== Autotools / Meson 原生双轨 ==========
           - name: fdk-aac
             build: |
               git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
@@ -309,7 +325,6 @@ jobs:
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
               make -j$(nproc) && make install
 
-          # ========== 核心修复：升级 Meson 构建 fontconfig ==========
           - name: expat-fontconfig
             build: |
               set -euo pipefail
@@ -365,9 +380,7 @@ jobs:
               Libs.private: -L\${libdir} -lexpat -lfreetype
               Cflags: -I\${includedir}
               EOF
-          # ================================================================
 
-          # ========== 字幕依赖栈（Meson both + Autotools 双轨） ==========
           - name: ass-stack
             build: |
               set -euo pipefail
