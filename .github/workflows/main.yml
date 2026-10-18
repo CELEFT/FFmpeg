@@ -80,7 +80,6 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
-          # ========== 不再依赖 x265 的 install 行为：从构建目录直接收集 .a/.so/.h ==========
           - name: x265
             build: |
               set -euo pipefail
@@ -104,46 +103,32 @@ jobs:
                 -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
                 -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
               )
-
               for shared in ON OFF; do
                 rm -rf "build-$shared"
                 cmake -S source -B "build-$shared" "${X265_FLAGS[@]}" -DENABLE_SHARED="$shared"
                 cmake --build "build-$shared" -j"$(nproc)"
-                echo "--- build-$shared artifacts ---"
-                find "build-$shared" -maxdepth 2 -name 'libx265*' -o -maxdepth 2 -name 'x265_config.h' | sort
               done
 
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
-
-              # 1) 头文件（x265_config.h 为构建期生成）
               for h in x265.h x265_config.h; do
                 src=$(find build-ON build-OFF source -maxdepth 1 -name "$h" | head -n1 || true)
-                if [ -n "${src:-}" ]; then cp -f "$src" "$PREFIX/include/$h"; fi
+                [ -n "${src:-}" ] && cp -f "$src" "$PREFIX/include/$h"
               done
-
-              # 2) 静态库
-              A=$(find build-OFF build-ON -maxdepth 2 -name 'libx265.a' | head -n1 || true)
-              if [ -z "${A:-}" ]; then A=$(find . -name 'libx265.a' | head -n1 || true); fi
-              if [ -n "${A:-}" ]; then cp -f "$A" "$PREFIX/lib/libx265.a"; fi
-
-              # 3) 动态库：先收共享构建产物，缺失则用 PIC 静态库整体打包
+              A=$(find . -name 'libx265.a' | head -n1 || true)
+              [ -n "${A:-}" ] && cp -f "$A" "$PREFIX/lib/libx265.a"
               while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done < <(find build-ON -maxdepth 2 -name 'libx265.so*' 2>/dev/null || true)
               if [ ! -e "$PREFIX/lib/libx265.so" ]; then
                 real=$(find "$PREFIX/lib" -maxdepth 1 -name 'libx265.so.*' | head -n1 || true)
-                if [ -n "${real:-}" ]; then
-                  cp -f "$real" "$PREFIX/lib/libx265.so"
+                if [ -n "${real:-}" ]; then cp -f "$real" "$PREFIX/lib/libx265.so"
                 else
                   echo "::warning::CMake 未产出 libx265.so，改用 PIC 静态库生成"
                   $CXX -shared -Wl,-soname,libx265.so -o "$PREFIX/lib/libx265.so" \
-                    -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive \
-                    -lc++_static -lm
+                    -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive -lc++_static -lm
                 fi
               fi
-
               test -f "$PREFIX/lib/libx265.a"  || { echo "libx265.a missing";  exit 1; }
               test -e "$PREFIX/lib/libx265.so" || { echo "libx265.so missing"; exit 1; }
               test -f "$PREFIX/include/x265.h" || { echo "x265.h missing";     exit 1; }
-              ls -l "$PREFIX"/lib/libx265* "$PREFIX"/include/x265*
 
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/x265.pc" <<EOF
@@ -197,6 +182,7 @@ jobs:
               Cflags: -I\${includedir}
               EOF
 
+          # ========== libaom：安装后校验并补齐 libaom.so（版本化软链 / 静态合成双保险）==========
           - name: libaom
             build: |
               set -euo pipefail
@@ -206,8 +192,31 @@ jobs:
                 -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
                 -DENABLE_SHARED=ON -DENABLE_STATIC=ON \
                 -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF \
-                -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                -DCONFIG_AV1_ENCODER=1 -DCONFIG_PIC=1 \
+                -DAOM_TARGET_CPU=arm64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               ninja && ninja install
+
+              mkdir -p "$PREFIX/lib"
+              echo "--- aom 安装产物 ---"
+              ls -l "$PREFIX"/lib/libaom* || true
+              if [ ! -e "$PREFIX/lib/libaom.so" ]; then
+                real=$(ls "$PREFIX"/lib/libaom.so.* 2>/dev/null | head -n1 || true)
+                if [ -n "${real:-}" ]; then
+                  ln -sf "$(basename "$real")" "$PREFIX/lib/libaom.so"
+                elif [ -f "$PREFIX/lib/libaom.a" ]; then
+                  echo "::warning::aom 未产出 .so，改用 PIC 静态库生成"
+                  $CXX -shared -Wl,-soname,libaom.so -o "$PREFIX/lib/libaom.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/libaom.a" -Wl,--no-whole-archive -lc++_static -lm
+                fi
+              fi
+              # 若静态库没装（只装了 shared），从构建目录补
+              if [ ! -f "$PREFIX/lib/libaom.a" ]; then
+                A=$(find . -name 'libaom.a' | head -n1 || true)
+                [ -n "${A:-}" ] && cp -f "$A" "$PREFIX/lib/libaom.a"
+              fi
+              test -f "$PREFIX/lib/libaom.a"  || { echo "libaom.a missing";  exit 1; }
+              test -e "$PREFIX/lib/libaom.so" || { echo "libaom.so missing"; exit 1; }
+
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/aom.pc" <<EOF
               prefix=$PREFIX
@@ -277,6 +286,7 @@ jobs:
               Cflags: -I\${includedir} -I\${includedir}/vvenc
               EOF
 
+          # ========== xeve：上游无完整 install 规则，全部手动收集 + 缺失则合成 .so ==========
           - name: xeve
             build: |
               set -euo pipefail
@@ -286,10 +296,39 @@ jobs:
                 cmake .. -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
                   -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-                  -DSET_PROF=MAIN -DBUILD_SHARED_LIBS="$mode" -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                make -j"$(nproc)" && make install
+                  -DSET_PROF=MAIN -DBUILD_SHARED_LIBS="$mode" \
+                  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                make -j"$(nproc)"
+                make install || true
                 cd ..
               done
+
+              mkdir -p "$PREFIX/lib" "$PREFIX/include"
+              echo "--- xeve 构建产物 ---"
+              find . -name 'libxeve*' -o -name 'xeve*.h' | sort || true
+
+              # 头文件
+              [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
+              while IFS= read -r h; do cp -f "$h" "$PREFIX/include/"; done \
+                < <(find . -maxdepth 3 -name 'xeve*.h' -not -path './build_*/*' 2>/dev/null || true)
+
+              # 静态库 / 动态库
+              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done \
+                < <(find . -maxdepth 4 -name 'libxeve.a'  -o -maxdepth 4 -name 'libxeve.so*' 2>/dev/null || true)
+              if [ ! -e "$PREFIX/lib/libxeve.so" ]; then
+                real=$(ls "$PREFIX"/lib/libxeve.so.* 2>/dev/null | head -n1 || true)
+                if [ -n "${real:-}" ]; then
+                  ln -sf "$(basename "$real")" "$PREFIX/lib/libxeve.so"
+                elif [ -f "$PREFIX/lib/libxeve.a" ]; then
+                  $CXX -shared -Wl,-soname,libxeve.so -o "$PREFIX/lib/libxeve.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/libxeve.a" -Wl,--no-whole-archive -lc++_static -lm
+                fi
+              fi
+
+              test -f "$PREFIX/lib/libxeve.a"  || { echo "libxeve.a missing";  exit 1; }
+              test -e "$PREFIX/lib/libxeve.so" || { echo "libxeve.so missing"; exit 1; }
+              test -f "$PREFIX/include/xeve.h" || { echo "xeve.h missing";     exit 1; }
+
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/xeve.pc" <<EOF
               prefix=$PREFIX
@@ -301,9 +340,10 @@ jobs:
               Version: 1.0.0
               Libs: -L\${libdir} -lxeve
               Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir} -I\${includedir}/xeve
+              Cflags: -I\${includedir}
               EOF
 
+          # ========== xevd：同上，手动收集 + 合成缺失的 .so ==========
           - name: xevd
             build: |
               set -euo pipefail
@@ -313,10 +353,37 @@ jobs:
                 cmake .. -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
                   -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-                  -DBUILD_SHARED_LIBS="$mode" -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                make -j"$(nproc)" && make install
+                  -DBUILD_SHARED_LIBS="$mode" \
+                  -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                make -j"$(nproc)"
+                make install || true
                 cd ..
               done
+
+              mkdir -p "$PREFIX/lib" "$PREFIX/include"
+              echo "--- xevd 构建产物 ---"
+              find . -name 'libxevd*' -o -name 'xevd*.h' | sort || true
+
+              [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
+              while IFS= read -r h; do cp -f "$h" "$PREFIX/include/"; done \
+                < <(find . -maxdepth 3 -name 'xevd*.h' -not -path './build_*/*' 2>/dev/null || true)
+
+              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done \
+                < <(find . -maxdepth 4 -name 'libxevd.a' -o -maxdepth 4 -name 'libxevd.so*' 2>/dev/null || true)
+              if [ ! -e "$PREFIX/lib/libxevd.so" ]; then
+                real=$(ls "$PREFIX"/lib/libxevd.so.* 2>/dev/null | head -n1 || true)
+                if [ -n "${real:-}" ]; then
+                  ln -sf "$(basename "$real")" "$PREFIX/lib/libxevd.so"
+                elif [ -f "$PREFIX/lib/libxevd.a" ]; then
+                  $CXX -shared -Wl,-soname,libxevd.so -o "$PREFIX/lib/libxevd.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/libxevd.a" -Wl,--no-whole-archive -lc++_static -lm
+                fi
+              fi
+
+              test -f "$PREFIX/lib/libxevd.a"  || { echo "libxevd.a missing";  exit 1; }
+              test -e "$PREFIX/lib/libxevd.so" || { echo "libxevd.so missing"; exit 1; }
+              test -f "$PREFIX/include/xevd.h" || { echo "xevd.h missing";     exit 1; }
+
               mkdir -p "$PREFIX/lib/pkgconfig"
               cat > "$PREFIX/lib/pkgconfig/xevd.pc" <<EOF
               prefix=$PREFIX
@@ -328,7 +395,7 @@ jobs:
               Version: 1.0.0
               Libs: -L\${libdir} -lxevd
               Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir} -I\${includedir}/xevd
+              Cflags: -I\${includedir}
               EOF
 
           - name: openssl
@@ -409,7 +476,6 @@ jobs:
               ./autogen.sh && ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic && make -j"$(nproc)" && make install
 
-          # ========== liblc3 无 lib 目标：直接用 NDK clang 编译源码，产物完全可控 ==========
           - name: lc3
             build: |
               set -euo pipefail
@@ -664,26 +730,49 @@ jobs:
         run: |
           set -euo pipefail
           PC_DIR="$PREFIX/lib/pkgconfig"
+          mkdir -p "$PC_DIR"
           for f in "$PC_DIR"/*.pc; do
             [ -e "$f" ] || continue
             sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
           done
-          # 若 x265.pc 丢失则补一份，避免历史 artifact 缺文件导致 configure 失败
-          if [ ! -f "$PC_DIR/x265.pc" ]; then
-            cat > "$PC_DIR/x265.pc" <<EOF
+          for m in x265 xeve xevd aom; do
+            if [ ! -f "$PC_DIR/$m.pc" ]; then
+              case "$m" in
+                x265) desc="H.265/HEVC video encoder"; lib=x265 ;;
+                aom)  desc="AOMedia Project AV1 Codec Library"; lib=aom ;;
+                xeve) desc="MPEG-5 EVC Encoder"; lib=xeve ;;
+                xevd) desc="MPEG-5 EVC Decoder"; lib=xevd ;;
+              esac
+              cat > "$PC_DIR/$m.pc" <<EOF
           prefix=$PREFIX
           exec_prefix=\${prefix}
           libdir=\${exec_prefix}/lib
           includedir=\${prefix}/include
 
-          Name: x265
-          Description: H.265/HEVC video encoder
-          Version: 4.1
-          Libs: -L\${libdir} -lx265
+          Name: $m
+          Description: $desc
+          Version: 1.0.0
+          Libs: -L\${libdir} -l$lib
           Libs.private: $BASE_PRIVATE_LIBS
           Cflags: -I\${includedir}
           EOF
-          fi
+            fi
+          done
+
+      # ===== 兜底：任何缺 .so 的库，用 PIC 静态库现场合成 =====
+      - name: Repair missing shared libs from static archives
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$PREFIX/lib" || exit 0
+          for a in *.a; do
+            base=${a%.a}
+            if [ -e "$base.so" ] || ls "${base}.so".* >/dev/null 2>&1; then continue; fi
+            echo "--- synthesizing $base.so from $a ---"
+            $CXX -shared -Wl,-soname,"$base.so" -o "$base.so" \
+              -Wl,--whole-archive "$a" -Wl,--no-whole-archive -lc++_static -lm -lz 2>&1 | tail -n 5 \
+              || { echo "::warning::cannot synthesize $base.so"; rm -f "$base.so"; }
+          done
 
       - name: Verify all external libs
         shell: bash
@@ -711,10 +800,12 @@ jobs:
             lib=${L[$m]}
             [ -f "$PREFIX/include/${H[$m]}" ]    || { echo "::error::header missing: $m (${H[$m]})"; fail=1; }
             [ -f "$PREFIX/lib/pkgconfig/$m.pc" ] || { echo "::error::pc missing: $m.pc"; fail=1; }
-            { ls "$PREFIX/lib/lib${lib}.so" >/dev/null 2>&1 || ls "$PREFIX/lib/lib${lib}.so".* >/dev/null 2>&1; } || { echo "::error::so missing: lib${lib}"; fail=1; }
+            { [ -e "$PREFIX/lib/lib${lib}.so" ] || ls "$PREFIX/lib/lib${lib}.so".* >/dev/null 2>&1; } || { echo "::error::so missing: lib${lib}"; fail=1; }
             [ -f "$PREFIX/lib/lib${lib}.a" ]     || { echo "::error::static missing: lib${lib}.a"; fail=1; }
             pkg-config --exists "$m"             || { echo "::error::pkg-config broken: $m"; fail=1; }
           done
+          echo "--- headers ---"; find "$PREFIX/include" -maxdepth 1 -type f | sort | head -n 60
+          echo "--- libs ---";    ls "$PREFIX/lib" | sort
           [ "$fail" -eq 0 ] || exit 1
 
       - name: Link test via pkg-config (shared + static)
@@ -723,6 +814,7 @@ jobs:
           set -euo pipefail
           cat > /tmp/t.c <<'EOF'
           #include <x265.h>
+          #include <aom/aom_decoder.h>
           #include <fdk-aac/aacenc_lib.h>
           #include <lame/lame.h>
           #include <lc3.h>
@@ -734,8 +826,8 @@ jobs:
             return 0;
           }
           EOF
-          echo "== shared =="; $CC /tmp/t.c -o /tmp/t_shared $(pkg-config --cflags --libs x265 fdk-aac lame lc3)
-          echo "== static =="; $CC /tmp/t.c -o /tmp/t_static $(pkg-config --static --cflags --libs x265 fdk-aac lame lc3)
+          echo "== shared =="; $CC /tmp/t.c -o /tmp/t_shared $(pkg-config --cflags --libs x265 aom fdk-aac lame lc3)
+          echo "== static =="; $CC /tmp/t.c -o /tmp/t_static $(pkg-config --static --cflags --libs x265 aom fdk-aac lame lc3)
           echo "==> link tests OK"
 
       - name: Download FFmpeg Source
