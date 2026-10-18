@@ -93,7 +93,7 @@ jobs:
               make install
             )
 
-            # 2. FriBidi  ← 关键修复：autoreconf 代替 autogen.sh
+            # 2. FriBidi  ← 加 --disable-docs，跳过 c2man 依赖
             echo "### FriBidi ($LINK)"
             ( cd fribidi
               make distclean >/dev/null 2>&1 || true
@@ -104,6 +104,8 @@ jobs:
                 --host="$ANDROID_TRIPLE" \
                 --build=x86_64-pc-linux-gnu \
                 $LTOPT --with-pic \
+                --disable-docs \
+                --disable-debug \
                 CFLAGS="$CFLAGS_EXTRA"
               make -j"$(nproc)"
               make install
@@ -217,18 +219,16 @@ jobs:
       - name: Collect artifacts
         run: |
           set -euxo pipefail
-          mkdir -p artifacts/static/lib artifacts/static/include \
-                   artifacts/shared/lib artifacts/shared/include
+          mkdir -p artifacts/static/lib/pkgconfig artifacts/static/include \
+                   artifacts/shared/lib/pkgconfig artifacts/shared/include
 
           # 静态：.a + .pc + include
           cp -a "$PREFIX_STATIC"/lib/*.a artifacts/static/lib/
-          mkdir -p artifacts/static/lib/pkgconfig
           cp -a "$PREFIX_STATIC"/lib/pkgconfig/*.pc artifacts/static/lib/pkgconfig/ 2>/dev/null || true
           cp -a "$PREFIX_STATIC"/include/. artifacts/static/include/
 
           # 动态：.so* + .pc + include
           cp -a "$PREFIX_SHARED"/lib/*.so* artifacts/shared/lib/
-          mkdir -p artifacts/shared/lib/pkgconfig
           cp -a "$PREFIX_SHARED"/lib/pkgconfig/*.pc artifacts/shared/lib/pkgconfig/ 2>/dev/null || true
           cp -a "$PREFIX_SHARED"/include/. artifacts/shared/include/
 
