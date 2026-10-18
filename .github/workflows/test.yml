@@ -9,10 +9,9 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
 
 jobs:
-  prepare:
+  # 为了极速测试，直接把 prepare 和 test 合并进一个 Job
+  test-ass-stack:
     runs-on: ubuntu-latest
-    outputs:
-      ndk-path: ${{ steps.setup-ndk.outputs.path }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,20 +22,8 @@ jobs:
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip \
             gperf gettext
-            
-      - name: Cache NDK
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ndk
-          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
-
-      - name: Restore NDK Permissions
-        if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x ${{ github.workspace }}/ndk
 
       - name: Download and Unpack NDK
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
@@ -44,32 +31,6 @@ jobs:
           rm ndk.zip
           chmod -R +x ${{ github.workspace }}/ndk
 
-      - name: Set NDK Output Path
-        id: setup-ndk
-        run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
-
-      - name: Upload NDK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ndk
-          path: ${{ steps.setup-ndk.outputs.path }}
-          retention-days: 1
-
-  test-ass-stack:
-    needs: prepare
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Download NDK
-        uses: actions/download-artifact@v4
-        with:
-          name: ndk
-          path: ${{ github.workspace }}/ndk
-          
-      - name: Fix NDK Permissions
-        run: chmod -R +x ${{ github.workspace }}/ndk
-      
       - name: Set toolchain environment
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
@@ -93,9 +54,9 @@ jobs:
             --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no \
             && make -j$(nproc) && make install && cd ..
 
-          # 2. 编译 Fribidi (之前漏掉的)
+          # 2. 编译 Fribidi (加上 cross_compiling=yes 强制跳过测试程序运行)
           git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android cross_compiling=yes \
             --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
 
           # 3. 编译 HarfBuzz (使用 Meson)
