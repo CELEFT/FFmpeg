@@ -120,11 +120,9 @@ jobs:
           - name: svt-av1
             build: |
               git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git && cd SVT-AV1
-              # 动态库
               mkdir build_shared && cd build_shared
               cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               ninja && ninja install && cd ..
-              # 静态库
               mkdir build_static && cd build_static
               cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF
               ninja && ninja install && cd ..
@@ -211,11 +209,9 @@ jobs:
             build: |
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
               export ANDROID_NDK_ROOT=$NDK
-              # 动态库
               ./Configure android-arm64 -D__ANDROID_API__=$API_LEVEL --prefix=$PREFIX --openssldir=$PREFIX/ssl no-tests
               make -j$(nproc) && make install_sw
               make clean
-              # 静态库
               ./Configure android-arm64 -D__ANDROID_API__=$API_LEVEL --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
               mkdir -p $PREFIX/lib/pkgconfig
@@ -272,6 +268,49 @@ jobs:
               ./autogen.sh
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
               make -j$(nproc) && make install
+
+          # ========== 核心修复：补全 expat + fontconfig 依赖链 ==========
+          - name: expat-fontconfig
+            build: |
+              set -euo pipefail
+              # 1. 编译 expat (fontconfig 的隐藏强依赖)
+              wget -q https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
+              tar xf expat-2.6.2.tar.gz && cd expat-2.6.2
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --build=x86_64-pc-linux-gnu \
+                --enable-static --enable-shared --with-pic
+              make -j$(nproc) && make install && cd ..
+
+              # 2. 编译 fontconfig (明确指定 expat 路径)
+              git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
+              ./autogen.sh
+              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --build=x86_64-pc-linux-gnu \
+                --enable-static --enable-shared --with-pic \
+                --with-expat-includes=$PREFIX/include --with-expat-lib=$PREFIX/lib \
+                --disable-docs
+              make -j$(nproc) && make install && cd ..
+
+              # 3. 手动修复 fontconfig.pc (补全私有依赖，确保静态链接成功)
+              mkdir -p $PREFIX/lib/pkgconfig
+              cat > $PREFIX/lib/pkgconfig/fontconfig.pc <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${prefix}/lib
+              includedir=\${prefix}/include
+              sysconfdir=\${prefix}/etc
+              localstatedir=\${prefix}/var
+              PACKAGE=fontconfig
+              confdir=\${sysconfdir}/fonts
+              cachedir=/var/cache/fontconfig
+
+              Name: Fontconfig
+              Description: Font configuration and customization library
+              Version: 2.15.0
+              Libs: -L\${libdir} -lfontconfig
+              Libs.private: -L\${libdir} -lexpat -lfreetype
+              Cflags: -I\${includedir}
+              EOF
+          # ================================================================
 
           # ========== 字幕依赖栈（Meson both + Autotools 双轨） ==========
           - name: ass-stack
@@ -407,6 +446,8 @@ jobs:
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
           echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
           echo "PKG_CONFIG_PATH=${{ github.workspace }}/prefix/lib/pkgconfig" >> $GITHUB_ENV
+          # 【核心修复】允许交叉编译时 pkg-config 读取目标平台的 .pc 文件
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
 
       - name: Download FFmpeg Source
         run: |
