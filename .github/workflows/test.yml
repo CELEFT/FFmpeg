@@ -1,4 +1,4 @@
-name: Test External Libraries Compilation
+name: Test ass-stack Compilation
 
 on:
   workflow_dispatch:
@@ -24,7 +24,6 @@ jobs:
             nasm yasm cmake meson ninja-build git wget unzip \
             gperf gettext
             
-      # 仅保留系统级 apt 安装，确保 meson 在 /usr/bin/meson 全局可用
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
@@ -56,84 +55,9 @@ jobs:
           path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
-  test-libs:
+  test-ass-stack:
     needs: prepare
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: libvpx
-            build: |
-              git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
-              find . -name "configure*" -type f -exec sed -i 's/die "--enable-shared only supported on ELF, OS\/2, and Darwin for now"/echo "Skipping ELF check for Android"/g' {} +
-              export CROSS=$TOOLCHAIN/bin/llvm-
-              export ASFLAGS="-D__ANDROID__"
-              export LDFLAGS="-Wl,-z,max-page-size=16384"
-              ./configure --prefix=$PREFIX --target=arm64-android-gcc --libc=$SYSROOT \
-                --enable-vp8 --enable-vp9 --enable-static --enable-shared \
-                --disable-examples --disable-tools --disable-docs --disable-unit-tests \
-                --extra-cflags="-fPIC"
-              make -j$(nproc) && make install
-
-          - name: dav1d
-            build: |
-              # 完全回滚，依赖环境中的 meson 直接编译
-              git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
-              printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
-              meson setup _build --cross-file $PWD/android.cross --prefix=$PREFIX --default-library=both --buildtype=release
-              ninja -C _build && ninja -C _build install
-
-          - name: fdk-aac
-            build: |
-              git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
-              ./autogen.sh
-              export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example
-              make -j$(nproc) && make install
-
-          - name: ass-stack
-            build: |
-              # 1. 编译 FreeType
-              git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-                --enable-static --enable-shared \
-                --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no \
-                && make -j$(nproc) && make install && cd ..
-
-              # 2. 编译 Fribidi
-              git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-                --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
-
-              # 3. 编译 HarfBuzz (使用 Meson)
-              git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
-              printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
-              meson setup _build --cross-file $PWD/android.cross \
-                --prefix=$PREFIX --default-library=both --buildtype=release \
-                -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled \
-                -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled \
-                -Dtests=disabled -Ddocs=disabled
-              ninja -C _build && ninja -C _build install && cd ..
-
-              # 4. 编译 Fontconfig
-              git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-                --enable-static --enable-shared --disable-docs \
-                && make -j$(nproc) && make install && cd ..
-
-              # 5. 编译 libass (环境变量强制兜底)
-              git clone --depth 1 https://github.com/libass/libass.git && cd libass
-              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
-              export FRIBIDI_CFLAGS="-I$PREFIX/include"
-              export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
-              export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz"
-              export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
-              
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
-                --enable-static --enable-shared \
-                && make -j$(nproc) && make install
-
     steps:
       - uses: actions/checkout@v4
       
@@ -159,15 +83,53 @@ jobs:
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
           echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
-      
-      - name: Build ${{ matrix.name }}
-        run: ${{ matrix.build }}
+
+      - name: Build ass-stack
+        run: |
+          # 1. 编译 FreeType
+          git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
+          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+            --enable-static --enable-shared \
+            --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no \
+            && make -j$(nproc) && make install && cd ..
+
+          # 2. 编译 Fribidi (之前漏掉的)
+          git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
+          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+            --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+
+          # 3. 编译 HarfBuzz (使用 Meson)
+          git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
+          printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
+          meson setup _build --cross-file $PWD/android.cross \
+            --prefix=$PREFIX --default-library=both --buildtype=release \
+            -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled \
+            -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled \
+            -Dtests=disabled -Ddocs=disabled
+          ninja -C _build && ninja -C _build install && cd ..
+
+          # 4. 编译 Fontconfig
+          git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
+          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+            --enable-static --enable-shared --disable-docs \
+            && make -j$(nproc) && make install && cd ..
+
+          # 5. 编译 libass
+          git clone --depth 1 https://github.com/libass/libass.git && cd libass
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export FRIBIDI_CFLAGS="-I$PREFIX/include"
+          export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
+          export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz"
+          export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
+          
+          ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+            --enable-static --enable-shared \
+            && make -j$(nproc) && make install
 
       - name: Verify Artifacts and Headers
         run: |
-          echo "=== Checking compiled libraries for ${{ matrix.name }} ==="
+          echo "=== Checking compiled libraries and headers ==="
           ls -la $PREFIX/lib/ || true
-          echo "=== Checking headers for ${{ matrix.name }} ==="
           ls -la $PREFIX/include/ || true
           echo ""
           if ls $PREFIX/lib/*.so 1> /dev/null 2>&1; then echo "✅ Shared libraries (.so) found."; else echo "❌ No Shared libraries (.so) found."; fi
