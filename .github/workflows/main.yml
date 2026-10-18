@@ -161,28 +161,44 @@ jobs:
             build: |
               export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
 
+              # 1. 编译 FreeType
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+                --enable-static --enable-shared \
+                --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no \
+                && make -j$(nproc) && make install && cd ..
               
+              # 2. 编译 Fribidi
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-              ./autogen.sh && ./configure --prefix=$PREFIX --build=x86_64-pc-linux-gnu --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --build=x86_64-pc-linux-gnu --host=aarch64-linux-android \
+                --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
               
+              # 3. 编译 HarfBuzz
               git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
               printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
               meson setup _build --cross-file $PWD/android.cross --prefix=$PREFIX --default-library=both --buildtype=release -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled -Dtests=disabled -Ddocs=disabled
               ninja -C _build && ninja -C _build install && cd ..
               
-              # 编译 fontconfig (现在 host 已经有了 libexpat1-dev)
+              # 4. 编译 Fontconfig
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+                --enable-static --enable-shared --disable-docs \
+                && make -j$(nproc) && make install && cd ..
               
+              # 5. 编译 libass (强制注入 CPPFLAGS 和 LDFLAGS)
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               export FRIBIDI_CFLAGS="-I$PREFIX/include"
               export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
               export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz"
               export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
-              # 核心修复：加上 --disable-require-system-font-provider 作为兜底
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-require-system-font-provider && make -j$(nproc) && make install
+              
+              export CPPFLAGS="-I$PREFIX/include"
+              export LDFLAGS="-L$PREFIX/lib"
+              
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
+                --enable-static --enable-shared \
+                --disable-require-system-font-provider \
+                && make -j$(nproc) && make install
 
     steps:
       - uses: actions/checkout@v4
@@ -323,15 +339,22 @@ jobs:
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
 
+      # ==================== 执行整个目录的打包 ====================
       - name: Package entire prefix directory
         run: |
+          # 1. 将纯静态的 ffmpeg/ffprobe 放入 bin_static，避免覆盖原有的动态链接版
           mkdir -p $PREFIX/bin_static
           cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe $PREFIX/bin_static/
+          
+          # 2. 生成 BUILD_INFO.txt 放入 prefix 根目录
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $PREFIX/BUILD_INFO.txt
           $PREFIX/bin/ffmpeg -buildconf >> $PREFIX/BUILD_INFO.txt 2>/dev/null || true
           
+          # 3. 执行极限压缩打包 (tar + xz 9e T0)
           cd ${{ github.workspace }}
           tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
+          
+          # 4. 移至 artifacts 目录
           mkdir -p artifacts
           mv ffmpeg-android-arm64-v8a.tar.xz artifacts/
 
@@ -372,5 +395,7 @@ jobs:
             - `bin/`：动态链接版本的 `ffmpeg` 和 `ffprobe`
             - `bin_static/`：**纯静态链接**版本的 `ffmpeg` 和 `ffprobe`
             - `BUILD_INFO.txt`：构建配置信息
+            
+            *注意：解压后自行按需提取。*
           files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
           generate_release_notes: true
