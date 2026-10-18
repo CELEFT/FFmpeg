@@ -15,7 +15,6 @@ env:
   ANDROID_TRIPLE: "aarch64-linux-android"
 
 jobs:
-  # ==================== Job 1: 准备 NDK ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -49,7 +48,6 @@ jobs:
           path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
-  # ==================== Job 2: 并行编译外部库 ====================
   build-libs:
     needs: prepare
     runs-on: ubuntu-latest
@@ -57,10 +55,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ========== 原生双轨（单次编译） ==========
           - name: x264
             build: |
               git clone --depth 1 https://code.videolan.org/videolan/x264.git && cd x264
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --cross-prefix=$TOOLCHAIN/bin/llvm- --enable-static --enable-shared --enable-pic --disable-cli
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --cross-prefix=$TOOLCHAIN/bin/llvm- \
+                --enable-static --enable-shared --enable-pic --disable-cli
               make -j$(nproc) && make install
           - name: x265
             build: |
@@ -69,7 +69,7 @@ jobs:
               cd build/linux
               cmake -G "Unix Makefiles" \
                 -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-                -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 \
+                -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL \
                 -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
                 -DCMAKE_ASM_COMPILER=$CC -DENABLE_ASSEMBLY=OFF \
                 -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384" \
@@ -95,20 +95,17 @@ jobs:
                 --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j$(nproc) && make install
-          
           - name: libaom
             build: |
               git clone --depth 1 https://aomedia.googlesource.com/aom && mkdir -p aom/build && cd aom/build
-              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64
+              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DENABLE_SHARED=ON -DENABLE_STATIC=ON -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF -DCONFIG_AV1_ENCODER=1 -DAOM_TARGET_CPU=arm64
               ninja && ninja install
-              
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/aom.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: aom
               Description: AOMedia Project AV1 Codec Library
               Version: 3.8.0
@@ -116,28 +113,25 @@ jobs:
               Libs.private: -lm -lpthread
               Cflags: -I\${includedir}
               EOF
-          
+
+          # ========== 回退双轨（双次编译：先动态，后静态） ==========
           - name: svt-av1
             build: |
               git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git && cd SVT-AV1
-              
-              # 编译静态库
-              mkdir build_static && cd build_static
-              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF
-              ninja && ninja install && cd ..
-              
-              # 编译动态库
+              # 动态库
               mkdir build_shared && cd build_shared
-              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
+              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               ninja && ninja install && cd ..
-              
+              # 静态库
+              mkdir build_static && cd build_static
+              cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF
+              ninja && ninja install && cd ..
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/SvtAv1Enc.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: SvtAv1Enc
               Description: SVT-AV1 Encoder
               Version: 1.8.0
@@ -145,26 +139,21 @@ jobs:
               Libs.private: -lm -lpthread
               Cflags: -I\${includedir}
               EOF
-              
           - name: vvenc
             build: |
               git clone --depth 1 https://github.com/fraunhoferhhi/vvenc.git && cd vvenc
-              
-              mkdir build_static && cd build_static
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-              make -j$(nproc) && make install && cd ..
-              
               mkdir build_shared && cd build_shared
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install && cd ..
-              
+              mkdir build_static && cd build_static
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+              make -j$(nproc) && make install && cd ..
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/libvvenc.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: libvvenc
               Description: Fraunhofer Versatile Video Encoder
               Version: 1.11.0
@@ -172,26 +161,21 @@ jobs:
               Libs.private: -lstdc++ -lm -lpthread
               Cflags: -I\${includedir}
               EOF
-              
           - name: xeve
             build: |
               git clone --depth 1 https://github.com/mpeg5/xeve.git && cd xeve
-              
-              mkdir build_static && cd build_static
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=OFF
-              make -j$(nproc) && make install && cd ..
-              
               mkdir build_shared && cd build_shared
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install && cd ..
-              
+              mkdir build_static && cd build_static
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DSET_PROF=MAIN -DBUILD_SHARED_LIBS=OFF
+              make -j$(nproc) && make install && cd ..
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/xeve.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: xeve
               Description: MPEG-5 EVC Encoder
               Version: 1.0.0
@@ -199,26 +183,21 @@ jobs:
               Libs.private: -lstdc++ -lm -lpthread
               Cflags: -I\${includedir}
               EOF
-              
           - name: xevd
             build: |
               git clone --depth 1 https://github.com/mpeg5/xevd.git && cd xevd
-              
-              mkdir build_static && cd build_static
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF
-              make -j$(nproc) && make install && cd ..
-              
               mkdir build_shared && cd build_shared
-              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-36 -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=ON
               make -j$(nproc) && make install && cd ..
-              
+              mkdir build_static && cd build_static
+              cmake .. -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$TARGET_ABI -DANDROID_PLATFORM=android-$API_LEVEL -DCMAKE_INSTALL_PREFIX=$PREFIX -DBUILD_SHARED_LIBS=OFF
+              make -j$(nproc) && make install && cd ..
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/xevd.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: xevd
               Description: MPEG-5 EVC Decoder
               Version: 1.0.0
@@ -226,59 +205,23 @@ jobs:
               Libs.private: -lstdc++ -lm -lpthread
               Cflags: -I\${includedir}
               EOF
-
-          - name: fdk-aac
-            build: |
-              git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
-              ./autogen.sh
-              export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-example
-              make -j$(nproc) && make install
-          - name: lame
-            build: |
-              wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz && tar xf lame-3.100.tar.gz && cd lame-3.100
-              sed -i '/lame_init_old/d' include/libmp3lame.sym
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-frontend --disable-asm
-              make -j$(nproc) && make install
-          - name: opus
-            build: |
-              git clone --depth 1 https://github.com/xiph/opus.git && cd opus
-              ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared
-              make -j$(nproc) && make install
-          - name: vorbis
-            build: |
-              git clone --depth 1 https://github.com/xiph/ogg.git && cd ogg
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
-              git clone --depth 1 https://github.com/xiph/vorbis.git && cd vorbis
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install
-          - name: lc3
-            build: |
-              git clone --depth 1 https://android.googlesource.com/platform/external/liblc3 && cd liblc3
-              make -j$(nproc) CC="$CC" LIBC=bionic
-              mkdir -p $PREFIX/lib $PREFIX/include
-              
-              # 生成静态库 .a
-              cp bin/liblc3.a $PREFIX/lib/ 2>/dev/null || true
-              # 手动生成动态库 .so
-              $CC -shared -o $PREFIX/lib/liblc3.so build/src/*.o -lm
-              
-              cp include/*.h $PREFIX/include/ 2>/dev/null || true
           - name: openssl
             build: |
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
               export ANDROID_NDK_ROOT=$NDK
-              # 去掉 no-shared，允许同时生成 .so 和 .a
-              ./Configure android-arm64 -D__ANDROID_API__=36 --prefix=$PREFIX --openssldir=$PREFIX/ssl no-tests
+              # 动态库
+              ./Configure android-arm64 -D__ANDROID_API__=$API_LEVEL --prefix=$PREFIX --openssldir=$PREFIX/ssl no-tests
               make -j$(nproc) && make install_sw
-              
+              make clean
+              # 静态库
+              ./Configure android-arm64 -D__ANDROID_API__=$API_LEVEL --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
+              make -j$(nproc) && make install_sw
               mkdir -p $PREFIX/lib/pkgconfig
               cat > $PREFIX/lib/pkgconfig/openssl.pc <<EOF
               prefix=$PREFIX
               exec_prefix=\${prefix}
               libdir=\${prefix}/lib
               includedir=\${prefix}/include
-
               Name: openssl
               Description: OpenSSL Library
               Version: 3.0.0
@@ -286,31 +229,65 @@ jobs:
               Libs.private: -ldl -lpthread
               Cflags: -I\${includedir}
               EOF
-              
+
+          # ========== Autotools / Meson 原生双轨 ==========
+          - name: fdk-aac
+            build: |
+              git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && cd fdk-aac
+              ./autogen.sh
+              export CFLAGS="-D_FILE_OFFSET_BITS=64 -Wno-implicit-function-declaration"
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-example
+              make -j$(nproc) && make install
+          - name: lame
+            build: |
+              wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz && tar xf lame-3.100.tar.gz && cd lame-3.100
+              sed -i '/lame_init_old/d' include/libmp3lame.sym
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-frontend --disable-asm
+              make -j$(nproc) && make install
+          - name: opus
+            build: |
+              git clone --depth 1 https://github.com/xiph/opus.git && cd opus
+              ./autogen.sh
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared
+              make -j$(nproc) && make install
+          - name: vorbis
+            build: |
+              git clone --depth 1 https://github.com/xiph/ogg.git && cd ogg
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              git clone --depth 1 https://github.com/xiph/vorbis.git && cd vorbis
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared && make -j$(nproc) && make install
+          - name: lc3
+            build: |
+              git clone --depth 1 https://android.googlesource.com/platform/external/liblc3 && cd liblc3
+              make -j$(nproc) CC="$CC" LIBC=bionic
+              mkdir -p $PREFIX/lib $PREFIX/include
+              cp bin/liblc3.a $PREFIX/lib/ 2>/dev/null || true
+              $CC -shared -o $PREFIX/lib/liblc3.so build/src/*.o -lm
+              cp include/*.h $PREFIX/include/ 2>/dev/null || true
           - name: xvid
             build: |
               git clone --depth 1 https://github.com/arthenica/xvidcore.git && cd xvidcore/build/generic
-              # 加上 --enable-shared，同时生成 .so 和 .a
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-shared --disable-assembly
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-shared --enable-static --disable-assembly
               make -j$(nproc) && make install
           - name: webp
             build: |
               git clone --depth 1 https://github.com/webmproject/libwebp.git && cd libwebp
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
               make -j$(nproc) && make install
           - name: xavs2
             build: |
               git clone --depth 1 https://github.com/pkuvcl/xavs2.git && cd xavs2/build/linux
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-shared --enable-static
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-shared --enable-static
               make -j$(nproc) && make install
           - name: shine
             build: |
               git clone --depth 1 https://github.com/savonet/shine.git && cd shine
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared
               make -j$(nproc) && make install
 
+          # ========== 字幕依赖栈（Meson both + Autotools 双轨） ==========
           - name: ass-stack
             build: |
               set -euo pipefail
@@ -320,7 +297,7 @@ jobs:
 
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --without-zlib --without-png --without-bzip2 --without-harfbuzz CFLAGS="-O2 -fPIC"
+              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --without-zlib --without-png --without-bzip2 --without-harfbuzz CFLAGS="-O2 -fPIC"
               make -j$(nproc) && make install && cd ..
 
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
@@ -373,7 +350,7 @@ jobs:
 
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               ./autogen.sh
-              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --disable-fontconfig --disable-require-system-font-provider CFLAGS="-O2 -fPIC" CPPFLAGS="$BASE_CPPFLAGS" LDFLAGS="$BASE_LDFLAGS"
+              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --build=x86_64-pc-linux-gnu --enable-static --enable-shared --with-pic --disable-fontconfig --disable-require-system-font-provider CFLAGS="-O2 -fPIC" CPPFLAGS="$BASE_CPPFLAGS" LDFLAGS="$BASE_LDFLAGS"
               make -j$(nproc) && make install
 
     steps:
@@ -411,7 +388,6 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 3: 编译 FFmpeg ====================
   build-ffmpeg:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -474,7 +450,7 @@ jobs:
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
-      
+
       - name: Build FFmpeg (Shared)
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
@@ -512,12 +488,18 @@ jobs:
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
 
+      # ==================== 合并打包：.a + .so + include + .pc ====================
       - name: Package entire prefix directory
         run: |
           mkdir -p $PREFIX/bin_static
           cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe $PREFIX/bin_static/
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $PREFIX/BUILD_INFO.txt
           $PREFIX/bin/ffmpeg -buildconf >> $PREFIX/BUILD_INFO.txt 2>/dev/null || true
+          
+          echo "=== 检查动态库和静态库并存 ==="
+          echo "动态库 (.so) 数量: $(find $PREFIX/lib -name '*.so*' | wc -l)"
+          echo "静态库 (.a) 数量: $(find $PREFIX/lib -name '*.a' | wc -l)"
+          
           cd ${{ github.workspace }}
           tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
           mkdir -p artifacts
@@ -529,7 +511,6 @@ jobs:
           path: artifacts/
           retention-days: 1
 
-  # ==================== Job 4: 发布 Release ====================
   release:
     needs: build-ffmpeg
     runs-on: ubuntu-latest
@@ -554,11 +535,11 @@ jobs:
             - **FFmpeg**: 9.0.2
             
             ### 包含内容 (tar.xz 极压包)
-            打包了完整的 `prefix` 目录，包含：
-            - `lib/`：所有的动态库 (`.so`) 和静态库 (`.a`) **（动静态合并）**
-            - `include/`：所有第三方库及 FFmpeg 的头文件（已完成软链接归一化）
-            - `bin/`：动态链接版本的 `ffmpeg` 和 `ffprobe`
-            - `bin_static/`：**纯静态链接**版本的 `ffmpeg` 和 `ffprobe`
+            打包了完整的 `prefix` 目录，**所有外部库均已同时包含动态库（.so）和静态库（.a）**，以及头文件和 `.pc` 文件：
+            - `lib/`：`.so`、`.a` 与 `.pc` 文件
+            - `include/`：所有头文件（已归一化）
+            - `bin/`：动态链接版 `ffmpeg` 和 `ffprobe`
+            - `bin_static/`：纯静态链接版 `ffmpeg` 和 `ffprobe`
             - `BUILD_INFO.txt`：构建配置信息
           files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
           generate_release_notes: true
