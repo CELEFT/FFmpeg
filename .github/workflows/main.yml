@@ -12,6 +12,7 @@ env:
   API_LEVEL: "36"
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
+  ANDROID_TRIPLE: "aarch64-linux-android"
 
 jobs:
   # ==================== Job 1: 准备 NDK ====================
@@ -157,19 +158,20 @@ jobs:
               export ANDROID_NDK_ROOT=$NDK
               ./Configure android-arm64 -D__ANDROID_API__=36 --prefix=$PREFIX --openssldir=$PREFIX/ssl no-shared no-tests
               make -j$(nproc) && make install_sw
+          
+          # ==================== 整合了你提供的终极 ass-stack ====================
           - name: ass-stack
             build: |
               set -euo pipefail
               mkdir -p $PREFIX
 
-              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
-              export CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2 $CPPFLAGS"
-              export LDFLAGS="-L$PREFIX/lib $LDFLAGS"
+              export BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
+              export BASE_LDFLAGS="-L$PREFIX/lib"
 
               # 1. FreeType (Autotools)
               git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --build=x86_64-pc-linux-gnu \
+              ./configure --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu \
                 --enable-static --enable-shared --with-pic \
                 --without-zlib --without-png --without-bzip2 --without-harfbuzz \
                 CFLAGS="-O2 -fPIC"
@@ -191,14 +193,17 @@ jobs:
               cpu = 'aarch64'
               endian = 'little'
               EOF
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
               meson setup _build --cross-file fribidi.cross \
-                --prefix=$PREFIX --default-library=both --buildtype=release \
+                --prefix=$PREFIX \
+                --default-library=both \
+                --buildtype=release \
                 -Ddocs=false -Ddeprecated=false -Db_staticpic=true
               ninja -C _build && ninja -C _build install && cd ..
 
               # 3. HarfBuzz (Meson)
               git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
-              cat > harfbuzz.cross <<EOF
+              cat > android.cross <<EOF
               [binaries]
               c = '$CC'
               cpp = '$CXX'
@@ -215,15 +220,18 @@ jobs:
               cpu = 'aarch64'
               endian = 'little'
               EOF
-              meson setup _build --cross-file harfbuzz.cross \
-                --prefix=$PREFIX --default-library=both --buildtype=release \
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+              meson setup _build --cross-file android.cross \
+                --prefix=$PREFIX \
+                --default-library=both \
+                --buildtype=release \
                 -Db_staticpic=true -Dfreetype=enabled \
                 -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
                 -Dicu=disabled -Dgraphite2=disabled \
                 -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
               ninja -C _build && ninja -C _build install && cd ..
 
-              # 4. 头文件归一化 (关键：解决找不到 fribidi.h 的问题)
+              # 4. 头文件归一化 (完美解决找不到 fribidi.h 的核心)
               for sub in fribidi harfbuzz; do
                 if [ -d "$PREFIX/include/$sub" ]; then
                   for h in "$PREFIX/include/$sub"/*.h; do
@@ -239,12 +247,17 @@ jobs:
               # 5. libass (Autotools)
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               ./autogen.sh
-              ./configure --prefix=$PREFIX --host=aarch64-linux-android --build=x86_64-pc-linux-gnu \
+              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+              ./configure \
+                --prefix=$PREFIX --host=${ANDROID_TRIPLE} --build=x86_64-pc-linux-gnu \
                 --enable-static --enable-shared --with-pic \
                 --disable-fontconfig \
                 --disable-require-system-font-provider \
-                CFLAGS="-O2 -fPIC"
-              make -j$(nproc) && make install && cd ..
+                CFLAGS="-O2 -fPIC" \
+                CPPFLAGS="$BASE_CPPFLAGS" \
+                LDFLAGS="$BASE_LDFLAGS"
+              make -j$(nproc) && make install
 
     steps:
       - uses: actions/checkout@v4
@@ -269,8 +282,8 @@ jobs:
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
           echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
           echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++" >> $GITHUB_ENV
+          echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
+          echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
@@ -310,8 +323,8 @@ jobs:
           echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
           echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
           echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android36-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android36-clang++" >> $GITHUB_ENV
+          echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
+          echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
           echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
@@ -385,7 +398,7 @@ jobs:
           make -j$(nproc) ffmpeg ffprobe
           $STRIP ffmpeg ffprobe
 
-      # ==================== 执行整个目录的打包 ====================
+      # ==================== 核心要求：合并动态和静态打包 ====================
       - name: Package entire prefix directory
         run: |
           # 1. 将纯静态的 ffmpeg/ffprobe 放入 bin_static，避免覆盖原有的动态链接版
@@ -396,7 +409,7 @@ jobs:
           echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > $PREFIX/BUILD_INFO.txt
           $PREFIX/bin/ffmpeg -buildconf >> $PREFIX/BUILD_INFO.txt 2>/dev/null || true
           
-          # 3. 执行极限压缩打包 (tar + xz 9e T0)
+          # 3. 执行极限压缩打包 (完全包含 lib 下的 .so 和 .a，以及 include)
           cd ${{ github.workspace }}
           tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
           
@@ -436,8 +449,8 @@ jobs:
             
             ### 包含内容 (tar.xz 极压包)
             打包了完整的 `prefix` 目录，包含：
-            - `lib/`：所有的动态库 (`.so`) 和静态库 (`.a`)
-            - `include/`：所有第三方库及 FFmpeg 的头文件
+            - `lib/`：所有的动态库 (`.so`) 和静态库 (`.a`) **（动静态合并）**
+            - `include/`：所有第三方库及 FFmpeg 的头文件（已完成软链接归一化）
             - `bin/`：动态链接版本的 `ffmpeg` 和 `ffprobe`
             - `bin_static/`：**纯静态链接**版本的 `ffmpeg` 和 `ffprobe`
             - `BUILD_INFO.txt`：构建配置信息
