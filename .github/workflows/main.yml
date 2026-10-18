@@ -165,15 +165,14 @@ jobs:
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --without-zlib --with-png=no --with-bzip2=no --with-harfbuzz=no && make -j$(nproc) && make install && cd ..
               
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-              # 强制传入 --build 触发交叉编译模式，彻底消除运行测试程序的报错
-              ./autogen.sh && ./configure --prefix=$PREFIX --build=x86_64-pc-linux-gnu --host=aarch64-linux-android \
-                --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
+              ./autogen.sh && ./configure --prefix=$PREFIX --build=x86_64-pc-linux-gnu --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install && cd ..
               
               git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
               printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > $PWD/android.cross
               meson setup _build --cross-file $PWD/android.cross --prefix=$PREFIX --default-library=both --buildtype=release -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled -Dtests=disabled -Ddocs=disabled
               ninja -C _build && ninja -C _build install && cd ..
               
+              # 编译 fontconfig (现在 host 已经有了 libexpat1-dev)
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-docs && make -j$(nproc) && make install && cd ..
               
@@ -182,18 +181,18 @@ jobs:
               export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
               export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz"
               export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
-              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared && make -j$(nproc) && make install
+              # 核心修复：加上 --disable-require-system-font-provider 作为兜底
+              ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android --enable-static --enable-shared --disable-require-system-font-provider && make -j$(nproc) && make install
 
     steps:
       - uses: actions/checkout@v4
-      # 【核心修复】在 build-libs Job 中直接安装环境和 meson
       - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext
+            gperf gettext libexpat1-dev
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
