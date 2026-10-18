@@ -15,6 +15,7 @@ env:
   ANDROID_TRIPLE: "aarch64-linux-android"
 
 jobs:
+  # ==================== Job 1: 准备 NDK ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -48,6 +49,7 @@ jobs:
           path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
+  # ==================== Job 2: 并行编译外部库 ====================
   build-libs:
     needs: prepare
     runs-on: ubuntu-latest
@@ -264,27 +266,11 @@ jobs:
               cp bin/liblc3.a $PREFIX/lib/ 2>/dev/null || true
               $CC -shared -o $PREFIX/lib/liblc3.so build/src/*.o -lm
               cp include/*.h $PREFIX/include/ 2>/dev/null || true
-          - name: xvid
-            build: |
-              git clone --depth 1 https://github.com/arthenica/xvidcore.git && cd xvidcore/build/generic
-              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-shared --enable-static --disable-assembly
-              make -j$(nproc) && make install
           - name: webp
             build: |
               git clone --depth 1 https://github.com/webmproject/libwebp.git && cd libwebp
               ./autogen.sh
               ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared --disable-libwebpdemux --disable-libwebpmux
-              make -j$(nproc) && make install
-          - name: xavs2
-            build: |
-              git clone --depth 1 https://github.com/pkuvcl/xavs2.git && cd xavs2/build/linux
-              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-shared --enable-static
-              make -j$(nproc) && make install
-          - name: shine
-            build: |
-              git clone --depth 1 https://github.com/savonet/shine.git && cd shine
-              ./autogen.sh
-              ./configure --prefix=$PREFIX --host=$ANDROID_TRIPLE --enable-static --enable-shared
               make -j$(nproc) && make install
 
           # ========== 字幕依赖栈（Meson both + Autotools 双轨） ==========
@@ -388,6 +374,7 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
+  # ==================== Job 3: 编译 FFmpeg ====================
   build-ffmpeg:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -439,18 +426,18 @@ jobs:
             --enable-shared --enable-static --enable-pic \
             --enable-gpl --enable-version3 --enable-nonfree \
             --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-            --enable-libx264 --enable-libx265 --enable-libxvid \
+            --enable-libx264 --enable-libx265 \
             --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
             --enable-libvvenc --enable-libxeve --enable-libxevd \
-            --enable-libwebp --enable-libxavs2 \
+            --enable-libwebp \
             --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-            --enable-liblc3 --enable-libshine \
+            --enable-liblc3 \
             --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
             --extra-libs="-lm -lz -ldl"
-
+      
       - name: Build FFmpeg (Shared)
         working-directory: ffmpeg
         run: make -j$(nproc) && make install
@@ -470,12 +457,12 @@ jobs:
             --pkg-config-flags="--static" \
             --enable-gpl --enable-version3 --enable-nonfree \
             --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-            --enable-libx264 --enable-libx265 --enable-libxvid \
+            --enable-libx264 --enable-libx265 \
             --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
             --enable-libvvenc --enable-libxeve --enable-libxevd \
-            --enable-libwebp --enable-libxavs2 \
+            --enable-libwebp \
             --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-            --enable-liblc3 --enable-libshine \
+            --enable-liblc3 \
             --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
@@ -511,6 +498,7 @@ jobs:
           path: artifacts/
           retention-days: 1
 
+  # ==================== Job 4: 发布 Release ====================
   release:
     needs: build-ffmpeg
     runs-on: ubuntu-latest
