@@ -185,15 +185,11 @@ jobs:
                 --enable-static --enable-shared --disable-docs \
                 && make -j$(nproc) && make install && cd ..
               
-              # 5. 编译 libass (强制注入 CPPFLAGS 和 LDFLAGS)
+              # 5. 编译 libass (强制将依赖头文件路径塞进 CFLAGS)
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
-              export FRIBIDI_CFLAGS="-I$PREFIX/include"
-              export FRIBIDI_LIBS="-L$PREFIX/lib -lfribidi"
-              export HARFBUZZ_CFLAGS="-I$PREFIX/include/harfbuzz"
-              export HARFBUZZ_LIBS="-L$PREFIX/lib -lharfbuzz"
-              
-              export CPPFLAGS="-I$PREFIX/include"
-              export LDFLAGS="-L$PREFIX/lib"
+              export CFLAGS="-I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2 $CFLAGS"
+              export CPPFLAGS="-I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2 $CPPFLAGS"
+              export LDFLAGS="-L$PREFIX/lib $LDFLAGS"
               
               ./autogen.sh && ./configure --prefix=$PREFIX --host=aarch64-linux-android \
                 --enable-static --enable-shared \
@@ -395,7 +391,5 @@ jobs:
             - `bin/`：动态链接版本的 `ffmpeg` 和 `ffprobe`
             - `bin_static/`：**纯静态链接**版本的 `ffmpeg` 和 `ffprobe`
             - `BUILD_INFO.txt`：构建配置信息
-            
-            *注意：解压后自行按需提取。*
           files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
           generate_release_notes: true
