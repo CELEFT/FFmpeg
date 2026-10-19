@@ -1,4 +1,4 @@
-name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job, Cached)
+name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job, Cached, Two Tarballs)
 
 on:
   push:
@@ -14,11 +14,11 @@ env:
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
   BASE_PRIVATE_LIBS: "-lc++_static -lm"
-  # 升级任一外部库版本时，把它 +1 以强制重建外部库缓存
+  # 升级任一外部库版本时把它 +1，强制重建外部库缓存
   LIBS_CACHE_VERSION: "v1"
 
 jobs:
-  # ==================== Job 1: 准备 NDK + 检查 prefix 缓存 ====================
+  # ==================== Job 1: 准备 NDK + 探测 prefix 缓存 ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -58,7 +58,6 @@ jobs:
           path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
-      # 只探测、不保存：缓存命中就恢复 prefix，未命中则不占空间
       - name: Probe prefix cache (restore-only)
         id: cache-prefix
         uses: actions/cache/restore@v4
@@ -701,13 +700,24 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 2b: 合并 prefix 并写入缓存（仅缓存未命中时） ====================
+  # ==================== Job 2b: 合并 prefix + 打包 tar.xz + 写缓存 ====================
   combine-prefix:
     needs: [prepare, build-libs]
-    if: needs.prepare.outputs.prefix-cache-hit != 'true' && needs.build-libs.result == 'success'
+    if: |
+      always() &&
+      (needs.prepare.outputs.prefix-cache-hit == 'true' || needs.build-libs.result == 'success')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all per-lib prefix artifacts
+      - name: Restore prefix from cache (cache hit)
+        if: needs.prepare.outputs.prefix-cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/prefix
+          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
+          fail-on-cache-miss: true
+
+      - name: Download per-lib prefix artifacts (cache miss)
+        if: needs.prepare.outputs.prefix-cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
@@ -721,46 +731,51 @@ jobs:
           echo "so=$(find lib -name '*.so*' 2>/dev/null | wc -l) a=$(find lib -name '*.a' 2>/dev/null | wc -l) pc=$(find lib/pkgconfig -name '*.pc' 2>/dev/null | wc -l)"
           test -d lib && test -d include
 
-      - name: Save prefix to cache
+      - name: Save prefix to cache (cache miss)
+        if: needs.prepare.outputs.prefix-cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/prefix
           key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
 
-      - name: Upload merged prefix (single artifact)
+      # ===== 新增：把合并后的外部库打成 tar.xz（纯外部库，不含 FFmpeg） =====
+      - name: Pack prefix tarball
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+          tar -I 'xz -9e -T0' -cf prefix-android-arm64-v8a.tar.xz prefix
+          ls -lh prefix-android-arm64-v8a.tar.xz
+
+      - name: Upload merged prefix (single artifact, for downstream job)
         uses: actions/upload-artifact@v4
         with:
           name: prefix-merged
           path: ${{ github.workspace }}/prefix
           retention-days: 1
 
+      # ===== 新增：外部库 tarball 作为 artifact（供 release 下载） =====
+      - name: Upload prefix tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefix-tarball
+          path: ${{ github.workspace }}/prefix-android-arm64-v8a.tar.xz
+          retention-days: 1
+
   # ==================== Job 3: 编译 FFmpeg ====================
   build-ffmpeg:
-    needs: [prepare, build-libs, combine-prefix]
-    if: |
-      always() &&
-      (needs.prepare.outputs.prefix-cache-hit == 'true' || needs.combine-prefix.result == 'success')
+    needs: [prepare, combine-prefix]
+    if: needs.combine-prefix.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Download NDK
         uses: actions/download-artifact@v4
         with:
           name: ndk
           path: ${{ github.workspace }}/ndk
 
-      # ---------- 外部库来源：命中缓存 → 恢复；未命中 → 下载合并 artifact ----------
-      - name: Restore prefix from cache (cache hit)
-        if: needs.prepare.outputs.prefix-cache-hit == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/prefix
-          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
-          fail-on-cache-miss: true
-
-      - name: Download merged prefix (cache miss)
-        if: needs.prepare.outputs.prefix-cache-hit != 'true'
+      # 统一从 combine-prefix 上传的 prefix-merged 取外部库
+      - name: Download merged prefix
         uses: actions/download-artifact@v4
         with:
           name: prefix-merged
@@ -768,7 +783,6 @@ jobs:
 
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
-
       - name: Set FFmpeg environment
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
@@ -982,7 +996,7 @@ jobs:
           path: artifacts/
           retention-days: 1
 
-  # ==================== Job 4: 发布 Release ====================
+  # ==================== Job 4: 发布 Release（两个 tar.xz） ====================
   release:
     needs: build-ffmpeg
     runs-on: ubuntu-latest
@@ -990,24 +1004,51 @@ jobs:
       contents: write
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download final artifacts
+      - name: Download ffmpeg-final
         uses: actions/download-artifact@v4
         with:
           name: ffmpeg-final
           path: artifacts
+
+      - name: Download prefix-tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: prefix-tarball
+          path: artifacts
+
       - name: Prepare release env
         run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
           body: |
             ## FFmpeg Android Build (arm64-v8a)
+
             - **Build Date**: ${{ env.BUILD_DATE }}
             - **NDK**: r30 (API 36)
             - **FFmpeg**: 9.0.2
 
-            ### 内容
-            `lib/`（`.so` + `.a` + `.pc`）、`include/`、`bin/`、`bin_static/`、`BUILD_INFO.txt`
-          files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
+            ### 发布产物
+
+            | 文件 | 内容 |
+            |---|---|
+            | `ffmpeg-android-arm64-v8a.tar.xz` | FFmpeg 全量产物：外部库 `.so/.a/.pc` + `include/` + `bin/`（ffmpeg/ffprobe 动态）+ `bin_static/`（静态） |
+            | `prefix-android-arm64-v8a.tar.xz`  | **纯外部库合集**（x264/x265/dav1d/vpx/aom/svt-av1/vvenc/xeve/xevd/openssl/fdk-aac/lame/opus/vorbis/lc3/webp/expat/fontconfig/freetype/fribidi/harfbuzz/libass），供下游直接复用 |
+
+            ### 下游复用外部库
+
+            在独立 workflow `Build FFmpeg (arm64-v8a) — standalone / reusable` 中：
+
+            ```
+            prefix_source:  url
+            prefix_url:     ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/prefix-android-arm64-v8a.tar.xz
+            ffmpeg_version: 9.0.2
+            ```
+
+            脚本会自动识别 tarball 顶层 `prefix/` 目录并放置到 `$GITHUB_WORKSPACE/prefix`。
+          files: |
+            artifacts/ffmpeg-android-arm64-v8a.tar.xz
+            artifacts/prefix-android-arm64-v8a.tar.xz
           generate_release_notes: true
