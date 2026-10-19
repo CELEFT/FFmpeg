@@ -818,7 +818,9 @@ jobs:
             HANDLE_AACENCODER h = NULL;
             (void)aacEncOpen(&h, 0, 0);
             (void)lame_init();
-            (void)lc3_encoder_frame_lt;
+            /* liblc3 公开 API：lc3_encoder_size(dt, sr_hz) */
+            unsigned (*lc3_size_fn)(enum lc3_dt, int) = &lc3_encoder_size;
+            (void)lc3_size_fn;
             (void)a;
             return 0;
           }
