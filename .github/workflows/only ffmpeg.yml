@@ -1,139 +1,261 @@
-- name: Build FFmpeg
-  run: |
-    #!/bin/bash
-    set -euo pipefail
+name: Build FFmpeg Only
 
-    WORKSPACE="$(pwd)"
-    NDK_DIR="$WORKSPACE/ndk"
-    PREFIX="$WORKSPACE/prefix"
-    FFMPEG_VERSION="${{ inputs.ffmpeg_version }}"
+on:
+  push:
+    tags: [ 'v*' ] # 推送 v 开头的 tag 时自动触发并发布
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: 'FFmpeg Version'
+        required: true
+        default: '9.0.2'
+      prefix_url:
+        description: '外部库下载链接'
+        required: false
+        default: 'https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz'
 
-    TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
-    SYSROOT="$TOOLCHAIN/sysroot"
-    API_LEVEL="${{ env.API_LEVEL }}"
-    ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
+env:
+  NDK_VERSION: "r30"
+  API_LEVEL: "36"
+  NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  ANDROID_TRIPLE: "aarch64-linux-android"
 
-    export CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
-    export CXX="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
-    export AR="$TOOLCHAIN/bin/llvm-ar"
-    export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
-    export STRIP="$TOOLCHAIN/bin/llvm-strip"
-    export PATH="$TOOLCHAIN/bin:$PATH"
+jobs:
+  build-ffmpeg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-    export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-    export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
-    export PKG_CONFIG_ALLOW_CROSS=1
+      # ==================== 1. 准备环境 ====================
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config nasm yasm cmake meson ninja-build git wget unzip file
 
-    # ===== 关键修复：强制修正路径 + 补齐 C++ 依赖 =====
-    echo "🔧 正在修正 pkg-config 文件..."
-    PC_DIR="$PREFIX/lib/pkgconfig"
-    if [ -d "$PC_DIR" ]; then
-      for f in "$PC_DIR"/*.pc; do
-        [ -e "$f" ] || continue
-        # 1. 强制修正绝对路径
-        sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
-        # 2. 针对 xevd 和 xeve，强制在 Libs 里补上 c++ 运行库，修复动态链接失败
-        if grep -qE "Name: (xevd|xeve)" "$f"; then
-          sed -i 's/^Libs: \(.*\)/Libs: \1 -lc++_static -lm/g' "$f"
-        fi
-      done
-    fi
-    # ===================================================
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
-    echo "验证 xevd pkg-config："
-    pkg-config --cflags --libs xevd || echo "xevd 未找到"
+      - name: Restore NDK Permissions (cache hit)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: chmod -R +x ${{ github.workspace }}/ndk
 
-    # 下载源码
-    if [ ! -d "ffmpeg" ]; then
-        wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
-        tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
-        mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
-    fi
+      - name: Download NDK (cache miss)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          wget -q "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          rm ndk.zip
+          chmod -R +x ${{ github.workspace }}/ndk
 
-    # --- 编译 FFmpeg 动态库 (Shared) ---
-    cd ffmpeg
-    make distclean || true
+      # ==================== 2. 下载并解压外部库 ====================
+      - name: Download and Extract Prefix
+        run: |
+          set -euo pipefail
+          wget -q "${{ inputs.prefix_url || 'https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz' }}" -O prefix_pkg
+          
+          mkdir -p extract_dir
+          echo "文件类型: $(file prefix_pkg)"
+          
+          if file prefix_pkg | grep -qi "Zip archive"; then
+            unzip -q prefix_pkg -d extract_dir
+          elif file prefix_pkg | grep -qi "XZ compressed"; then
+            tar -xf prefix_pkg -C extract_dir
+          elif file prefix_pkg | grep -qi "gzip compressed"; then
+            tar -xzf prefix_pkg -C extract_dir
+          else
+            echo "::error::未知的压缩格式"
+            exit 1
+          fi
+          
+          if [ -d "extract_dir/prefix" ]; then
+            mv extract_dir/prefix ${{ github.workspace }}/prefix
+          elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
+            mv extract_dir ${{ github.workspace }}/prefix
+          else
+            echo "::error::解压后的包内找不到 prefix/lib 或 prefix/include 目录"
+            ls -R extract_dir | head -n 50
+            exit 1
+          fi
+          
+          echo "✅ 外部库解压完成"
 
-    ./configure \
-      --prefix="$PREFIX" \
-      --enable-cross-compile --target-os=android \
-      --arch=aarch64 --cpu=armv8-a \
-      --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
-      --sysroot="$SYSROOT" \
-      --pkg-config=pkg-config --pkg-config-flags="" \
-      --enable-shared --enable-static --enable-pic \
-      --enable-gpl --enable-version3 --enable-nonfree \
-      --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-      --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
-      --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
-      --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
-      --enable-decoder=av1_mediacodec \
-      --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
-      --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
-      --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
-      --enable-libx264 --enable-libx265 \
-      --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
-      --enable-libvvenc --enable-libxeve --enable-libxevd \
-      --enable-libwebp \
-      --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-      --enable-liblc3 \
-      --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
-      --disable-doc --disable-debug \
-      --extra-cflags="-I$PREFIX/include -fPIC" \
-      --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
-      --extra-libs="-lc++_static -lm -lz" \
-    || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
+      # ==================== 3. 编译 FFmpeg ====================
+      - name: Build FFmpeg
+        run: |
+          #!/bin/bash
+          set -euo pipefail
 
-    echo "开始编译动态库版本..."
-    make -j$(nproc)
-    make install
-    cd ..
+          WORKSPACE="$(pwd)"
+          NDK_DIR="$WORKSPACE/ndk"
+          PREFIX="$WORKSPACE/prefix"
+          FFMPEG_VERSION="${{ inputs.ffmpeg_version || '9.0.2' }}"
 
-    # --- 编译 FFmpeg 静态库及静态可执行文件 (Static) ---
-    rm -rf ffmpeg-static
-    cp -r ffmpeg ffmpeg-static
-    cd ffmpeg-static
-    make distclean || true
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          API_LEVEL="${{ env.API_LEVEL }}"
+          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
 
-    ./configure \
-      --prefix="$PREFIX" \
-      --enable-cross-compile --target-os=android \
-      --arch=aarch64 --cpu=armv8-a \
-      --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
-      --sysroot="$SYSROOT" \
-      --disable-shared --enable-static --enable-pic \
-      --pkg-config=pkg-config --pkg-config-flags="--static" \
-      --enable-gpl --enable-version3 --enable-nonfree \
-      --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-      --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
-      --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
-      --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
-      --enable-decoder=av1_mediacodec \
-      --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
-      --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
-      --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
-      --enable-libx264 --enable-libx265 \
-      --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
-      --enable-libvvenc --enable-libxeve --enable-libxevd \
-      --enable-libwebp \
-      --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-      --enable-liblc3 \
-      --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
-      --disable-doc --disable-debug \
-      --extra-cflags="-I$PREFIX/include -fPIC" \
-      --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
-      --extra-libs="-lc++_static -lm -lz" \
-    || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
+          export CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export PATH="$TOOLCHAIN/bin:$PATH"
 
-    echo "开始编译静态可执行文件 (ffmpeg, ffprobe)..."
-    make -j$(nproc) ffmpeg ffprobe
-    $STRIP ffmpeg ffprobe
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
 
-    # --- 整理产物 ---
-    cd ..
-    mkdir -p "$PREFIX/bin_static"
-    cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe "$PREFIX/bin_static/"
+          # ===== 关键修复：强制修正路径 + 补齐 C++ 依赖 =====
+          echo "🔧 正在修正 pkg-config 文件..."
+          PC_DIR="$PREFIX/lib/pkgconfig"
+          if [ -d "$PC_DIR" ]; then
+            for f in "$PC_DIR"/*.pc; do
+              [ -e "$f" ] || continue
+              sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+              if grep -qE "Name: (xevd|xeve)" "$f"; then
+                sed -i 's/^Libs: \(.*\)/Libs: \1 -lc++_static -lm/g' "$f"
+              fi
+            done
+          fi
 
-    echo "======================================"
-    echo "FFmpeg 构建完成！"
-    echo "======================================"
+          # 下载源码
+          if [ ! -d "ffmpeg" ]; then
+              wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+              tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+              mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+          fi
+
+          # --- 编译动态库 ---
+          cd ffmpeg
+          make distclean || true
+          ./configure \
+            --prefix="$PREFIX" \
+            --enable-cross-compile --target-os=android \
+            --arch=aarch64 --cpu=armv8-a \
+            --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+            --sysroot="$SYSROOT" \
+            --pkg-config=pkg-config --pkg-config-flags="" \
+            --enable-shared --enable-static --enable-pic \
+            --enable-gpl --enable-version3 --enable-nonfree \
+            --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+            --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
+            --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
+            --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
+            --enable-decoder=av1_mediacodec \
+            --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
+            --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
+            --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
+            --enable-libx264 --enable-libx265 \
+            --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+            --enable-libvvenc --enable-libxeve --enable-libxevd \
+            --enable-libwebp \
+            --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+            --enable-liblc3 \
+            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+            --disable-doc --disable-debug \
+            --extra-cflags="-I$PREFIX/include -fPIC" \
+            --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
+            --extra-libs="-lc++_static -lm -lz" \
+          || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
+
+          make -j$(nproc)
+          make install
+          cd ..
+
+          # --- 编译静态库及可执行文件 ---
+          rm -rf ffmpeg-static
+          cp -r ffmpeg ffmpeg-static
+          cd ffmpeg-static
+          make distclean || true
+          ./configure \
+            --prefix="$PREFIX" \
+            --enable-cross-compile --target-os=android \
+            --arch=aarch64 --cpu=armv8-a \
+            --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+            --sysroot="$SYSROOT" \
+            --disable-shared --enable-static --enable-pic \
+            --pkg-config=pkg-config --pkg-config-flags="--static" \
+            --enable-gpl --enable-version3 --enable-nonfree \
+            --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+            --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
+            --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
+            --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
+            --enable-decoder=av1_mediacodec \
+            --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
+            --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
+            --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
+            --enable-libx264 --enable-libx265 \
+            --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+            --enable-libvvenc --enable-libxeve --enable-libxevd \
+            --enable-libwebp \
+            --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+            --enable-liblc3 \
+            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+            --disable-doc --disable-debug \
+            --extra-cflags="-I$PREFIX/include -fPIC" \
+            --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
+            --extra-libs="-lc++_static -lm -lz" \
+          || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
+
+          make -j$(nproc) ffmpeg ffprobe
+          $STRIP ffmpeg ffprobe
+
+          cd ..
+          mkdir -p "$PREFIX/bin_static"
+          cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe "$PREFIX/bin_static/"
+
+          echo "✅ FFmpeg 构建完成！"
+
+      # ==================== 4. 打包并上传 Artifact ====================
+      - name: Package
+        run: |
+          cd "${{ github.workspace }}"
+          tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
+          ls -lh ffmpeg-android-arm64-v8a.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-final
+          path: ${{ github.workspace }}/ffmpeg-android-arm64-v8a.tar.xz
+          retention-days: 7
+
+  # ==================== 5. 发布 Release (仅打 Tag 时触发) ====================
+  release:
+    needs: build-ffmpeg
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-final
+          path: artifacts
+
+      - name: Prepare env
+        run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## FFmpeg for Android (arm64-v8a)
+            - **Build Date**: ${{ env.BUILD_DATE }}
+            - **NDK**: r30 (API 36)
+            - **FFmpeg**: 9.0.2
+
+            ### 内容
+            - `lib/`（`.so` 动态库 + `.a` 静态库）
+            - `include/`
+            - `bin/`（FFmpeg 动态库版）
+            - `bin_static/`（`ffmpeg` / `ffprobe` 静态可执行文件）
+          files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
+          generate_release_notes: true
