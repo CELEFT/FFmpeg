@@ -14,61 +14,11 @@ env:
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
   BASE_PRIVATE_LIBS: "-lc++_static -lm"
-  # 升级任一外部库版本时把它 +1，强制重建外部库缓存
   LIBS_CACHE_VERSION: "v1"
 
 jobs:
-  # ==================== Job 1: 准备 NDK + 探测 prefix 缓存 ====================
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      ndk-path: ${{ steps.setup-ndk.outputs.path }}
-      prefix-cache-hit: ${{ steps.cache-prefix.outputs.cache-hit }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache NDK
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ndk
-          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
-
-      - name: Restore NDK Permissions
-        if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x ${{ github.workspace }}/ndk
-
-      - name: Download and Unpack NDK
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
-        run: |
-          wget -q "${{ env.NDK_URL }}" -O ndk.zip
-          unzip -q ndk.zip
-          mv android-ndk-r30* ${{ github.workspace }}/ndk
-          rm ndk.zip
-          chmod -R +x ${{ github.workspace }}/ndk
-
-      - name: Set NDK Output Path
-        id: setup-ndk
-        run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
-
-      - name: Upload NDK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ndk
-          path: ${{ steps.setup-ndk.outputs.path }}
-          retention-days: 1
-
-      - name: Probe prefix cache (restore-only)
-        id: cache-prefix
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/prefix
-          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
-
-  # ==================== Job 2: 并行编译外部库（仅缓存未命中时） ====================
+  # ==================== Job 1: 并行编译外部库 ====================
   build-libs:
-    needs: prepare
-    if: needs.prepare.outputs.prefix-cache-hit != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -666,18 +616,47 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore prefix cache
+        id: cache-prefix
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/prefix
+          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
+
+      - name: Skip notice
+        if: steps.cache-prefix.outputs.cache-hit == 'true'
+        run: echo "🎉 Prefix cache hit! Skipping external lib compilation."
+
       - name: Install host dependencies
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config nasm yasm cmake meson ninja-build git wget unzip gperf gettext libexpat1-dev
-      - name: Download NDK
-        uses: actions/download-artifact@v4
+
+      - name: Cache NDK
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
+        id: cache-ndk
+        uses: actions/cache@v4
         with:
-          name: ndk
           path: ${{ github.workspace }}/ndk
-      - name: Fix NDK Permissions
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
+      - name: Restore NDK Permissions (cache hit)
+        if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit == 'true'
         run: chmod -R +x ${{ github.workspace }}/ndk
+
+      - name: Download NDK (cache miss)
+        if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          wget -q "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          rm ndk.zip
+          chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Set toolchain environment
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
           echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
@@ -690,34 +669,34 @@ jobs:
           echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
           echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
+
       - name: Build ${{ matrix.name }}
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         shell: bash
         run: ${{ matrix.build }}
+
       - name: Upload ${{ matrix.name }} (per-lib snapshot)
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: prefix-${{ matrix.name }}
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 2b: 合并 prefix + 打包 tar.xz + 写缓存 ====================
+  # ==================== Job 2: 合并 prefix + 打包 tar.xz + 写缓存 ====================
   combine-prefix:
-    needs: [prepare, build-libs]
-    if: |
-      always() &&
-      (needs.prepare.outputs.prefix-cache-hit == 'true' || needs.build-libs.result == 'success')
+    needs: build-libs
     runs-on: ubuntu-latest
     steps:
-      - name: Restore prefix from cache (cache hit)
-        if: needs.prepare.outputs.prefix-cache-hit == 'true'
+      - name: Restore prefix from cache
+        id: cache-prefix
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/prefix
           key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
-          fail-on-cache-miss: true
 
       - name: Download per-lib prefix artifacts (cache miss)
-        if: needs.prepare.outputs.prefix-cache-hit != 'true'
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
@@ -732,13 +711,12 @@ jobs:
           test -d lib && test -d include
 
       - name: Save prefix to cache (cache miss)
-        if: needs.prepare.outputs.prefix-cache-hit != 'true'
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/prefix
           key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
 
-      # ===== 新增：把合并后的外部库打成 tar.xz（纯外部库，不含 FFmpeg） =====
       - name: Pack prefix tarball
         run: |
           set -euo pipefail
@@ -746,14 +724,13 @@ jobs:
           tar -I 'xz -9e -T0' -cf prefix-android-arm64-v8a.tar.xz prefix
           ls -lh prefix-android-arm64-v8a.tar.xz
 
-      - name: Upload merged prefix (single artifact, for downstream job)
+      - name: Upload merged prefix
         uses: actions/upload-artifact@v4
         with:
           name: prefix-merged
           path: ${{ github.workspace }}/prefix
           retention-days: 1
 
-      # ===== 新增：外部库 tarball 作为 artifact（供 release 下载） =====
       - name: Upload prefix tarball
         uses: actions/upload-artifact@v4
         with:
@@ -763,26 +740,37 @@ jobs:
 
   # ==================== Job 3: 编译 FFmpeg ====================
   build-ffmpeg:
-    needs: [prepare, combine-prefix]
-    if: needs.combine-prefix.result == 'success'
+    needs: combine-prefix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Download NDK
-        uses: actions/download-artifact@v4
-        with:
-          name: ndk
-          path: ${{ github.workspace }}/ndk
 
-      # 统一从 combine-prefix 上传的 prefix-merged 取外部库
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
+      - name: Restore NDK Permissions (cache hit)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: chmod -R +x ${{ github.workspace }}/ndk
+
+      - name: Download NDK (cache miss)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          wget -q "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          rm ndk.zip
+          chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Download merged prefix
         uses: actions/download-artifact@v4
         with:
           name: prefix-merged
           path: ${{ github.workspace }}/prefix
 
-      - name: Fix NDK Permissions
-        run: chmod -R +x ${{ github.workspace }}/ndk
       - name: Set FFmpeg environment
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
