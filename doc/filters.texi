@@ -8689,6 +8689,14 @@ Valid range is 0 to 0.3.
 Set threshold B for 3rd plane. Default is 0.04.
 Valid range is 0 to 5.
 
+@item 3a
+Set threshold A for 4th plane. Default is 0.02.
+Valid range is 0 to 0.3.
+
+@item 3b
+Set threshold B for 4th plane. Default is 0.04.
+Valid range is 0 to 5.
+
 Threshold A is designed to react on abrupt changes in the input signal and
 threshold B is designed to react on continuous changes in the input signal.
 
@@ -8710,7 +8718,8 @@ will continue processing other side of frames if they are equal or below thresho
 @item 0s
 @item 1s
 @item 2s
-Set sigma for 1st plane, 2nd plane or 3rd plane. Default is 32767.
+@item 3s
+Set sigma for 1st plane, 2nd plane, 3rd plane or 4th plane. Default is 32767.
 Valid range is from 0 to 32767.
 This options controls weight for each pixel in radius defined by size.
 Default value means every pixel have same weight.
@@ -19424,7 +19433,19 @@ When used in combination with display and view, this inverts the transform, so g
 Allows you to specify an external file-transform to use instead of the OCIO config file. This is useful for applying a single transform without needing a full OCIO config file.
 
 @item format
-Allow you to specify the output pix_fmt of the OCIO filter. This *has* to be a RGB colorspace, so you really are limited to rgb24, rgba, rgb48, rgba48, gbrp10, gbrp12, gbrpf32le, gbrapf32le, for most encoding we would recommend rgb48
+Allow you to specify the output pix_fmt of the OCIO filter. This *has* to be a
+RGB colorspace, so you are limited to rgb24, rgba, rgb48, rgba64, gbrp10,
+gbrap10, gbrp12, gbrap12, gbrpf32 and gbrapf32; for most encoding we would
+recommend rgb48.
+
+Half-float (gbrpf16, gbrapf16) is accepted as input but is not a valid output
+format, because swscale has no half-float write support and its legacy
+half-float read path clamps values to [0,1]. When this option is not set, the
+output format defaults to the input format, except that half-float input is
+promoted to the matching float format. Where negotiation cannot yet tell
+whether the input will be half-float, the output falls back to float, so a
+float output may be selected even when the input turns out to be an integer
+format.
 
 @item context_params
 Allow you to specify additional context parameters for the OCIO filter. This is a list of key=value pairs, separated by colons.
