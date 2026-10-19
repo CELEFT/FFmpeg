@@ -1,4 +1,4 @@
-name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job)
+name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job, Cached)
 
 on:
   push:
@@ -14,24 +14,30 @@ env:
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
   BASE_PRIVATE_LIBS: "-lc++_static -lm"
+  # 升级任一外部库版本时，把它 +1 以强制重建外部库缓存
+  LIBS_CACHE_VERSION: "v1"
 
 jobs:
-  # ==================== Job 1: 准备 NDK ====================
+  # ==================== Job 1: 准备 NDK + 检查 prefix 缓存 ====================
   prepare:
     runs-on: ubuntu-latest
     outputs:
       ndk-path: ${{ steps.setup-ndk.outputs.path }}
+      prefix-cache-hit: ${{ steps.cache-prefix.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
       - name: Restore NDK Permissions
         if: steps.cache-ndk.outputs.cache-hit == 'true'
         run: chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Download and Unpack NDK
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
@@ -40,9 +46,11 @@ jobs:
           mv android-ndk-r30* ${{ github.workspace }}/ndk
           rm ndk.zip
           chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Set NDK Output Path
         id: setup-ndk
         run: echo "path=${{ github.workspace }}/ndk" >> $GITHUB_OUTPUT
+
       - name: Upload NDK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -50,9 +58,18 @@ jobs:
           path: ${{ steps.setup-ndk.outputs.path }}
           retention-days: 1
 
-  # ==================== Job 2: 并行编译外部库 ====================
+      # 只探测、不保存：缓存命中就恢复 prefix，未命中则不占空间
+      - name: Probe prefix cache (restore-only)
+        id: cache-prefix
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/prefix
+          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
+
+  # ==================== Job 2: 并行编译外部库（仅缓存未命中时） ====================
   build-libs:
     needs: prepare
+    if: needs.prepare.outputs.prefix-cache-hit != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -677,32 +694,81 @@ jobs:
       - name: Build ${{ matrix.name }}
         shell: bash
         run: ${{ matrix.build }}
-      - name: Upload ${{ matrix.name }}
+      - name: Upload ${{ matrix.name }} (per-lib snapshot)
         uses: actions/upload-artifact@v4
         with:
           name: prefix-${{ matrix.name }}
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 3: 编译 FFmpeg ====================
-  build-ffmpeg:
-    needs: build-libs
+  # ==================== Job 2b: 合并 prefix 并写入缓存（仅缓存未命中时） ====================
+  combine-prefix:
+    needs: [prepare, build-libs]
+    if: needs.prepare.outputs.prefix-cache-hit != 'true' && needs.build-libs.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Download NDK
-        uses: actions/download-artifact@v4
-        with:
-          name: ndk
-          path: ${{ github.workspace }}/ndk
-      - name: Download all prefix dependencies
+      - name: Download all per-lib prefix artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: prefix-*
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
+
+      - name: Sanity check merged prefix
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}/prefix"
+          echo "so=$(find lib -name '*.so*' 2>/dev/null | wc -l) a=$(find lib -name '*.a' 2>/dev/null | wc -l) pc=$(find lib/pkgconfig -name '*.pc' 2>/dev/null | wc -l)"
+          test -d lib && test -d include
+
+      - name: Save prefix to cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/prefix
+          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
+
+      - name: Upload merged prefix (single artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefix-merged
+          path: ${{ github.workspace }}/prefix
+          retention-days: 1
+
+  # ==================== Job 3: 编译 FFmpeg ====================
+  build-ffmpeg:
+    needs: [prepare, build-libs, combine-prefix]
+    if: |
+      always() &&
+      (needs.prepare.outputs.prefix-cache-hit == 'true' || needs.combine-prefix.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download NDK
+        uses: actions/download-artifact@v4
+        with:
+          name: ndk
+          path: ${{ github.workspace }}/ndk
+
+      # ---------- 外部库来源：命中缓存 → 恢复；未命中 → 下载合并 artifact ----------
+      - name: Restore prefix from cache (cache hit)
+        if: needs.prepare.outputs.prefix-cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/prefix
+          key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
+          fail-on-cache-miss: true
+
+      - name: Download merged prefix (cache miss)
+        if: needs.prepare.outputs.prefix-cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: prefix-merged
+          path: ${{ github.workspace }}/prefix
+
       - name: Fix NDK Permissions
         run: chmod -R +x ${{ github.workspace }}/ndk
+
       - name: Set FFmpeg environment
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
@@ -753,7 +819,6 @@ jobs:
             fi
           done
 
-      # ===== 兜底：任何缺 .so 的库，用 PIC 静态库现场合成 =====
       - name: Repair missing shared libs from static archives
         shell: bash
         run: |
@@ -818,7 +883,6 @@ jobs:
             HANDLE_AACENCODER h = NULL;
             (void)aacEncOpen(&h, 0, 0);
             (void)lame_init();
-            /* liblc3 公开 API：lc3_encoder_size(dt, sr_hz) */
             unsigned (*lc3_size_fn)(enum lc3_dt, int) = &lc3_encoder_size;
             (void)lc3_size_fn;
             (void)a;
