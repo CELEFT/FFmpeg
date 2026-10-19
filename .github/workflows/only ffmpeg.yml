@@ -1,4 +1,4 @@
-name: Build FFmpeg Only (with Prebuilt Prefix)
+name: Build FFmpeg Only (with Built-in Prefix)
 
 on:
   workflow_dispatch:
@@ -8,8 +8,9 @@ on:
         required: true
         default: '9.0.2'
       prefix_url:
-        description: '外部库的下载链接 (支持 .zip 或 .tar.xz)'
-        required: true
+        description: '外部库下载链接 (默认已内置)'
+        required: false
+        default: 'https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz'
 
 env:
   NDK_VERSION: "r30"
@@ -109,6 +110,22 @@ jobs:
           export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
+
+          # ===== 关键修复：修正所有 .pc 文件里的绝对路径 =====
+          echo "🔧 正在修正 pkg-config 文件中的绝对路径..."
+          PC_DIR="$PREFIX/lib/pkgconfig"
+          if [ -d "$PC_DIR" ]; then
+            for f in "$PC_DIR"/*.pc; do
+              [ -e "$f" ] || continue
+              sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+            done
+          fi
+          # ===================================================
+
+          # 验证 xevd 是否能被正确识别
+          echo "验证 xevd pkg-config："
+          pkg-config --modversion xevd || echo "xevd 未找到"
+          pkg-config --cflags --libs xevd || echo "xevd cflags 异常"
 
           # 下载源码
           if [ ! -d "ffmpeg" ]; then
@@ -214,4 +231,4 @@ jobs:
         with:
           name: ffmpeg-final
           path: ${{ github.workspace }}/ffmpeg-android-arm64-v8a.tar.xz
-          retention-days: 7
+          retention-days: 30
