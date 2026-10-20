@@ -3,15 +3,24 @@ name: Build FFmpeg Only
 on:
   push:
     tags: [ 'v*' ] # 推送 Tag 时触发并发布
-  workflow_dispatch: # 手动触发
-  schedule:
-    - cron: '0 0 * * 0' # 每周日 00:00 (UTC) 自动触发
+  workflow_dispatch: # 手动触发（可在网页上自定义链接）
+    inputs:
+      ffmpeg_version:
+        description: 'FFmpeg Version'
+        required: true
+        default: '9.0.2'
+      prefix_url:
+        description: '外部库下载链接 (留空则使用默认)'
+        required: false
+        default: ''
 
 env:
   NDK_VERSION: "r30"
   API_LEVEL: "36"
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   ANDROID_TRIPLE: "aarch64-linux-android"
+  # === 修改这里，即可改变全局默认的外部库链接 ===
+  DEFAULT_PREFIX_URL: "https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz"
 
 jobs:
   build-ffmpeg:
@@ -49,9 +58,16 @@ jobs:
       - name: Download and Extract Prefix
         run: |
           set -euo pipefail
-          # 兼容手动触发和定时触发（无 inputs 时用默认链接）
-          URL="${{ inputs.prefix_url || 'https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz' }}"
-          wget -q "$URL" -O prefix_pkg
+          # 逻辑：优先使用手动输入的链接，如果为空则使用 env.DEFAULT_PREFIX_URL
+          INPUT_URL="${{ inputs.prefix_url }}"
+          if [ -z "$INPUT_URL" ]; then
+            FINAL_URL="${{ env.DEFAULT_PREFIX_URL }}"
+          else
+            FINAL_URL="$INPUT_URL"
+          fi
+          
+          echo "📥 正在下载外部库: $FINAL_URL"
+          wget -q "$FINAL_URL" -O prefix_pkg
           
           mkdir -p extract_dir
           echo "文件类型: $(file prefix_pkg)"
@@ -229,7 +245,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 只有在推送 Tag 或者每周定时任务时才执行
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule'
     steps:
       - name: Download Artifact
@@ -244,7 +259,6 @@ jobs:
       - name: Create / Update Release
         uses: softprops/action-gh-release@v2
         with:
-          # 如果是手动推的 v* 标签，就用标签名；如果是定时触发的，就用 fixed 标签名 weekly-latest
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'weekly-latest' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Weekly Latest Build' }}
           body: |
@@ -259,6 +273,5 @@ jobs:
             - `bin/`（FFmpeg 动态库版）
             - `bin_static/`（`ffmpeg` / `ffprobe` 静态可执行文件）
           files: artifacts/ffmpeg-android-arm64-v8a.tar.xz
-          # 关键参数：允许覆盖同名文件
           overwrite_files: true
           generate_release_notes: true
