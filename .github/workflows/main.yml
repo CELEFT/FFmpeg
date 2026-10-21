@@ -289,25 +289,35 @@ jobs:
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
           # ★ 文本渲染链必须同一 job 顺序构建
-          - name: text-stack
+                    - name: text-stack
             build: |
               set -o errexit
 
-              # 1) freetype
+              # ================= 1) freetype =================
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
                 cd freetype
                 make distclean >/dev/null 2>&1 || true
-                [ -x configure ] || ./autogen.sh
+                # 仓库自带的 configure 只是探测外壳，依赖 builds/unix/configure
+                # 后者必须由 autogen.sh 生成；删掉外壳强制重生成
+                rm -f configure
+                if [ -x ./autogen.sh ]; then ./autogen.sh; fi
+                if [ ! -f builds/unix/configure ]; then
+                  echo "::error::freetype: builds/unix/configure 未生成（autogen 失败）"
+                  ls -la . | head -30
+                  ls -la builds/unix | head -30
+                  exit 1
+                fi
                 ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
                   --without-zlib --without-png --without-bzip2 --without-harfbuzz \
                   CFLAGS="$EXTRA_CFLAGS"
                 make -j"$(nproc)"
                 make install
+                make distclean >/dev/null 2>&1 || true
               )
 
-              # 2) expat
+              # ================= 2) expat =================
               if [ ! -d expat-2.6.2 ]; then
                 wget -q https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
                 tar xf expat-2.6.2.tar.gz
@@ -319,9 +329,10 @@ jobs:
                   $LTOPT --with-pic
                 make -j"$(nproc)"
                 make install
+                make distclean >/dev/null 2>&1 || true
               )
 
-              # 3) fontconfig（需要 meson >= 1.11）
+              # ================= 3) fontconfig (meson >= 1.11) =================
               [ -d fontconfig ] || git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git fontconfig
               (
                 cd fontconfig
@@ -342,8 +353,9 @@ jobs:
                 ninja -C _build
                 ninja -C _build install
               )
+              mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
 
-              # 4) fribidi
+              # ================= 4) fribidi =================
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
                 cd fribidi
@@ -363,8 +375,13 @@ jobs:
                 ninja -C _build
                 ninja -C _build install
               )
+              if [ "$LINK" = "shared" ]; then
+                test -e "$PREFIX/lib/libfribidi.so" || { echo "::error::libfribidi.so missing"; exit 1; }
+              else
+                test -f "$PREFIX/lib/libfribidi.a" || { echo "::error::libfribidi.a missing"; exit 1; }
+              fi
 
-              # 5) harfbuzz
+              # ================= 5) harfbuzz =================
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
                 cd harfbuzz
@@ -389,7 +406,7 @@ jobs:
                 ninja -C _build install
               )
 
-              # 6) 头文件归一化（复制，不用软链）
+              # ================= 6) 头文件归一化（复制，不用软链）=================
               for sub in fribidi harfbuzz; do
                 [ -d "$PREFIX/include/$sub" ] || continue
                 find "$PREFIX/include/$sub" -name '*.h' -print0 \
@@ -402,31 +419,48 @@ jobs:
                 cp -n "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # 7) libass
+              # ================= 7) libass =================
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
                 cd libass
                 make distclean >/dev/null 2>&1 || true
-                [ -x configure ] || ./autogen.sh
+                rm -f configure
+                if [ -x ./autogen.sh ]; then ./autogen.sh; fi
                 ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
+                  --disable-fontconfig \
                   --disable-require-system-font-provider \
                   CFLAGS="$EXTRA_CFLAGS" \
                   CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2" \
                   LDFLAGS="-L$PREFIX/lib"
                 make -j"$(nproc)"
                 make install
+                make distclean >/dev/null 2>&1 || true
               )
 
-              # 8) 本 job 自检
+              # ================= 8) 本 job 自检 =================
               if [ "$LINK" = "static" ]; then
                 test -s "$PREFIX/lib/libass.a" || { echo "::error::libass.a missing"; exit 1; }
+                for l in freetype fribidi harfbuzz expat fontconfig ass; do
+                  test -f "$PREFIX/lib/lib${l}.a" || echo "::warning::缺 lib${l}.a"
+                done
+                if find "$PREFIX/lib" -name '*.so*' | grep -q .; then
+                  echo "::error::static prefix 出现 .so"; find "$PREFIX/lib" -name '*.so*'; exit 1
+                fi
+                echo "✅ text-stack [static] ok"
               else
                 test -e "$PREFIX/lib/libass.so" || { echo "::error::libass.so missing"; exit 1; }
                 echo "--- libass.so SONAME ---"
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*SONAME.*\[\(.*\)\].*/  \1/p'
                 echo "--- libass.so NEEDED ---"
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
+                echo "--- prefix/lib 文件 ↔ SONAME ---"
+                for f in "$PREFIX/lib"/*.so*; do
+                  [ -e "$f" ] || continue
+                  printf '%-34s %s\n' "$(basename "$f")" \
+                    "$(readelf -d "$f" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+                done
+                echo "✅ text-stack [shared] ok"
               fi
 
     steps:
