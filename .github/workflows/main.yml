@@ -289,7 +289,7 @@ jobs:
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
           # ★ 文本渲染链必须同一 job 顺序构建
-                    - name: text-stack
+          - name: text-stack
             build: |
               set -o errexit
 
