@@ -201,7 +201,7 @@ jobs:
               --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
               --disable-doc --disable-debug \
               --extra-cflags="-I$PREFIX/include -fPIC" \
-              --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -static" \
+              --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
               --extra-libs="-lc++_static -lm -lz" \
             || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
             
