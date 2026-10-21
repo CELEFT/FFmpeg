@@ -126,6 +126,15 @@ jobs:
           done
           find "$PREFIX/include" -mindepth 2 -name "*.h" -exec cp -f {} "$PREFIX/include/" \;
 
+          # === 关键修复：强制隐藏 .so，逼迫链接器使用 .a 静态库 ===
+          if [ "$BUILD_TYPE" == "static" ]; then
+            echo "🔧 正在隐藏动态库 (.so)，强制进行纯静态链接..."
+            for f in "$PREFIX/lib"/*.so*; do
+              [ -e "$f" ] || continue
+              mv "$f" "${f}.bak"
+            done
+          fi
+
           if [ ! -d "ffmpeg" ]; then
               echo "⬇️ 下载 FFmpeg 源码..."
               if ! wget -q --tries=3 --timeout=30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"; then
@@ -141,7 +150,6 @@ jobs:
 
           echo "🚀 开始构建 ($BUILD_TYPE)..."
 
-          # === 彻底分离配置，避免任何变量传递引发的血案 ===
           if [ "$BUILD_TYPE" == "shared" ]; then
             ./configure \
               --prefix="$OUTPUT" \
@@ -254,12 +262,12 @@ jobs:
           echo "Testing ${{ matrix.build_type }} linkage..."
           echo "======================================"
           if [ "${{ matrix.build_type }}" == "static" ]; then
-            # 检查是否引入了非系统级别的动态依赖 (排除 bionic 基础库)
-            if readelf -d output/ffmpeg 2>/dev/null | grep NEEDED | grep -v -E 'libc\.so|libm\.so|libdl\.so|libz\.so'; then
+            # 排除系统基础库 (bionic, android ndk 等)
+            if readelf -d output/ffmpeg 2>/dev/null | grep NEEDED | grep -v -E 'libc\.so|libm\.so|libdl\.so|libz\.so|libandroid\.so|libcamera2ndk\.so|libmediandk\.so'; then
               echo "::error::Static build has unexpected non-system dynamic dependencies!"
               exit 1
             fi
-            echo "✅ Verification passed: It is a completely static executable."
+            echo "✅ Verification passed: It is a completely static executable (only depends on Android system libs)."
           else
             echo "RUNPATH / RPATH settings:"
             readelf -d output/ffmpeg | grep -E 'RUNPATH|RPATH'
@@ -324,7 +332,7 @@ jobs:
             **2. `ffmpeg-static-arm64-v8a.tar.xz` (完全静态版)**
             ```
             output/
-            ├── ffmpeg            <-- 纯静态，无依赖
+            ├── ffmpeg            <-- 纯静态，无第三方依赖，只依赖系统最底层库
             ├── ffprobe
             └── BUILD_INFO.txt
             ```
