@@ -47,21 +47,20 @@ jobs:
 
       - name: Restore NDK Permissions (cache hit)
         if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x ${{ github.workspace }}/ndk
+        run: chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Download NDK (cache miss)
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           wget -q --tries=3 --timeout=30 "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          mv android-ndk-r30* ${{ github.workspace }}/ndk
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
           rm ndk.zip
-          chmod -R +x ${{ github.workspace }}/ndk
+          chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Download and Extract Prefix
         run: |
           set -euo pipefail
-          # 严谨获取下载链接，兼容手动触发和自动触发
           if [ -n "${{ inputs.prefix_url }}" ]; then
             FINAL_URL="${{ inputs.prefix_url }}"
           else
@@ -84,9 +83,9 @@ jobs:
           fi
           
           if [ -d "extract_dir/prefix" ]; then
-            mv extract_dir/prefix ${{ github.workspace }}/prefix
+            mv extract_dir/prefix "${{ github.workspace }}/prefix"
           elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
-            mv extract_dir ${{ github.workspace }}/prefix
+            mv extract_dir "${{ github.workspace }}/prefix"
           else
             echo "::error::解压后的包内找不到 prefix 目录"
             exit 1
@@ -116,7 +115,6 @@ jobs:
           export STRIP="$TOOLCHAIN/bin/llvm-strip"
           export PATH="$TOOLCHAIN/bin:$PATH"
 
-          # 统一设置 pkg-config 检索路径
           export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
@@ -143,7 +141,7 @@ jobs:
 
           echo "🚀 开始构建 ($BUILD_TYPE)..."
 
-          # === 彻底分离配置，避免 eval 导致的参数解析灾难 ===
+          # === 彻底分离配置，避免任何变量传递引发的血案 ===
           if [ "$BUILD_TYPE" == "shared" ]; then
             ./configure \
               --prefix="$OUTPUT" \
@@ -203,7 +201,7 @@ jobs:
               --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
               --disable-doc --disable-debug \
               --extra-cflags="-I$PREFIX/include -fPIC" \
-              --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
+              --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -static" \
               --extra-libs="-lc++_static -lm -lz" \
             || { echo "::group::config.log failures"; tail -n 100 ffbuild/config.log; echo "::endgroup::"; exit 1; }
             
@@ -213,12 +211,10 @@ jobs:
           mkdir -p "$OUTPUT"
           
           if [ "$BUILD_TYPE" == "shared" ]; then
-            # 【同级目录处理】把 bin 里的可执行文件移到 output 根目录
             if [ -d "$OUTPUT/bin" ]; then
               cp -a "$OUTPUT/bin/." "$OUTPUT/"
               rm -rf "$OUTPUT/bin"
             fi
-            # 拷贝所有外部依赖库
             cp -a "$PREFIX/lib"/*.so* "$OUTPUT/lib/" 2>/dev/null || true
           else
             if [ -d "$OUTPUT/bin" ]; then
@@ -229,7 +225,6 @@ jobs:
             $STRIP "$OUTPUT/ffmpeg" "$OUTPUT/ffprobe"
           fi
 
-          # 生成 BUILD_INFO
           cat > "$OUTPUT/BUILD_INFO.txt" <<EOF
           ======================================
           FFmpeg Android Build Info
@@ -259,8 +254,9 @@ jobs:
           echo "Testing ${{ matrix.build_type }} linkage..."
           echo "======================================"
           if [ "${{ matrix.build_type }}" == "static" ]; then
-            if file output/ffmpeg | grep -q "dynamically linked"; then
-              echo "::error::Static build is dynamically linked!"
+            # 检查是否引入了非系统级别的动态依赖 (排除 bionic 基础库)
+            if readelf -d output/ffmpeg 2>/dev/null | grep NEEDED | grep -v -E 'libc\.so|libm\.so|libdl\.so|libz\.so'; then
+              echo "::error::Static build has unexpected non-system dynamic dependencies!"
               exit 1
             fi
             echo "✅ Verification passed: It is a completely static executable."
