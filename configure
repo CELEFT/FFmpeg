@@ -334,7 +334,6 @@ External library support:
   --enable-ohcodec         enable OpenHarmony Codec support [no]
   --enable-openal          enable OpenAL 1.1 capture support [no]
   --enable-opencl          enable OpenCL processing [no]
-  --enable-opengl          enable OpenGL rendering [no]
   --enable-openssl         enable openssl, needed for https support
                            if gnutls, libtls or mbedtls is not used [no]
   --enable-pocketsphinx    enable PocketSphinx, needed for asr filter [no]
@@ -2143,7 +2142,6 @@ EXTERNAL_LIBRARY_LIST="
     mediacodec
     ohcodec
     openal
-    opengl
     openssl
     pocketsphinx
     vapoursynth
@@ -2455,7 +2453,6 @@ HEADERS_LIST="
     dirent_h
     dxgidebug_h
     dxva_h
-    ES2_gl_h
     gsm_h
     io_h
     linux_dma_buf_h
@@ -2520,7 +2517,6 @@ SYSTEM_FUNCS="
     GetSystemTimeAsFileTime
     gettimeofday
     glob
-    glXGetProcAddress
     gmtime_r
     inet_aton
     ioctl
@@ -2563,7 +2559,6 @@ SYSTEM_FUNCS="
     usleep
     UTGetOSTypeFromString
     VirtualAlloc
-    wglGetProcAddress
 "
 
 SYSTEM_LIBRARIES="
@@ -2597,6 +2592,7 @@ TOOLCHAIN_FEATURES="
     ibm_asm
     inline_asm_direct_symbol_refs
     inline_asm_nonlocal_labels
+    loongson_mmi_mnemonics
     pragma_deprecated
     rsync_contimeout
     symver_asm_label
@@ -2721,6 +2717,7 @@ CONFIG_EXTRA="
     deflate_wrapper
     dirac_parse
     dnn
+    dnn_onnx_d3d12
     dovi_rpudec
     dovi_rpuenc
     dvprofile
@@ -3576,6 +3573,7 @@ scale_d3d11_filter_deps="d3d11va"
 scale_d3d12_filter_deps="d3d12va ID3D12VideoProcessor"
 deinterlace_d3d12_filter_deps="d3d12va ID3D12VideoProcessor"
 mestimate_d3d12_filter_deps="d3d12va ID3D12VideoMotionEstimator d3d12_motion_estimator"
+dnn_onnx_d3d12_deps="libonnxruntime d3d12va"
 
 amf_deps_any="libdl LoadLibrary"
 nvenc_deps="ffnvcodec"
@@ -3899,7 +3897,6 @@ aiff_muxer_select="iso_media"
 amv_muxer_select="riffenc"
 apv_demuxer_select="apv_parser"
 asf_demuxer_select="riffdec"
-asf_o_demuxer_select="riffdec"
 asf_muxer_select="riffenc"
 asf_stream_muxer_select="asf_muxer"
 av1_demuxer_select="av1_frame_merge_bsf av1_parser"
@@ -6657,7 +6654,14 @@ elif enabled mips; then
     enabled loongson3 && check_inline_asm loongson3 '"gsldxc1 $f0, 0($2, $3)"' '-mloongson-ext' && append MMIFLAGS '-mloongson-ext'
 
     # MMI can be detected at runtime too
-    enabled mmi && check_inline_asm mmi '"pxor $f0, $f0, $f0"' '-mloongson-mmi' && append MMIFLAGS '-mloongson-mmi'
+    enabled mmi && {
+        check_inline_asm loongson_mmi_mnemonics '"pxor $f0, $f0, $f0\n\tssrld $f0, $f0, $f0"' '-mloongson-mmi' || {
+            # the MMI code does not build for O32 and assumes little-endian
+            disable mmi
+            enabled mips64 && ! enabled bigendian &&
+                check_inline_asm mmi '"xor $f0, $f0, $f0"' '-mloongson-mmi'
+        }
+    } && append MMIFLAGS '-mloongson-mmi'
 
     if enabled bigendian && enabled msa; then
         disable msa
@@ -7311,6 +7315,11 @@ enabled libmpeghdec       && require_pkg_config libmpeghdec "mpeghdec >= 3.0.0" 
 enabled libmysofa         && { check_pkg_config libmysofa libmysofa mysofa.h mysofa_neighborhood_init_withstepdefine ||
                                require libmysofa mysofa.h mysofa_neighborhood_init_withstepdefine -lmysofa $zlib_extralibs; }
 enabled libonnxruntime    && require libonnxruntime onnxruntime_c_api.h OrtGetApiBase -lonnxruntime
+enabled libonnxruntime && enabled ID3D12Device &&
+    check_cc dnn_onnx_d3d12 "windows.h d3d12.h d3dcompiler.h dml_provider_factory.h" \
+        "(void)sizeof(((OrtDmlApi *)0)->SessionOptionsAppendExecutionProvider_DML1);
+         (void)sizeof(((OrtDmlApi *)0)->CreateGPUAllocationFromD3DResource);
+         (void)sizeof(((OrtDmlApi *)0)->FreeGPUAllocation);"
 enabled libopencore_amrnb && { check_pkg_config libopencore_amrnb opencore-amrnb opencore-amrnb/interf_dec.h Decoder_Interface_init ||
                                require libopencore_amrnb opencore-amrnb/interf_dec.h Decoder_Interface_init -lopencore-amrnb; }
 enabled libopencore_amrwb && { check_pkg_config libopencore_amrwb opencore-amrwb opencore-amrwb/dec_if.h D_IF_init ||
@@ -7453,13 +7462,6 @@ enabled opencl            && { check_pkg_config opencl OpenCL CL/cl.h clEnqueueN
                              { test_cpp_condition "OpenCL/cl.h" "defined(CL_VERSION_1_2)" ||
                                test_cpp_condition "CL/cl.h" "defined(CL_VERSION_1_2)" ||
                                die "ERROR: opencl must be installed and version must be 1.2 or compatible"; }
-enabled opengl            && { check_lib opengl GL/glx.h glXGetProcAddress "-lGL" ||
-                               check_lib opengl windows.h wglGetProcAddress "-lopengl32 -lgdi32" ||
-                               check_lib opengl OpenGL/gl3.h glGetError "-framework OpenGL" ||
-                               check_lib opengl ES2/gl.h glGetError "-isysroot=${sysroot} -framework OpenGLES" ||
-                               die "ERROR: opengl not found."
-                             }
-
 enabled openssl           && { { check_pkg_config openssl "openssl >= 3.0.0" openssl/ssl.h DTLS_get_data_mtu &&
                                  { enabled gplv3 || ! enabled gpl || enabled nonfree || die "ERROR: OpenSSL >=3.0.0 requires --enable-version3"; }; } ||
                                { enabled gpl && ! enabled nonfree && die "ERROR: OpenSSL <3.0.0 is incompatible with the gpl"; } ||
