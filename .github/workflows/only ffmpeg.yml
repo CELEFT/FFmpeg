@@ -23,7 +23,7 @@ env:
   ANDROID_TRIPLE: "aarch64-linux-android"
   DEFAULT_PREFIX_URL: "https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz"
   FFMPEG_VERSION_DEFAULT: "9.0.2"
-  # 相对检索路径：解压后在 output/ 目录下直接跑 ./ffmpeg 时，库目录为 ./lib
+  # 相对检索路径：在 output/ 目录下执行 ./ffmpeg 时，库目录为 ./lib
   RPATH_DIR: "./lib"
 
 concurrency:
@@ -40,14 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ==================================================================
       - name: Install host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils
 
-      # ==================================================================
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
@@ -69,7 +67,6 @@ jobs:
           rm -f ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
 
-      # ==================================================================
       - name: Download and Extract Prefix
         run: |
           set -euo pipefail
@@ -103,8 +100,6 @@ jobs:
             exit 1
           fi
 
-      # ==================================================================
-      # 静态构建前置体检：哪些库只有 .so 没有 .a
       - name: Inspect prefix static archives (static only)
         if: matrix.build_type == 'static'
         run: |
@@ -119,7 +114,6 @@ jobs:
           echo "===== 静态库清单 ====="
           ls -1 "$PREFIX"/lib/*.a 2>/dev/null || echo "(none)"
 
-      # ==================================================================
       - name: Build FFmpeg (${{ matrix.build_type }})
         run: |
           #!/bin/bash
@@ -150,11 +144,9 @@ jobs:
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
-          # 公共链接参数：-Wl,-rpath,./lib 即你要的“路径检索 ./lib”
-          # 注意 ./lib 里没有 $ 字符，不会被 make 二次展开吃掉
+          # -Wl,-rpath,./lib 即“路径检索 ./lib”；./lib 不含 $ 不会被 make 二次展开
           LD_COMMON="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,$RPATH_DIR"
 
-          # ---------- 1. 修正 pkg-config，并把 include 子目录补进 Cflags ----------
           echo "🔧 修正 pkg-config 与头文件包含路径..."
           SUBDIRS=""
           if [ -d "$PREFIX/include" ]; then
@@ -171,7 +163,6 @@ jobs:
             fi
           done
 
-          # 非破坏性平铺：只补缺失的头文件，绝不覆盖同名 header（避免 ABI 错位崩溃）
           if [ -d "$PREFIX/include" ]; then
             find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 \
               | while IFS= read -r -d '' h; do
@@ -180,7 +171,6 @@ jobs:
                 done
           fi
 
-          # ---------- 2. 静态模式：只隐藏“存在同名 .a”的 .so ----------
           if [ "$BUILD_TYPE" = "static" ]; then
             echo "🔧 静态模式：隐藏有对应 .a 的动态库，逼迫链接器使用静态库..."
             for f in "$PREFIX/lib"/*.so*; do
@@ -192,7 +182,6 @@ jobs:
             done
           fi
 
-          # ---------- 3. 下载源码 ----------
           if [ ! -d "ffmpeg" ]; then
             echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION} 源码..."
             if ! wget -q --tries=3 --timeout=30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"; then
@@ -208,8 +197,6 @@ jobs:
 
           echo "🚀 开始构建 ($BUILD_TYPE)  rpath=$RPATH_DIR ..."
 
-          # ---------- 4. configure ----------
-          # 注意：必须是 if ! ./configure ...; then（不能写成 | { ...; exit 1; }）
           if [ "$BUILD_TYPE" = "shared" ]; then
             if ! ./configure \
                 --prefix="$OUTPUT" \
@@ -286,7 +273,6 @@ jobs:
             make -j"$(nproc)" ffmpeg ffprobe
           fi
 
-          # ---------- 5. 组装输出 ----------
           if [ -d "$OUTPUT/bin" ]; then
             cp -a "$OUTPUT/bin/." "$OUTPUT/"
             rm -rf "$OUTPUT/bin"
@@ -297,17 +283,17 @@ jobs:
 
             echo "📦 收集第三方动态库到 output/lib ..."
             cp -a "$PREFIX/lib"/*.so* "$OUTPUT/lib/" 2>/dev/null || true
-            # libc++_shared.so 不在 prefix 里，必须从 NDK sysroot 补（否则两份 libc++ → SIGSEGV）
+            # libc++_shared.so 不在 prefix 里，必须从 NDK sysroot 补（避免两份 libc++ → SIGSEGV）
             cp -a "$SYS_LIB/libc++_shared.so" "$OUTPUT/lib/" 2>/dev/null || true
 
-            # 兜底包装脚本：无论 bionic 是否忽略 RPATH，都能定位 ./lib
-            cat > "$OUTPUT/ffmpeg.sh" <<'EOS'
-#!/system/bin/sh
-DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
-[ -n "$DIR" ] || DIR=.
-export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$DIR/ffmpeg" "$@"
-EOS
+            # 兜底包装脚本：printf 逐行生成，不受 YAML 缩进影响、无前导空格
+            {
+              printf '%s\n' '#!/system/bin/sh'
+              printf '%s\n' 'DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)'
+              printf '%s\n' '[ -n "$DIR" ] || DIR=.'
+              printf '%s\n' 'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+              printf '%s\n' 'exec "$DIR/ffmpeg" "$@"'
+            } > "$OUTPUT/ffmpeg.sh"
             chmod +x "$OUTPUT/ffmpeg.sh"
 
           else
@@ -316,7 +302,6 @@ EOS
             rm -rf "$OUTPUT/lib"
           fi
 
-          # ---------- 6. BUILD_INFO ----------
           {
             echo "======================================"
             echo "FFmpeg Android Build Info"
@@ -344,8 +329,6 @@ EOS
 
           cd ..
 
-      # ==================================================================
-      # 依赖校验 + 确认 ./lib 已写进 ELF
       - name: Verify linkage & ./lib rpath (${{ matrix.build_type }})
         run: |
           set -uo pipefail
@@ -361,7 +344,6 @@ EOS
           echo "Testing ${{ matrix.build_type }} linkage..."
           echo "======================================"
 
-          # 关键：确认 ./lib 已写入 ELF 的动态段
           dyn="$(readelf -d output/ffmpeg 2>/dev/null | grep -E 'RUNPATH|RPATH' || true)"
           echo "$dyn"
           if [ "${{ matrix.build_type }}" = "shared" ]; then
@@ -396,7 +378,6 @@ EOS
 
           exit $fail
 
-      # ==================================================================
       - name: Report 16KB page alignment
         run: |
           set -uo pipefail
@@ -407,7 +388,6 @@ EOS
             echo "$(printf '%-45s' "$f") -> ${al:-unknown}"
           done
 
-      # ==================================================================
       - name: Package (${{ matrix.build_type }})
         run: |
           set -euo pipefail
@@ -421,7 +401,6 @@ EOS
           path: ${{ github.workspace }}/ffmpeg-${{ matrix.build_type }}-arm64-v8a.tar.xz
           retention-days: 7
 
-  # ====================================================================
   release:
     needs: build-ffmpeg
     runs-on: ubuntu-latest
@@ -456,21 +435,21 @@ EOS
 
             ### 库检索路径：`./lib`
 
-            已写入 ELF 动态段：`RUNPATH = ./lib`，可直接在 `output/` 目录下执行：
+            已写入 ELF 动态段：`RUNPATH = ./lib`，在解压目录下可直接执行：
 
             ```sh
             cd output && ./ffmpeg -version
             ```
 
-            若在其它目录调用，建议用包内 wrapper（自动定位自身目录）：
+            从其它目录调用（自动定位自身目录）：
 
             ```sh
             ./ffmpeg.sh -version
-            # 等价于：DIR=<脚本目录>; LD_LIBRARY_PATH=$DIR/lib ./ffmpeg
             ```
 
-            > 说明：Android bionic 对 `DT_RPATH/DT_RUNPATH` 支持依 rom/版本而异，
-            > 因此包内同时提供 `./lib` 的 RUNPATH 与 `ffmpeg.sh` 双保险。
+            > Android bionic 对 DT_RPATH/DT_RUNPATH 的支持依系统版本而异，
+            > 因此同时提供 `./lib` RUNPATH 与 `ffmpeg.sh` 双保险。
+            > App 内集成请直接把 `lib/*.so` 放入 `jniLibs/arm64-v8a`。
 
             ### 📦 包结构
 
@@ -480,8 +459,7 @@ EOS
             ├── ffmpeg          <-- RUNPATH=./lib
             ├── ffprobe
             ├── ffmpeg.sh       <-- 兜底 wrapper
-            ├── lib/            <-- libav*.so + 全部第三方 .so + libc++_shared.so
-            ├── include/        <-- 头文件（如需瘦身可删）
+            ├── lib/            <-- libav*.so + 第三方 .so + libc++_shared.so
             └── BUILD_INFO.txt
             ```
 
