@@ -1,10 +1,12 @@
-name: Build FFmpeg 9.0.2 for Android (arm64-v8a, Multi-Job, Cached, Two Tarballs)
+name: Build FFmpeg 9.0.2 for Android (arm64-v8a) — prefix + ffmpeg
 
 on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
   workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 0'      # 每周日 03:00 UTC 自动构建并发布
 
 env:
   FFMPEG_VERSION: "9.0.2"
@@ -13,11 +15,17 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
+  LIBS_CACHE_VERSION: "v3"
   BASE_PRIVATE_LIBS: "-lc++_static -lm"
-  LIBS_CACHE_VERSION: "v1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # ==================== Job 1: 并行编译外部库 ====================
+  # ===================================================================
+  # Job 1: 并行编译外部库（每个库一个 matrix 分支）
+  # ===================================================================
   build-libs:
     runs-on: ubuntu-latest
     strategy:
@@ -31,92 +39,56 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --cross-prefix="$TOOLCHAIN/bin/llvm-" \
                 --enable-static --enable-shared --enable-pic --disable-cli
               make -j"$(nproc)" && make install
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/x264.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-
-              Name: x264
-              Description: H.264 (MPEG4 AVC) encoder library
-              Version: 0.164.3095
-              Libs: -L\${libdir} -lx264
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc x264 "H.264 encoder" "0.164.3108" x264
 
           - name: x265
             build: |
               set -euo pipefail
-              git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git
-              cd x265_git
+              git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git && cd x265_git
               sed -i 's/list(APPEND PLATFORM_LIBS pthread)/# list(APPEND PLATFORM_LIBS pthread)/' source/CMakeLists.txt || true
-
-              X265_FLAGS=(
-                -G "Unix Makefiles"
-                -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"
-                -DANDROID_ABI="$TARGET_ABI"
-                -DANDROID_PLATFORM="android-$API_LEVEL"
-                -DANDROID_STL=c++_static
-                -DCMAKE_SYSTEM_NAME=Android
-                -DCMAKE_SYSTEM_PROCESSOR=aarch64
-                -DCMAKE_BUILD_TYPE=Release
-                -DCMAKE_INSTALL_PREFIX="$PREFIX"
-                -DENABLE_ASSEMBLY=OFF
-                -DENABLE_CLI=OFF
-                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
-                -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
-              )
               for shared in ON OFF; do
                 rm -rf "build-$shared"
-                cmake -S source -B "build-$shared" "${X265_FLAGS[@]}" -DENABLE_SHARED="$shared"
+                cmake -S source -B "build-$shared" -G "Unix Makefiles" \
+                  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+                  -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
+                  -DANDROID_STL=c++_static -DCMAKE_SYSTEM_NAME=Android -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+                  -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+                  -DENABLE_ASSEMBLY=OFF -DENABLE_CLI=OFF -DENABLE_SHARED="$shared" \
+                  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
                 cmake --build "build-$shared" -j"$(nproc)"
               done
-
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               for h in x265.h x265_config.h; do
                 src=$(find build-ON build-OFF source -maxdepth 1 -name "$h" | head -n1 || true)
-                [ -n "${src:-}" ] && cp -f "$src" "$PREFIX/include/$h"
+                [ -n "$src" ] && cp -f "$src" "$PREFIX/include/$h"
               done
               A=$(find . -name 'libx265.a' | head -n1 || true)
-              [ -n "${A:-}" ] && cp -f "$A" "$PREFIX/lib/libx265.a"
-              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done < <(find build-ON -maxdepth 2 -name 'libx265.so*' 2>/dev/null || true)
+              [ -n "$A" ] && cp -f "$A" "$PREFIX/lib/libx265.a"
+              find build-ON -maxdepth 2 -name 'libx265.so*' -exec cp -af {} "$PREFIX/lib/" \;
               if [ ! -e "$PREFIX/lib/libx265.so" ]; then
-                real=$(find "$PREFIX/lib" -maxdepth 1 -name 'libx265.so.*' | head -n1 || true)
-                if [ -n "${real:-}" ]; then cp -f "$real" "$PREFIX/lib/libx265.so"
-                else
-                  echo "::warning::CMake 未产出 libx265.so，改用 PIC 静态库生成"
-                  $CXX -shared -Wl,-soname,libx265.so -o "$PREFIX/lib/libx265.so" \
-                    -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive -lc++_static -lm
-                fi
+                real=$(ls "$PREFIX"/lib/libx265.so.* 2>/dev/null | head -n1 || true)
+                [ -n "$real" ] && ln -sf "$(basename "$real")" "$PREFIX/lib/libx265.so"
               fi
               test -f "$PREFIX/lib/libx265.a"  || { echo "libx265.a missing";  exit 1; }
               test -e "$PREFIX/lib/libx265.so" || { echo "libx265.so missing"; exit 1; }
-              test -f "$PREFIX/include/x265.h" || { echo "x265.h missing";     exit 1; }
-
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/x265.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-
-              Name: x265
-              Description: H.265/HEVC video encoder
-              Version: 4.1
-              Libs: -L\${libdir} -lx265
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc x265 "H.265/HEVC encoder" "4.1" x265
 
           - name: dav1d
             build: |
               set -euo pipefail
               git clone --depth 1 https://code.videolan.org/videolan/dav1d.git && cd dav1d
-              printf "[binaries]\nc='%s'\ncpp='%s'\nar='%s'\nstrip='%s'\npkgconfig='pkg-config'\n\n[properties]\nneeds_exe_wrapper=true\n\n[host_machine]\nsystem='android'\ncpu_family='aarch64'\ncpu='aarch64'\nendian='little'\n" "$CC" "$CXX" "$AR" "$STRIP" > "$PWD/android.cross"
-              meson setup _build --cross-file "$PWD/android.cross" --prefix="$PREFIX" \
+              {
+                printf '[binaries]\n'
+                printf "c = '%s'\n" "$CC"
+                printf "cpp = '%s'\n" "$CXX"
+                printf "ar = '%s'\n" "$AR"
+                printf "strip = '%s'\n" "$STRIP"
+                printf "pkgconfig = 'pkg-config'\n"
+                printf '\n[properties]\nneeds_exe_wrapper = true\n'
+                printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
+              } > android.cross
+              meson setup _build --cross-file android.cross --prefix="$PREFIX" \
                 --default-library=both --buildtype=release \
                 -Denable_tools=false -Denable_tests=false
               ninja -C _build && ninja -C _build install
@@ -125,7 +97,8 @@ jobs:
             build: |
               set -euo pipefail
               git clone --depth 1 https://github.com/webmproject/libvpx.git && cd libvpx
-              find . -name "configure*" -type f -exec sed -i 's/die "--enable-shared only supported on ELF, OS\/2, and Darwin for now"/echo "Skipping ELF check for Android"/g' {} +
+              find . -name "configure*" -type f -exec \
+                sed -i 's/die "--enable-shared only supported on ELF, OS\/2, and Darwin for now"/echo "Skipping ELF check for Android"/g' {} +
               export CROSS="$TOOLCHAIN/bin/llvm-"
               export ASFLAGS="-D__ANDROID__"
               export LDFLAGS="-Wl,-z,max-page-size=16384"
@@ -134,19 +107,7 @@ jobs:
                 --disable-examples --disable-tools --disable-docs --disable-unit-tests \
                 --extra-cflags="-fPIC"
               make -j"$(nproc)" && make install
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/vpx.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: vpx
-              Description: WebM Project VP8/VP9 Codec Library
-              Version: 1.14.0
-              Libs: -L\${libdir} -lvpx
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc vpx "WebM VP8/VP9 codec" "1.14.0" vpx
 
           - name: libaom
             build: |
@@ -160,40 +121,13 @@ jobs:
                 -DCONFIG_AV1_ENCODER=1 -DCONFIG_PIC=1 \
                 -DAOM_TARGET_CPU=arm64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               ninja && ninja install
-
-              mkdir -p "$PREFIX/lib"
-              echo "--- aom 安装产物 ---"
-              ls -l "$PREFIX"/lib/libaom* || true
               if [ ! -e "$PREFIX/lib/libaom.so" ]; then
                 real=$(ls "$PREFIX"/lib/libaom.so.* 2>/dev/null | head -n1 || true)
-                if [ -n "${real:-}" ]; then
-                  ln -sf "$(basename "$real")" "$PREFIX/lib/libaom.so"
-                elif [ -f "$PREFIX/lib/libaom.a" ]; then
-                  echo "::warning::aom 未产出 .so，改用 PIC 静态库生成"
-                  $CXX -shared -Wl,-soname,libaom.so -o "$PREFIX/lib/libaom.so" \
-                    -Wl,--whole-archive "$PREFIX/lib/libaom.a" -Wl,--no-whole-archive -lc++_static -lm
-                fi
-              fi
-              if [ ! -f "$PREFIX/lib/libaom.a" ]; then
-                A=$(find . -name 'libaom.a' | head -n1 || true)
-                [ -n "${A:-}" ] && cp -f "$A" "$PREFIX/lib/libaom.a"
+                [ -n "$real" ] && ln -sf "$(basename "$real")" "$PREFIX/lib/libaom.so"
               fi
               test -f "$PREFIX/lib/libaom.a"  || { echo "libaom.a missing";  exit 1; }
               test -e "$PREFIX/lib/libaom.so" || { echo "libaom.so missing"; exit 1; }
-
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/aom.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: aom
-              Description: AOMedia Project AV1 Codec Library
-              Version: 3.8.0
-              Libs: -L\${libdir} -laom
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc aom "AOMedia AV1 codec" "3.8.0" aom
 
           - name: svt-av1
             build: |
@@ -204,23 +138,12 @@ jobs:
                 cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
                   -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-                  -DBUILD_SHARED_LIBS="$mode" -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                  -DBUILD_SHARED_LIBS="$mode" -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                  -DCMAKE_BUILD_TYPE=Release -DBUILD_ENC_ONLY=OFF
                 ninja && ninja install
                 cd ..
               done
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/SvtAv1Enc.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: SvtAv1Enc
-              Description: SVT-AV1 Encoder
-              Version: 1.8.0
-              Libs: -L\${libdir} -lSvtAv1Enc
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir} -I\${includedir}/svt-av1
-              EOF
+              test -e "$PREFIX/lib/libSvtAv1Enc.so" || { echo "libSvtAv1Enc.so missing"; exit 1; }
 
           - name: vvenc
             build: |
@@ -233,22 +156,12 @@ jobs:
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
                   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS="$mode" \
                   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                make -j"$(nproc)" && make install
+                make -j"$(nproc)" -C .. 2>/dev/null || true
+                cmake --build . -j"$(nproc)"
+                cmake --install . || true
                 cd ..
               done
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/libvvenc.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: libvvenc
-              Description: Fraunhofer Versatile Video Encoder
-              Version: 1.11.0
-              Libs: -L\${libdir} -lvvenc
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir} -I\${includedir}/vvenc
-              EOF
+              mkpc libvvenc "Fraunhofer VVC encoder" "1.11.0" vvenc "-I\${includedir}/vvenc"
 
           - name: xeve
             build: |
@@ -261,48 +174,22 @@ jobs:
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
                   -DSET_PROF=MAIN -DBUILD_SHARED_LIBS="$mode" \
                   -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                make -j"$(nproc)"
-                make install || true
+                cmake --build . -j"$(nproc)"
+                cmake --install . || true
                 cd ..
               done
-
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
-              echo "--- xeve 构建产物 ---"
-              find . -name 'libxeve*' -o -name 'xeve*.h' | sort || true
-
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
-              while IFS= read -r h; do cp -f "$h" "$PREFIX/include/"; done \
-                < <(find . -maxdepth 3 -name 'xeve*.h' -not -path './build_*/*' 2>/dev/null || true)
-
-              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done \
-                < <(find . -maxdepth 4 -name 'libxeve.a'  -o -maxdepth 4 -name 'libxeve.so*' 2>/dev/null || true)
+              find . -maxdepth 3 -name 'xeve*.h' -not -path './build_*/*' -exec cp -f {} "$PREFIX/include/" \;
+              find . -maxdepth 4 \( -name 'libxeve.a' -o -name 'libxeve.so*' \) -exec cp -af {} "$PREFIX/lib/" \;
               if [ ! -e "$PREFIX/lib/libxeve.so" ]; then
                 real=$(ls "$PREFIX"/lib/libxeve.so.* 2>/dev/null | head -n1 || true)
-                if [ -n "${real:-}" ]; then
-                  ln -sf "$(basename "$real")" "$PREFIX/lib/libxeve.so"
-                elif [ -f "$PREFIX/lib/libxeve.a" ]; then
-                  $CXX -shared -Wl,-soname,libxeve.so -o "$PREFIX/lib/libxeve.so" \
-                    -Wl,--whole-archive "$PREFIX/lib/libxeve.a" -Wl,--no-whole-archive -lc++_static -lm
-                fi
+                [ -n "$real" ] && ln -sf "$(basename "$real")" "$PREFIX/lib/libxeve.so"
               fi
-
               test -f "$PREFIX/lib/libxeve.a"  || { echo "libxeve.a missing";  exit 1; }
               test -e "$PREFIX/lib/libxeve.so" || { echo "libxeve.so missing"; exit 1; }
               test -f "$PREFIX/include/xeve.h" || { echo "xeve.h missing";     exit 1; }
-
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/xeve.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: xeve
-              Description: MPEG-5 EVC Encoder
-              Version: 1.0.0
-              Libs: -L\${libdir} -lxeve
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc xeve "MPEG-5 EVC encoder" "1.0.0" xeve
 
           - name: xevd
             build: |
@@ -315,63 +202,40 @@ jobs:
                   -DANDROID_STL=c++_static -DCMAKE_INSTALL_PREFIX="$PREFIX" \
                   -DBUILD_SHARED_LIBS="$mode" \
                   -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-                make -j"$(nproc)"
-                make install || true
+                cmake --build . -j"$(nproc)"
+                cmake --install . || true
                 cd ..
               done
-
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
-              echo "--- xevd 构建产物 ---"
-              find . -name 'libxevd*' -o -name 'xevd*.h' | sort || true
-
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
-              while IFS= read -r h; do cp -f "$h" "$PREFIX/include/"; done \
-                < <(find . -maxdepth 3 -name 'xevd*.h' -not -path './build_*/*' 2>/dev/null || true)
-
-              while IFS= read -r f; do cp -af "$f" "$PREFIX/lib/"; done \
-                < <(find . -maxdepth 4 -name 'libxevd.a' -o -maxdepth 4 -name 'libxevd.so*' 2>/dev/null || true)
+              find . -maxdepth 3 -name 'xevd*.h' -not -path './build_*/*' -exec cp -f {} "$PREFIX/include/" \;
+              find . -maxdepth 4 \( -name 'libxevd.a' -o -name 'libxevd.so*' \) -exec cp -af {} "$PREFIX/lib/" \;
               if [ ! -e "$PREFIX/lib/libxevd.so" ]; then
                 real=$(ls "$PREFIX"/lib/libxevd.so.* 2>/dev/null | head -n1 || true)
-                if [ -n "${real:-}" ]; then
-                  ln -sf "$(basename "$real")" "$PREFIX/lib/libxevd.so"
-                elif [ -f "$PREFIX/lib/libxevd.a" ]; then
-                  $CXX -shared -Wl,-soname,libxevd.so -o "$PREFIX/lib/libxevd.so" \
-                    -Wl,--whole-archive "$PREFIX/lib/libxevd.a" -Wl,--no-whole-archive -lc++_static -lm
-                fi
+                [ -n "$real" ] && ln -sf "$(basename "$real")" "$PREFIX/lib/libxevd.so"
               fi
-
               test -f "$PREFIX/lib/libxevd.a"  || { echo "libxevd.a missing";  exit 1; }
               test -e "$PREFIX/lib/libxevd.so" || { echo "libxevd.so missing"; exit 1; }
               test -f "$PREFIX/include/xevd.h" || { echo "xevd.h missing";     exit 1; }
-
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/xevd.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: xevd
-              Description: MPEG-5 EVC Decoder
-              Version: 1.0.0
-              Libs: -L\${libdir} -lxevd
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd
 
           - name: openssl
             build: |
               set -euo pipefail
               git clone --depth 1 https://github.com/openssl/openssl.git && cd openssl
               export ANDROID_NDK_ROOT="$NDK"
-              ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" --prefix="$PREFIX" --openssldir="$PREFIX/ssl" no-tests
+              ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" --prefix="$PREFIX" \
+                --openssldir="$PREFIX/ssl" --libdir=lib no-tests
               make -j"$(nproc)" && make install_sw
               make clean
-              ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" --prefix="$PREFIX" --openssldir="$PREFIX/ssl" no-shared no-tests
+              ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" --prefix="$PREFIX" \
+                --openssldir="$PREFIX/ssl" --libdir=lib no-shared no-tests
               make -j"$(nproc)" && make install_sw
               for f in "$PREFIX"/lib/pkgconfig/*.pc; do
                 [ -e "$f" ] || continue
                 sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
               done
+              test -f "$PREFIX/lib/pkgconfig/openssl.pc" || { echo "openssl.pc missing"; exit 1; }
 
           - name: fdk-aac
             build: |
@@ -382,48 +246,26 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic --disable-example
               make -j"$(nproc)" && make install
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/fdk-aac.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: fdk-aac
-              Description: Fraunhofer FDK AAC Codec Library
-              Version: 2.0.3
-              Libs: -L\${libdir} -lfdk-aac
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc fdk-aac "Fraunhofer FDK AAC" "2.0.3" fdk-aac
 
           - name: lame
             build: |
               set -euo pipefail
-              wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz && tar xf lame-3.100.tar.gz && cd lame-3.100
+              wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+              tar xf lame-3.100.tar.gz && cd lame-3.100
               sed -i '/lame_init_old/d' include/libmp3lame.sym
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --enable-static --enable-shared --with-pic --disable-frontend --disable-asm
               make -j"$(nproc)" && make install
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/lame.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: lame
-              Description: MP3 encoding library
-              Version: 3.100
-              Libs: -L\${libdir} -lmp3lame
-              Libs.private: $BASE_PRIVATE_LIBS
-              Cflags: -I\${includedir}
-              EOF
+              mkpc lame "MP3 encoding library" "3.100" mp3lame
 
           - name: opus
             build: |
               set -euo pipefail
               git clone --depth 1 https://github.com/xiph/opus.git && cd opus
               ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --enable-static --enable-shared --with-pic
+              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
+                --enable-static --enable-shared --with-pic
               make -j"$(nproc)" && make install
 
           - name: vorbis
@@ -446,173 +288,152 @@ jobs:
               done
               $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
               $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
-              cp -f include/*.h "$PREFIX/include/"
+              find include -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
               test -f "$PREFIX/lib/liblc3.a"  || { echo "liblc3.a missing";  exit 1; }
               test -e "$PREFIX/lib/liblc3.so" || { echo "liblc3.so missing"; exit 1; }
-              test -f "$PREFIX/include/lc3.h" || { echo "lc3.h missing";     exit 1; }
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/lc3.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: lc3
-              Description: Low Complexity Communication Codec
-              Version: 1.1.0
-              Libs: -L\${libdir} -llc3
-              Libs.private: -lm
-              Cflags: -I\${includedir}
-              EOF
+              # FFmpeg 认的是 pkg-config 名 liblc3（不是 lc3），务必写成 liblc3.pc
+              mkpc liblc3 "Low Complexity Communication Codec" "1.1.0" lc3 "" 
+              cp -f "$PREFIX/lib/pkgconfig/liblc3.pc" "$PREFIX/lib/pkgconfig/lc3.pc"
 
           - name: webp
             build: |
               set -euo pipefail
               git clone --depth 1 https://github.com/webmproject/libwebp.git && cd libwebp
               ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --enable-static --enable-shared --with-pic \
+              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
+                --enable-static --enable-shared --with-pic \
                 --disable-libwebpdemux --disable-libwebpmux
               make -j"$(nproc)" && make install
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/libwebp.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              Name: libwebp
-              Description: WebP image codec
-              Version: 1.5.0
-              Libs: -L\${libdir} -lwebp
-              Libs.private: -lm
-              Cflags: -I\${includedir}
-              EOF
+              mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          - name: expat-fontconfig
+          # =============================================================
+          # 文本渲染链：freetype -> expat -> fontconfig -> fribidi
+          #              -> harfbuzz -> libass
+          # 必须放在同一个 job 里按顺序构建，否则 fontconfig/libass
+          # 会在依赖还没生成时就去 pkg-config 查找（这就是
+          # "libfribidi.so not found" 的肇因）
+          # =============================================================
+          - name: text-stack-ass
             build: |
               set -euo pipefail
+              export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+
+              # ---------- 1. freetype ----------
+              git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
+              ./autogen.sh
+              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                --enable-static --enable-shared --with-pic \
+                --without-zlib --without-png --without-bzip2 --without-harfbuzz \
+                CFLAGS="-O2 -fPIC"
+              make -j"$(nproc)" && make install
+              cd ..
+              test -e "$PREFIX/lib/libfreetype.so" || { echo "libfreetype.so missing"; exit 1; }
+
+              # ---------- 2. expat ----------
               wget -q https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
               tar xf expat-2.6.2.tar.gz && cd expat-2.6.2
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                 --enable-static --enable-shared --with-pic
-              make -j"$(nproc)" && make install && cd ..
+              make -j"$(nproc)" && make install
+              cd ..
 
-              pip3 install -U meson
-
+              # ---------- 3. fontconfig ----------
               git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git && cd fontconfig
-              cat > fontconfig.cross <<EOF
-              [binaries]
-              c = '$CC'
-              cpp = '$CXX'
-              ar = '$AR'
-              strip = '$STRIP'
-              pkgconfig = 'pkg-config'
-              [host_machine]
-              system = 'android'
-              cpu_family = 'aarch64'
-              cpu = 'aarch64'
-              endian = 'little'
-              EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file fontconfig.cross \
-                --prefix="$PREFIX" --default-library=both --buildtype=release \
-                -Dxml-backend=expat -Ddoc=disabled -Dtests=disabled -Dtools=disabled
-              ninja -C _build && ninja -C _build install && cd ..
+              {
+                printf '[binaries]\n'
+                printf "c = '%s'\n" "$CC"
+                printf "cpp = '%s'\n" "$CXX"
+                printf "ar = '%s'\n" "$AR"
+                printf "strip = '%s'\n" "$STRIP"
+                printf "pkgconfig = 'pkg-config'\n"
+                printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
+              } > android.cross
+              meson setup _build --cross-file android.cross --prefix="$PREFIX" \
+                --default-library=both --buildtype=release \
+                -Dxml-backend=expat -Dfreetype=enabled -Ddoc=disabled \
+                -Dtests=disabled -Dtools=disabled -Dnls=false
+              ninja -C _build && ninja -C _build install
+              cd ..
+              mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
 
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/fontconfig.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-              sysconfdir=\${prefix}/etc
-              localstatedir=\${prefix}/var
-              PACKAGE=fontconfig
-              confdir=\${sysconfdir}/fonts
-              cachedir=/var/cache/fontconfig
-
-              Name: Fontconfig
-              Description: Font configuration and customization library
-              Version: 2.16.2
-              Libs: -L\${libdir} -lfontconfig
-              Libs.private: -L\${libdir} -lexpat -lfreetype -lm
-              Cflags: -I\${includedir}
-              EOF
-
-          - name: ass-stack
-            build: |
-              set -euo pipefail
-              mkdir -p "$PREFIX"
-              export BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
-              export BASE_LDFLAGS="-L$PREFIX/lib"
-
-              git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git && cd freetype
-              ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                --enable-static --enable-shared --with-pic --without-zlib --without-png --without-bzip2 --without-harfbuzz \
-                CFLAGS="-O2 -fPIC"
-              make -j"$(nproc)" && make install && cd ..
-
+              # ---------- 4. fribidi ----------
               git clone --depth 1 https://github.com/fribidi/fribidi.git && cd fribidi
-              cat > fribidi.cross <<EOF
-              [binaries]
-              c = '$CC'
-              cpp = '$CXX'
-              ar = '$AR'
-              strip = '$STRIP'
-              pkgconfig = 'pkg-config'
-              [host_machine]
-              system = 'android'
-              cpu_family = 'aarch64'
-              cpu = 'aarch64'
-              endian = 'little'
-              EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" meson setup _build --cross-file fribidi.cross \
-                --prefix="$PREFIX" --default-library=both --buildtype=release \
+              {
+                printf '[binaries]\n'
+                printf "c = '%s'\n" "$CC"
+                printf "cpp = '%s'\n" "$CXX"
+                printf "ar = '%s'\n" "$AR"
+                printf "strip = '%s'\n" "$STRIP"
+                printf "pkgconfig = 'pkg-config'\n"
+                printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
+              } > android.cross
+              meson setup _build --cross-file android.cross --prefix="$PREFIX" \
+                --default-library=both --buildtype=release \
                 -Ddocs=false -Ddeprecated=false -Db_staticpic=true
-              ninja -C _build && ninja -C _build install && cd ..
+              ninja -C _build && ninja -C _build install
+              cd ..
+              test -e "$PREFIX/lib/libfribidi.so" || { echo "libfribidi.so missing -> libass 会在运行时炸"; exit 1; }
+              ls -l "$PREFIX"/lib/libfribidi.so*
 
+              # ---------- 5. harfbuzz ----------
               git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git && cd harfbuzz
-              cat > android.cross <<EOF
-              [binaries]
-              c = '$CC'
-              cpp = '$CXX'
-              ar = '$AR'
-              strip = '$STRIP'
-              pkgconfig = 'pkg-config'
-              [properties]
-              needs_exe_wrapper = true
-              [host_machine]
-              system = 'android'
-              cpu_family = 'aarch64'
-              cpu = 'aarch64'
-              endian = 'little'
-              EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" meson setup _build --cross-file android.cross \
-                --prefix="$PREFIX" --default-library=both --buildtype=release \
+              {
+                printf '[binaries]\n'
+                printf "c = '%s'\n" "$CC"
+                printf "cpp = '%s'\n" "$CXX"
+                printf "ar = '%s'\n" "$AR"
+                printf "strip = '%s'\n" "$STRIP"
+                printf "pkgconfig = 'pkg-config'\n"
+                printf '\n[properties]\nneeds_exe_wrapper = true\n'
+                printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
+              } > android.cross
+              meson setup _build --cross-file android.cross --prefix="$PREFIX" \
+                --default-library=both --buildtype=release \
                 -Db_staticpic=true -Dfreetype=enabled -Dglib=disabled -Dgobject=disabled \
-                -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled \
-                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
-              ninja -C _build && ninja -C _build install && cd ..
+                -Dcairo=disabled -Dicu=disabled -Dgraphite2=disabled -Dsubset=disabled \
+                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled -Dutilities=disabled
+              ninja -C _build && ninja -C _build install
+              cd ..
 
-              for sub in fribidi harfbuzz; do
-                if [ -d "$PREFIX/include/$sub" ]; then
-                  for h in "$PREFIX/include/$sub"/*.h; do
-                    [ -e "$h" ] || continue
-                    ln -sf "$h" "$PREFIX/include/$(basename "$h")"
-                  done
-                fi
-              done
-              if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
-                ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
-              fi
-
+              # ---------- 6. libass ----------
               git clone --depth 1 https://github.com/libass/libass.git && cd libass
               ./autogen.sh
-              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                 --enable-static --enable-shared --with-pic \
                 --disable-fontconfig --disable-require-system-font-provider \
-                CFLAGS="-O2 -fPIC" CPPFLAGS="$BASE_CPPFLAGS" LDFLAGS="$BASE_LDFLAGS"
+                CFLAGS="-O2 -fPIC"
               make -j"$(nproc)" && make install
+              cd ..
+
+              # ---------- 7. 平铺头文件（只补缺失，不覆盖）----------
+              for sub in fribidi harfbuzz; do
+                [ -d "$PREFIX/include/$sub" ] || continue
+                find "$PREFIX/include/$sub" -name '*.h' -print0 \
+                  | while IFS= read -r -d '' h; do
+                      tgt="$PREFIX/include/$(basename "$h")"
+                      [ -e "$tgt" ] || cp -n "$h" "$tgt"
+                    done
+              done
+              [ -f "$PREFIX/include/freetype2/ft2build.h" ] && \
+                ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h" || true
+
+              # ---------- 8. libass 专项自检 ----------
+              test -e "$PREFIX/lib/libass.so" || { echo "libass.so missing"; exit 1; }
+              test -f "$PREFIX/lib/libass.a"  || { echo "libass.a missing";  exit 1; }
+              echo "===== libass.so NEEDED ====="
+              readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
+              echo "===== libass.so SONAME ====="
+              readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*SONAME.*\[\(.*\)\].*/  \1/p'
+              # 它 NEEDED 的每一个非系统库，此刻必须都在 prefix/lib 里
+              for n in $(readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+                case "$n" in
+                  libc.so|libm.so|libdl.so|libz.so|liblog.so|libandroid.so) continue ;;
+                esac
+                if [ ! -e "$PREFIX/lib/$n" ]; then
+                  echo "::warning::libass.so 需要 $n，但 prefix/lib 里没有（打包阶段会阻断）"
+                fi
+              done
 
     steps:
       - uses: actions/checkout@v4
@@ -626,13 +447,15 @@ jobs:
 
       - name: Skip notice
         if: steps.cache-prefix.outputs.cache-hit == 'true'
-        run: echo "🎉 Prefix cache hit! Skipping external lib compilation."
+        run: echo "🎉 Prefix cache hit, skip lib compilation."
 
       - name: Install host dependencies
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool pkg-config nasm yasm cmake meson ninja-build git wget unzip gperf gettext libexpat1-dev
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
+            nasm yasm cmake meson ninja-build git wget unzip gperf gettext python3-pip \
+            libexpat1-dev xz-utils
 
       - name: Cache NDK
         if: steps.cache-prefix.outputs.cache-hit != 'true'
@@ -642,40 +465,75 @@ jobs:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
-      - name: Restore NDK Permissions (cache hit)
+      - name: Restore NDK permissions (cache hit)
         if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x ${{ github.workspace }}/ndk
+        run: chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Download NDK (cache miss)
         if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          mv android-ndk-r30* ${{ github.workspace }}/ndk
-          rm ndk.zip
-          chmod -R +x ${{ github.workspace }}/ndk
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Set toolchain environment
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
-          echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
-          echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
-          echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
-          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
-          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
-          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "NDK=${{ github.workspace }}/ndk"
+            echo "SYSROOT=$TOOLCHAIN/sysroot"
+            echo "PREFIX=${{ github.workspace }}/prefix"
+            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+            echo "AR=$TOOLCHAIN/bin/llvm-ar"
+            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
+            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+      # 用 printf 逐行生成 mkpc，避免 heredoc 被 YAML 缩进污染
+      - name: Install pc helper (mkpc)
+        if: steps.cache-prefix.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          {
+            printf '%s\n' '#!/usr/bin/env bash'
+            printf '%s\n' 'set -euo pipefail'
+            printf '%s\n' 'mkpc() {'
+            printf '%s\n' '  local name="$1" desc="$2" ver="$3" lib="$4"'
+            printf '%s\n' '  local priv="${5:-$BASE_PRIVATE_LIBS}"'
+            printf '%s\n' '  local cflags="${6:-}"'
+            printf '%s\n' '  mkdir -p "$PREFIX/lib/pkgconfig"'
+            printf '%s\n' '  local out="$PREFIX/lib/pkgconfig/$name.pc"'
+            printf '%s\n' '  {'
+            printf '%s\n' '    echo "prefix=$PREFIX"'
+            printf '%s\n' '    echo "exec_prefix=${prefix}"'
+            printf '%s\n' '    echo "libdir=${exec_prefix}/lib"'
+            printf '%s\n' '    echo "includedir=${prefix}/include"'
+            printf '%s\n' '    echo'
+            printf '%s\n' '    echo "Name: $name"'
+            printf '%s\n' '    echo "Description: $desc"'
+            printf '%s\n' '    echo "Version: $ver"'
+            printf '%s\n' '    echo "Libs: -L${libdir} -l$lib"'
+            printf '%s\n' '    echo "Libs.private: $priv"'
+            printf '%s\n' '    echo "Cflags: -I${includedir} $cflags"'
+            printf '%s\n' '  } > "$out"'
+            printf '%s\n' '  echo "[mkpc] $out"'
+            printf '%s\n' '}'
+          } > "$HOME/.local/bin/mkpc"
+          chmod +x "$HOME/.local/bin/mkpc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build ${{ matrix.name }}
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         shell: bash
         run: ${{ matrix.build }}
 
-      - name: Upload ${{ matrix.name }} (per-lib snapshot)
+      - name: Upload ${{ matrix.name }} (prefix snapshot)
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -683,7 +541,9 @@ jobs:
           path: ${{ env.PREFIX }}
           retention-days: 1
 
-  # ==================== Job 2: 合并 prefix + 打包 tar.xz + 写缓存 ====================
+  # ===================================================================
+  # Job 2: 合并 prefix → 闭包校验 → 打包 tar.xz + 写缓存
+  # ===================================================================
   combine-prefix:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -695,7 +555,7 @@ jobs:
           path: ${{ github.workspace }}/prefix
           key: ${{ runner.os }}-prefix-${{ env.LIBS_CACHE_VERSION }}
 
-      - name: Download per-lib prefix artifacts (cache miss)
+      - name: Download per-lib snapshots
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
@@ -703,14 +563,65 @@ jobs:
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
 
-      - name: Sanity check merged prefix
+      - name: Sanity + NEEDED closure check
+        shell: bash
         run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}/prefix"
-          echo "so=$(find lib -name '*.so*' 2>/dev/null | wc -l) a=$(find lib -name '*.a' 2>/dev/null | wc -l) pc=$(find lib/pkgconfig -name '*.pc' 2>/dev/null | wc -l)"
-          test -d lib && test -d include
+          set -uo pipefail
+          PREFIX="${{ github.workspace }}/prefix"
+          LIBDIR="$PREFIX/lib"
+          test -d "$LIBDIR" && test -d "$PREFIX/include" || { echo "::error::prefix 结构异常"; exit 1; }
 
-      - name: Save prefix to cache (cache miss)
+          echo "===== 统计 ====="
+          echo "so=$(find "$LIBDIR" -name '*.so*' | wc -l) a=$(find "$LIBDIR" -name '*.a' | wc -l) pc=$(find "$LIBDIR/pkgconfig" -name '*.pc' | wc -l)"
+
+          # SONAME -> 文件
+          declare -A PROVIDER
+          for f in "$LIBDIR"/*.so*; do
+            [ -f "$f" ] || continue
+            sn=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')
+            [ -n "$sn" ] || sn=$(basename "$f")
+            PROVIDER["$sn"]="$f"
+          done
+
+          SYS="libc.so libm.so libdl.so libz.so liblog.so libandroid.so libmediandk.so \
+          libcamera2ndk.so libEGL.so libGLESv2.so libvulkan.so libnativewindow.so libsync.so libjnigraphics.so"
+
+          fail=0
+          {
+            echo "# prefix/lib NEEDED closure"
+            for f in "$LIBDIR"/*.so*; do
+              [ -f "$f" ] || continue
+              echo "## $(basename "$f")"
+              for n in $(readelf -d "$f" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+                skip=0
+                for s in $SYS; do [ "$n" = "$s" ] && skip=1 && break; done
+                [ "$skip" = 1 ] && continue
+                if [ "$n" = "libc++_shared.so" ]; then
+                  echo "  $n  -> (NDK sysroot, 打包时补入)"
+                elif [ -n "${PROVIDER[$n]:-}" ]; then
+                  echo "  $n  -> prefix/lib/$(basename "${PROVIDER[$n]}")"
+                else
+                  echo "  $n  -> MISSING"
+                  echo "::error::prefix/lib 内缺少 $n（被 $(basename "$f") 依赖）"
+                  fail=1
+                fi
+              done
+            done
+          } | tee "$LIBDIR/NEEDED_CLOSURE.txt"
+
+          # 文本栈硬性检查（这次事故的直接来源）
+          for pair in "libass.so:libfribidi.so" "libass.so:libfreetype.so"; do
+            a="${pair%%:*}"; b="${pair##*:}"
+            if [ -e "$LIBDIR/$a" ] && ! ls "$LIBDIR/$b"* >/dev/null 2>&1; then
+              echo "::error::$a 存在但 $b 缺失"
+              fail=1
+            fi
+          done
+
+          [ "$fail" -eq 0 ] && echo "✅ prefix 闭包完整"
+          exit "$fail"
+
+      - name: Save prefix to cache
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -738,8 +649,10 @@ jobs:
           path: ${{ github.workspace }}/prefix-android-arm64-v8a.tar.xz
           retention-days: 1
 
-  # ==================== Job 3: 编译 FFmpeg ====================
-  build-ffmpeg:
+  # ===================================================================
+  # Job 3: FFmpeg shared（独立，带 ./lib 检索路径 + 闭包打包）
+  # ===================================================================
+  build-shared:
     needs: combine-prefix
     runs-on: ubuntu-latest
     steps:
@@ -752,18 +665,18 @@ jobs:
           path: ${{ github.workspace }}/ndk
           key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
 
-      - name: Restore NDK Permissions (cache hit)
+      - name: Restore NDK permissions (cache hit)
         if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x ${{ github.workspace }}/ndk
+        run: chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Download NDK (cache miss)
         if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
-          mv android-ndk-r30* ${{ github.workspace }}/ndk
-          rm ndk.zip
-          chmod -R +x ${{ github.workspace }}/ndk
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Download merged prefix
         uses: actions/download-artifact@v4
@@ -771,147 +684,53 @@ jobs:
           name: prefix-merged
           path: ${{ github.workspace }}/prefix
 
-      - name: Set FFmpeg environment
+      - name: Set environment
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "TOOLCHAIN=$TOOLCHAIN" >> $GITHUB_ENV
-          echo "NDK=${{ github.workspace }}/ndk" >> $GITHUB_ENV
-          echo "SYSROOT=$TOOLCHAIN/sysroot" >> $GITHUB_ENV
-          echo "PREFIX=${{ github.workspace }}/prefix" >> $GITHUB_ENV
-          echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang" >> $GITHUB_ENV
-          echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++" >> $GITHUB_ENV
-          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
-          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> $GITHUB_ENV
-          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> $GITHUB_ENV
-          echo "$TOOLCHAIN/bin" >> $GITHUB_PATH
-          echo "PKG_CONFIG_PATH=${{ github.workspace }}/prefix/lib/pkgconfig" >> $GITHUB_ENV
-          echo "PKG_CONFIG_LIBDIR=${{ github.workspace }}/prefix/lib/pkgconfig" >> $GITHUB_ENV
-          echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+          SYS_LIB="$TOOLCHAIN/sysroot/usr/lib/${ANDROID_TRIPLE}"
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "SYSROOT=$TOOLCHAIN/sysroot"
+            echo "SYS_LIB=$SYS_LIB"
+            echo "PREFIX=${{ github.workspace }}/prefix"
+            echo "OUTPUT=${{ github.workspace }}/output"
+            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+            echo "AR=$TOOLCHAIN/bin/llvm-ar"
+            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
+            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
+            echo "PKG_CONFIG_PATH=${{ github.workspace }}/prefix/lib/pkgconfig"
+            echo "PKG_CONFIG_LIBDIR=${{ github.workspace }}/prefix/lib/pkgconfig"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      - name: Normalize pkg-config files
+      - name: Normalize pkg-config
         run: |
           set -euo pipefail
-          PC_DIR="$PREFIX/lib/pkgconfig"
-          mkdir -p "$PC_DIR"
-          for f in "$PC_DIR"/*.pc; do
+          for f in "$PREFIX/lib/pkgconfig"/*.pc; do
             [ -e "$f" ] || continue
             sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
           done
-          for m in x265 xeve xevd aom; do
-            if [ ! -f "$PC_DIR/$m.pc" ]; then
-              case "$m" in
-                x265) desc="H.265/HEVC video encoder"; lib=x265 ;;
-                aom)  desc="AOMedia Project AV1 Codec Library"; lib=aom ;;
-                xeve) desc="MPEG-5 EVC Encoder"; lib=xeve ;;
-                xevd) desc="MPEG-5 EVC Decoder"; lib=xevd ;;
-              esac
-              cat > "$PC_DIR/$m.pc" <<EOF
-          prefix=$PREFIX
-          exec_prefix=\${prefix}
-          libdir=\${exec_prefix}/lib
-          includedir=\${prefix}/include
 
-          Name: $m
-          Description: $desc
-          Version: 1.0.0
-          Libs: -L\${libdir} -l$lib
-          Libs.private: $BASE_PRIVATE_LIBS
-          Cflags: -I\${includedir}
-          EOF
-            fi
-          done
-
-      - name: Repair missing shared libs from static archives
-        shell: bash
-        run: |
-          set -uo pipefail
-          cd "$PREFIX/lib" || exit 0
-          for a in *.a; do
-            base=${a%.a}
-            if [ -e "$base.so" ] || ls "${base}.so".* >/dev/null 2>&1; then continue; fi
-            echo "--- synthesizing $base.so from $a ---"
-            $CXX -shared -Wl,-soname,"$base.so" -o "$base.so" \
-              -Wl,--whole-archive "$a" -Wl,--no-whole-archive -lc++_static -lm -lz 2>&1 | tail -n 5 \
-              || { echo "::warning::cannot synthesize $base.so"; rm -f "$base.so"; }
-          done
-
-      - name: Verify all external libs
-        shell: bash
-        run: |
-          set -uo pipefail
-          fail=0
-          declare -A H=(
-            [x264]=x264.h [x265]=x265.h [dav1d]=dav1d/dav1d.h [vpx]=vpx/vpx_decoder.h
-            [aom]=aom/aom_decoder.h [SvtAv1Enc]=svt-av1/EbSvtAv1Enc.h [libvvenc]=vvenc/vvenc.h
-            [xeve]=xeve.h [xevd]=xevd.h [openssl]=openssl/ssl.h [fdk-aac]=fdk-aac/aacenc_lib.h
-            [lame]=lame/lame.h [opus]=opus/opus.h [vorbis]=vorbis/codec.h [lc3]=lc3.h
-            [libwebp]=webp/encode.h [expat]=expat.h [fontconfig]=fontconfig/fontconfig.h
-            [freetype2]=freetype2/ft2build.h [fribidi]=fribidi/fribidi.h
-            [harfbuzz]=harfbuzz/hb.h [libass]=ass/ass.h
-          )
-          declare -A L=(
-            [x264]=x264 [x265]=x265 [dav1d]=dav1d [vpx]=vpx [aom]=aom
-            [SvtAv1Enc]=SvtAv1Enc [libvvenc]=vvenc [xeve]=xeve [xevd]=xevd
-            [openssl]=ssl [fdk-aac]=fdk-aac [lame]=mp3lame [opus]=opus
-            [vorbis]=vorbis [lc3]=lc3 [libwebp]=webp [expat]=expat
-            [fontconfig]=fontconfig [freetype2]=freetype [fribidi]=fribidi
-            [harfbuzz]=harfbuzz [libass]=ass
-          )
-          for m in $(printf '%s\n' "${!H[@]}" | sort); do
-            lib=${L[$m]}
-            [ -f "$PREFIX/include/${H[$m]}" ]    || { echo "::error::header missing: $m (${H[$m]})"; fail=1; }
-            [ -f "$PREFIX/lib/pkgconfig/$m.pc" ] || { echo "::error::pc missing: $m.pc"; fail=1; }
-            { [ -e "$PREFIX/lib/lib${lib}.so" ] || ls "$PREFIX/lib/lib${lib}.so".* >/dev/null 2>&1; } || { echo "::error::so missing: lib${lib}"; fail=1; }
-            [ -f "$PREFIX/lib/lib${lib}.a" ]     || { echo "::error::static missing: lib${lib}.a"; fail=1; }
-            pkg-config --exists "$m"             || { echo "::error::pkg-config broken: $m"; fail=1; }
-          done
-          echo "--- headers ---"; find "$PREFIX/include" -maxdepth 1 -type f | sort | head -n 60
-          echo "--- libs ---";    ls "$PREFIX/lib" | sort
-          [ "$fail" -eq 0 ] || exit 1
-
-      - name: Link test via pkg-config (shared + static)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/t.c <<'EOF'
-          #include <x265.h>
-          #include <aom/aom_decoder.h>
-          #include <fdk-aac/aacenc_lib.h>
-          #include <lame/lame.h>
-          #include <lc3.h>
-
-          int main(void) {
-            const x265_api *a = x265_api_get(8);
-            HANDLE_AACENCODER h = NULL;
-            (void)aacEncOpen(&h, 0, 0);
-            (void)lame_init();
-            unsigned (*lc3_size_fn)(enum lc3_dt, int) = &lc3_encoder_size;
-            (void)lc3_size_fn;
-            (void)a;
-            return 0;
-          }
-          EOF
-          echo "== shared =="; $CC /tmp/t.c -o /tmp/t_shared $(pkg-config --cflags --libs x265 aom fdk-aac lame lc3)
-          echo "== static =="; $CC /tmp/t.c -o /tmp/t_static $(pkg-config --static --cflags --libs x265 aom fdk-aac lame lc3)
-          echo "==> link tests OK"
-
-      - name: Download FFmpeg Source
+      - name: Download FFmpeg source
         run: |
           wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
           mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
 
-      - name: Configure FFmpeg (Shared)
+      - name: Configure FFmpeg (shared)
         working-directory: ffmpeg
         run: |
-          ./configure \
-            --prefix="$PREFIX" \
+          set -euo pipefail
+          if ! ./configure \
+            --prefix="$OUTPUT" \
             --enable-cross-compile --target-os=android \
             --arch=aarch64 --cpu=armv8-a \
             --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
             --sysroot="$SYSROOT" \
             --pkg-config=pkg-config --pkg-config-flags="" \
-            --enable-shared --enable-static --enable-pic \
+            --enable-shared --disable-static --enable-pic \
             --enable-gpl --enable-version3 --enable-nonfree \
             --enable-jni --enable-mediacodec --enable-network --enable-openssl \
             --enable-libx264 --enable-libx265 \
@@ -923,21 +742,220 @@ jobs:
             --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
-            --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
-            --extra-libs="-lc++_static -lm -lz" \
-          || { echo "::group::config.log failures"; grep -n -i -E "ERROR|error:|undefined reference|cannot find" ffbuild/config.log | tail -n 120 || true; echo "::endgroup::"; exit 1; }
+            --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,./lib" \
+            --extra-libs="-lc++_shared -lm -lz" ; then
+            echo "::group::configure failed"
+            grep -n -i -E "ERROR|error:|undefined reference|cannot find|not found" ffbuild/config.log | tail -n 120 || true
+            echo "::endgroup::"
+            exit 1
+          fi
 
-      - name: Build FFmpeg (Shared)
+      - name: Build & install FFmpeg (shared)
         working-directory: ffmpeg
         run: make -j"$(nproc)" && make install
 
-      - name: Configure FFmpeg (Static)
+      - name: Assemble output (shared) — NEEDED 闭包补齐
+        shell: bash
         run: |
-          cp -r ffmpeg ffmpeg-static
-          cd ffmpeg-static
-          make distclean || true
-          ./configure \
-            --prefix="$PREFIX" \
+          set -uo pipefail
+          mkdir -p "$OUTPUT/lib"
+          [ -d "$OUTPUT/bin" ] && { cp -a "$OUTPUT/bin/." "$OUTPUT/"; rm -rf "$OUTPUT/bin"; }
+
+          # 1) 第三方 .so 全部（解引用软链，保证 SONAME 文件名真实存在）
+          find "$PREFIX/lib" -maxdepth 1 -name '*.so*' -type f -exec cp -af {} "$OUTPUT/lib/" \;
+          find "$PREFIX/lib" -maxdepth 1 -name '*.so*' -type l -exec cp -aLf {} "$OUTPUT/lib/" \;
+          cp -aLf "$SYS_LIB/libc++_shared.so" "$OUTPUT/lib/" 2>/dev/null || \
+            cp -aLf "$SYS_LIB/libc++_shared.so" "$OUTPUT/" 2>/dev/null || true
+
+          # 2) 递归补齐：按 NEEDED 的名字去 prefix/sysroot 里找提供者
+          SYS="libc.so libm.so libdl.so libz.so liblog.so libandroid.so libmediandk.so \
+          libcamera2ndk.so libEGL.so libGLESv2.so libvulkan.so libnativewindow.so libsync.so libjnigraphics.so"
+          is_sys() { for s in $SYS; do [ "$1" = "$s" ] && return 0; done; return 1; }
+
+          provider() {
+            local want="$1" d f sn
+            for d in "$PREFIX/lib" "$SYS_LIB"; do
+              [ -d "$d" ] || continue
+              for f in "$d"/*.so*; do
+                [ -e "$f" ] || continue
+                sn=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')
+                [ -n "$sn" ] || sn=$(basename "$f")
+                [ "$sn" = "$want" ] && { echo "$f"; return 0; }
+              done
+            done
+            return 1
+          }
+
+          for round in 1 2 3; do
+            fixed=0
+            for f in "$OUTPUT/ffmpeg" "$OUTPUT/ffprobe" "$OUTPUT"/lib/*.so*; do
+              [ -f "$f" ] || continue
+              for n in $(readelf -d "$f" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+                is_sys "$n" && continue
+                [ -e "$OUTPUT/lib/$n" ] && continue
+                if p=$(provider "$n"); then
+                  cp -aLf "$p" "$OUTPUT/lib/$n"
+                  echo "🔧 补齐 $n  <-  $p"
+                  fixed=1
+                else
+                  echo "::error::无法定位 $n（被 $(basename "$f") 依赖）"
+                fi
+              done
+            done
+            [ "$fixed" -eq 0 ] && break
+          done
+
+          # 3) wrapper（printf 生成，避免 YAML 缩进污染 + 前导空格破坏 shebang）
+          for bin in ffmpeg ffprobe; do
+            {
+              printf '%s\n' '#!/system/bin/sh'
+              printf '%s\n' 'DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)'
+              printf '%s\n' '[ -n "$DIR" ] || DIR=.'
+              printf '%s\n' 'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+              printf '%s\n' "exec \"\$DIR/${bin}\" \"\$@\""
+            } > "$OUTPUT/${bin}.sh"
+            chmod +x "$OUTPUT/${bin}.sh"
+          done
+
+          {
+            echo "FFmpeg Android (shared) — $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "FFmpeg: ${FFMPEG_VERSION}  NDK r30  API ${API_LEVEL}"
+            echo "== RUNPATH =="
+            readelf -d "$OUTPUT/ffmpeg" | grep -E 'RUNPATH|RPATH' || echo "(none)"
+            echo "== NEEDED =="
+            readelf -d "$OUTPUT/ffmpeg" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
+            echo "== bundled libs =="
+            ls -1 "$OUTPUT/lib"
+          } > "$OUTPUT/BUILD_INFO.txt"
+
+          echo "✅ shared 组装完成"
+          ls -la "$OUTPUT" "$OUTPUT/lib" | head -80
+
+      - name: Verify shared bundle is self-contained
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          SYS="libc.so libm.so libdl.so libz.so liblog.so libandroid.so libmediandk.so \
+          libcamera2ndk.so libEGL.so libGLESv2.so libvulkan.so libnativewindow.so libsync.so libjnigraphics.so"
+          is_sys() { for s in $SYS; do [ "$1" = "$s" ] && return 0; done; return 1; }
+
+          readelf -d output/ffmpeg | grep -E 'RUNPATH|RPATH' || true
+          readelf -d output/ffmpeg | grep -q '\./lib' && echo "✅ RUNPATH 含 ./lib" || { echo "::error::未写入 ./lib"; fail=1; }
+
+          for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
+            [ -f "$f" ] || continue
+            for n in $(readelf -d "$f" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+              is_sys "$n" && continue
+              [ -e "output/lib/$n" ] || { echo "::error::$f 缺少 $n"; fail=1; }
+            done
+          done
+
+          [ -f output/lib/libc++_shared.so ] || { echo "::error::缺 libc++_shared.so"; fail=1; }
+          [ -f output/lib/libfribidi.so ]   || ls output/lib/libfribidi.so.* >/dev/null 2>&1 || { echo "::error::缺 libfribidi"; fail=1; }
+
+          [ "$fail" -eq 0 ] && echo "✅ shared 包内自洽，可直接解压运行"
+          exit "$fail"
+
+      - name: Package (shared)
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+          tar -I 'xz -9e -T0' -cf ffmpeg-shared-arm64-v8a.tar.xz output
+          ls -lh ffmpeg-shared-arm64-v8a.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-shared
+          path: ${{ github.workspace }}/ffmpeg-shared-arm64-v8a.tar.xz
+          retention-days: 1
+
+  # ===================================================================
+  # Job 4: FFmpeg static（独立，隐藏 .so、libc++_static、无需 ./lib）
+  # ===================================================================
+  build-static:
+    needs: combine-prefix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+
+      - name: Restore NDK permissions (cache hit)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Download NDK (cache miss)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          wget -q "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Download merged prefix
+        uses: actions/download-artifact@v4
+        with:
+          name: prefix-merged
+          path: ${{ github.workspace }}/prefix
+
+      - name: Set environment
+        run: |
+          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "SYSROOT=$TOOLCHAIN/sysroot"
+            echo "PREFIX=${{ github.workspace }}/prefix"
+            echo "OUTPUT=${{ github.workspace }}/output"
+            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+            echo "AR=$TOOLCHAIN/bin/llvm-ar"
+            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
+            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
+            echo "PKG_CONFIG_PATH=${{ github.workspace }}/prefix/lib/pkgconfig"
+            echo "PKG_CONFIG_LIBDIR=${{ github.workspace }}/prefix/lib/pkgconfig"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+      - name: Normalize pkg-config + hide .so with .a present
+        run: |
+          set -euo pipefail
+          for f in "$PREFIX/lib/pkgconfig"/*.pc; do
+            [ -e "$f" ] || continue
+            sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+          done
+          echo "===== 只有 .so 没有 .a 的库（静态链接会失败）====="
+          for so in "$PREFIX"/lib/*.so; do
+            [ -e "$so" ] || continue
+            b="$(basename "$so")"; b="${b%%.so*}"
+            [ -e "$PREFIX/lib/$b.a" ] || echo "::warning::$b: 无 .a"
+          done
+          echo "===== 隐藏有 .a 的 .so ====="
+          for f in "$PREFIX"/lib/*.so*; do
+            [ -e "$f" ] || continue
+            b="$(basename "$f")"; b="${b%%.so*}"
+            [ -e "$PREFIX/lib/$b.a" ] && mv "$f" "$f.bak"
+          done
+
+      - name: Download FFmpeg source
+        run: |
+          wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+
+      - name: Configure FFmpeg (static)
+        working-directory: ffmpeg
+        run: |
+          set -euo pipefail
+          if ! ./configure \
+            --prefix="$OUTPUT" \
             --enable-cross-compile --target-os=android \
             --arch=aarch64 --cpu=armv8-a \
             --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
@@ -956,87 +974,125 @@ jobs:
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
-            --extra-libs="-lc++_static -lm -lz" \
-          || { echo "::group::config.log failures"; grep -n -i -E "ERROR|error:|undefined reference|cannot find" ffbuild/config.log | tail -n 120 || true; echo "::endgroup::"; exit 1; }
+            --extra-libs="-lc++_static -lm -lz" ; then
+            echo "::group::configure failed"
+            grep -n -i -E "ERROR|error:|undefined reference|cannot find|not found" ffbuild/config.log | tail -n 120 || true
+            echo "::endgroup::"
+            exit 1
+          fi
 
-      - name: Build FFmpeg Static Binaries
-        working-directory: ffmpeg-static
+      - name: Build static binaries
+        working-directory: ffmpeg
         run: |
           make -j"$(nproc)" ffmpeg ffprobe
-          $STRIP ffmpeg ffprobe
+          mkdir -p "$OUTPUT"
+          cp ffmpeg ffprobe "$OUTPUT/"
+          "$STRIP" "$OUTPUT/ffmpeg" "$OUTPUT/ffprobe"
+          {
+            echo "FFmpeg Android (static) — $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "FFmpeg: ${FFMPEG_VERSION}  NDK r30  API ${API_LEVEL}"
+            echo "== file =="; file "$OUTPUT/ffmpeg" || true
+            echo "== NEEDED =="
+            readelf -d "$OUTPUT/ffmpeg" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
+          } > "$OUTPUT/BUILD_INFO.txt"
 
-      - name: Package entire prefix directory
+      - name: Verify static
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          SYS="libc.so libm.so libdl.so libz.so liblog.so libandroid.so libmediandk.so \
+          libcamera2ndk.so libEGL.so libGLESv2.so libvulkan.so libnativewindow.so libsync.so libjnigraphics.so"
+          is_sys() { for s in $SYS; do [ "$1" = "$s" ] && return 0; done; return 1; }
+          [ -d output/lib ] && { echo "::error::静态产物不应含 lib/"; fail=1; }
+          for f in output/ffmpeg output/ffprobe; do
+            for n in $(readelf -d "$f" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+              is_sys "$n" || { echo "::error::$f 依赖非系统库 $n"; fail=1; }
+            done
+          done
+          [ "$fail" -eq 0 ] && echo "✅ static 仅依赖 Android 系统库"
+          exit "$fail"
+
+      - name: Package (static)
         run: |
           set -euo pipefail
-          mkdir -p "$PREFIX/bin_static"
-          cp ffmpeg-static/ffmpeg ffmpeg-static/ffprobe "$PREFIX/bin_static/"
-          echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > "$PREFIX/BUILD_INFO.txt"
-          "$PREFIX/bin/ffmpeg" -buildconf >> "$PREFIX/BUILD_INFO.txt" 2>/dev/null || true
-          echo "so=$(find "$PREFIX/lib" -name '*.so*' | wc -l) a=$(find "$PREFIX/lib" -name '*.a' | wc -l) pc=$(find "$PREFIX/lib/pkgconfig" -name '*.pc' | wc -l)"
           cd "${{ github.workspace }}"
-          tar -I 'xz -9e -T0' -cf ffmpeg-android-arm64-v8a.tar.xz prefix
-          mkdir -p artifacts
-          mv ffmpeg-android-arm64-v8a.tar.xz artifacts/
+          tar -I 'xz -9e -T0' -cf ffmpeg-static-arm64-v8a.tar.xz output
+          ls -lh ffmpeg-static-arm64-v8a.tar.xz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-final
-          path: artifacts/
+          name: ffmpeg-static
+          path: ${{ github.workspace }}/ffmpeg-static-arm64-v8a.tar.xz
           retention-days: 1
 
-  # ==================== Job 4: 发布 Release（两个 tar.xz） ====================
+  # ===================================================================
+  # Job 5: 发布（tag 或 每周定时自动推送）
+  # ===================================================================
   release:
-    needs: build-ffmpeg
+    needs: [build-shared, build-static]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule'
     steps:
-      - name: Download ffmpeg-final
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: ffmpeg-final
           path: artifacts
+          pattern: ffmpeg-*
+          merge-multiple: true
 
-      - name: Download prefix-tarball
+      - name: Download prefix tarball
         uses: actions/download-artifact@v4
         with:
           name: prefix-tarball
           path: artifacts
 
-      - name: Prepare release env
-        run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
+          cd artifacts
+          ls -lh
+          sha256sum *.tar.xz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
-      - name: Create Release
+      - name: Create / Update Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ github.ref_name }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'weekly-latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Weekly Latest (arm64-v8a)' }}
           body: |
-            ## FFmpeg Android Build (arm64-v8a)
+            ## FFmpeg ${{ env.FFMPEG_VERSION }} for Android arm64-v8a
 
             - **Build Date**: ${{ env.BUILD_DATE }}
-            - **NDK**: r30 (API 36)
-            - **FFmpeg**: 9.0.2
+            - **NDK**: r30 / API 36
+            - **Trigger**: ${{ github.event_name }}
 
-            ### 发布产物
-
-            | 文件 | 内容 |
+            | 文件 | 说明 |
             |---|---|
-            | `ffmpeg-android-arm64-v8a.tar.xz` | FFmpeg 全量产物：外部库 `.so/.a/.pc` + `include/` + `bin/`（ffmpeg/ffprobe 动态）+ `bin_static/`（静态） |
-            | `prefix-android-arm64-v8a.tar.xz`  | **纯外部库合集**（x264/x265/dav1d/vpx/aom/svt-av1/vvenc/xeve/xevd/openssl/fdk-aac/lame/opus/vorbis/lc3/webp/expat/fontconfig/freetype/fribidi/harfbuzz/libass），供下游直接复用 |
+            | `ffmpeg-shared-arm64-v8a.tar.xz` | 动态版：`output/{ffmpeg,ffprobe,ffmpeg.sh,ffprobe.sh,lib/}`，RUNPATH=`./lib`，含 `libc++_shared.so` 与**全部第三方 `.so`（含 libfribidi/libfreetype/libharfbuzz/libfontconfig/libexpat）** |
+            | `ffmpeg-static-arm64-v8a.tar.xz` | 静态版：`output/{ffmpeg,ffprobe}`，仅依赖 Android 系统库 |
+            | `prefix-android-arm64-v8a.tar.xz` | 纯外部库合集（`.so/.a/.pc/include`），含 `NEEDED_CLOSURE.txt` 依赖闭包清单 |
 
-            ### 下游复用外部库
+            ### 用法（Termux / adb shell）
 
-            在独立 workflow `Build FFmpeg (arm64-v8a) — standalone / reusable` 中：
-
+            ```sh
+            tar xf ffmpeg-shared-arm64-v8a.tar.xz
+            cd output
+            ./ffmpeg.sh -version            # wrapper，自动 LD_LIBRARY_PATH=$DIR/lib
+            # 或：LD_LIBRARY_PATH="$PWD/lib" ./ffmpeg -version
             ```
-            prefix_source:  url
-            prefix_url:     ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/prefix-android-arm64-v8a.tar.xz
-            ffmpeg_version: 9.0.2
-            ```
 
-            脚本会自动识别 tarball 顶层 `prefix/` 目录并放置到 `$GITHUB_WORKSPACE/prefix`。
+            > libass 依赖链（freetype / fribidi / harfbuzz / fontconfig / expat）已全部打进 `lib/`，
+            > 且打包阶段做了 `NEEDED` 闭包校验，不会再出现 `library "libfribidi.so" not found`。
+
+            ### App 集成
+
+            把 `lib/*.so` 放进 `jniLibs/arm64-v8a`，用 `System.loadLibrary` 加载，无需 wrapper。
           files: |
-            artifacts/ffmpeg-android-arm64-v8a.tar.xz
-            artifacts/prefix-android-arm64-v8a.tar.xz
+            artifacts/*.tar.xz
+            artifacts/SHA256SUMS.txt
+          overwrite_files: true
           generate_release_notes: true
