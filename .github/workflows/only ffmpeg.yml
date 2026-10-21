@@ -1,4 +1,4 @@
-name: Build FFmpeg (Matrix)
+name: Build FFmpeg (split shared / static)
 
 on:
   push:
@@ -23,25 +23,24 @@ env:
   ANDROID_TRIPLE: "aarch64-linux-android"
   DEFAULT_PREFIX_URL: "https://github.com/CELEFT/FFmpeg/releases/download/v0.0.1/prefix-android-arm64-v8a.tar.xz"
   FFMPEG_VERSION_DEFAULT: "9.0.2"
-  # 相对检索路径：在 output/ 目录下执行 ./ffmpeg 时，库目录为 ./lib
-  RPATH_DIR: "./lib"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# =====================================================================
+# SHARED：动态链接，需要 libc++_shared.so 与 ./lib 检索路径
+# =====================================================================
 jobs:
-  build-ffmpeg:
+  build-shared:
+    name: build-ffmpeg (shared)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        build_type: [shared, static]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install host dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils
@@ -51,9 +50,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/ndk
-          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
+          key: Linux-ndk-${{ env.NDK_VERSION }}
 
-      - name: Restore NDK Permissions (cache hit)
+      - name: Restore NDK permissions (cache hit)
         if: steps.cache-ndk.outputs.cache-hit == 'true'
         run: chmod -R +x "${{ github.workspace }}/ndk"
 
@@ -67,7 +66,7 @@ jobs:
           rm -f ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
 
-      - name: Download and Extract Prefix
+      - name: Download and extract prefix
         run: |
           set -euo pipefail
           if [ -n "${{ inputs.prefix_url }}" ]; then
@@ -75,8 +74,7 @@ jobs:
           else
             FINAL_URL="${{ env.DEFAULT_PREFIX_URL }}"
           fi
-
-          echo "📥 正在下载外部库: $FINAL_URL"
+          echo "📥 下载外部库: $FINAL_URL"
           wget -q --tries=3 --timeout=30 "$FINAL_URL" -O prefix_pkg
 
           mkdir -p extract_dir
@@ -96,38 +94,28 @@ jobs:
           elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
             mv extract_dir "${{ github.workspace }}/prefix"
           else
-            echo "::error::解压后的包内找不到 prefix 目录"
+            echo "::error::解压后找不到 prefix 目录"
             exit 1
           fi
 
-      - name: Inspect prefix static archives (static only)
-        if: matrix.build_type == 'static'
-        run: |
-          set -uo pipefail
-          PREFIX="${{ github.workspace }}/prefix"
-          echo "===== 只有 .so、没有 .a 的库（无法静态链接）====="
-          for so in "$PREFIX"/lib/*.so; do
-            [ -e "$so" ] || continue
-            base="$(basename "$so")"; base="${base%%.so*}"
-            [ -e "$PREFIX/lib/${base}.a" ] || echo "::warning::${base}: 只有 .so，没有 .a"
-          done
-          echo "===== 静态库清单 ====="
-          ls -1 "$PREFIX"/lib/*.a 2>/dev/null || echo "(none)"
-
-      - name: Build FFmpeg (${{ matrix.build_type }})
+      - name: Build FFmpeg (shared)
         run: |
           #!/bin/bash
           set -euo pipefail
+
+          # ---- shared 专属参数（无任何分支变量）----
+          BUILD_TYPE="shared"
+          RPATH_DIR="./lib"
+          PKG_FLAGS=""
+          EXTRA_LIBS="-lc++_shared -lm -lz"
 
           WORKSPACE="$(pwd)"
           NDK_DIR="$WORKSPACE/ndk"
           PREFIX="$WORKSPACE/prefix"
           OUTPUT="$WORKSPACE/output"
           FFMPEG_VERSION="${{ inputs.ffmpeg_version || env.FFMPEG_VERSION_DEFAULT }}"
-          BUILD_TYPE="${{ matrix.build_type }}"
-          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
           API_LEVEL="${{ env.API_LEVEL }}"
-          RPATH_DIR="${{ env.RPATH_DIR }}"
+          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
 
           TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
           SYSROOT="$TOOLCHAIN/sysroot"
@@ -139,22 +127,20 @@ jobs:
           export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
           export STRIP="$TOOLCHAIN/bin/llvm-strip"
           export PATH="$TOOLCHAIN/bin:$PATH"
-
           export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
-          # -Wl,-rpath,./lib 即“路径检索 ./lib”；./lib 不含 $ 不会被 make 二次展开
-          LD_COMMON="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,$RPATH_DIR"
+          # 动态链接：额外把 NDK sysroot 纳入 rpath-link，供 libc++_shared 等解析
+          LD_SHARED="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,$RPATH_DIR"
 
-          echo "🔧 修正 pkg-config 与头文件包含路径..."
+          echo "🔧 修正 pkg-config 与头文件路径..."
           SUBDIRS=""
           if [ -d "$PREFIX/include" ]; then
             while IFS= read -r d; do
               SUBDIRS="$SUBDIRS -I$PREFIX/include/${d#./}"
             done < <(cd "$PREFIX/include" && find . -mindepth 1 -maxdepth 1 -type d)
           fi
-
           for f in "$PREFIX/lib/pkgconfig"/*.pc; do
             [ -e "$f" ] || continue
             sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
@@ -162,7 +148,6 @@ jobs:
               sed -i "s|^Cflags:.*|& $SUBDIRS|" "$f"
             fi
           done
-
           if [ -d "$PREFIX/include" ]; then
             find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 \
               | while IFS= read -r -d '' h; do
@@ -171,19 +156,8 @@ jobs:
                 done
           fi
 
-          if [ "$BUILD_TYPE" = "static" ]; then
-            echo "🔧 静态模式：隐藏有对应 .a 的动态库，逼迫链接器使用静态库..."
-            for f in "$PREFIX/lib"/*.so*; do
-              [ -e "$f" ] || continue
-              base="$(basename "$f")"; base="${base%%.so*}"
-              if [ -e "$PREFIX/lib/${base}.a" ]; then
-                mv "$f" "${f}.bak"
-              fi
-            done
-          fi
-
           if [ ! -d "ffmpeg" ]; then
-            echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION} 源码..."
+            echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION}..."
             if ! wget -q --tries=3 --timeout=30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"; then
               wget -q --tries=3 --timeout=30 "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FFMPEG_VERSION}.tar.gz" -O ffmpeg-mirror.tar.gz
               tar xzf ffmpeg-mirror.tar.gz && mv "FFmpeg-n${FFMPEG_VERSION}" ffmpeg
@@ -195,220 +169,452 @@ jobs:
           cd ffmpeg
           [ -f Makefile ] && { make distclean >/dev/null 2>&1 || true; }
 
-          echo "🚀 开始构建 ($BUILD_TYPE)  rpath=$RPATH_DIR ..."
-
-          if [ "$BUILD_TYPE" = "shared" ]; then
-            if ! ./configure \
-                --prefix="$OUTPUT" \
-                --enable-cross-compile --target-os=android \
-                --arch=aarch64 --cpu=armv8-a \
-                --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
-                --sysroot="$SYSROOT" \
-                --pkg-config=pkg-config --pkg-config-flags="" \
-                --enable-shared --disable-static --enable-pic \
-                --enable-gpl --enable-version3 --enable-nonfree \
-                --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-                --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
-                --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
-                --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
-                --enable-decoder=av1_mediacodec \
-                --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
-                --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
-                --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
-                --enable-libx264 --enable-libx265 \
-                --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
-                --enable-libvvenc --enable-libxeve --enable-libxevd \
-                --enable-libwebp \
-                --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-                --enable-liblc3 \
-                --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
-                --disable-doc --disable-debug \
-                --extra-cflags="-I$PREFIX/include -fPIC" \
-                --extra-ldflags="$LD_COMMON" \
-                --extra-libs="-lc++_shared -lm -lz" ; then
-              echo "::group::configure failed, tail of config.log"
-              tail -n 120 ffbuild/config.log || true
-              echo "::endgroup::"
-              exit 1
-            fi
-
-            make -j"$(nproc)"
-            make install
-
-          else
-            if ! ./configure \
-                --prefix="$OUTPUT" \
-                --enable-cross-compile --target-os=android \
-                --arch=aarch64 --cpu=armv8-a \
-                --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
-                --sysroot="$SYSROOT" \
-                --pkg-config=pkg-config --pkg-config-flags="--static" \
-                --disable-shared --enable-static --enable-pic \
-                --enable-gpl --enable-version3 --enable-nonfree \
-                --enable-jni --enable-mediacodec --enable-network --enable-openssl \
-                --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
-                --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
-                --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
-                --enable-decoder=av1_mediacodec \
-                --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
-                --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
-                --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
-                --enable-libx264 --enable-libx265 \
-                --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
-                --enable-libvvenc --enable-libxeve --enable-libxevd \
-                --enable-libwebp \
-                --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
-                --enable-liblc3 \
-                --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
-                --disable-doc --disable-debug \
-                --extra-cflags="-I$PREFIX/include -fPIC" \
-                --extra-ldflags="$LD_COMMON" \
-                --extra-libs="-lc++_static -lm -lz -ldl" ; then
-              echo "::group::configure failed, tail of config.log"
-              tail -n 120 ffbuild/config.log || true
-              echo "::endgroup::"
-              exit 1
-            fi
-
-            make -j"$(nproc)" ffmpeg ffprobe
+          echo "🚀 开始构建 (shared)  rpath=$RPATH_DIR"
+          if ! ./configure \
+              --prefix="$OUTPUT" \
+              --enable-cross-compile --target-os=android \
+              --arch=aarch64 --cpu=armv8-a \
+              --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+              --sysroot="$SYSROOT" \
+              --pkg-config=pkg-config --pkg-config-flags="$PKG_FLAGS" \
+              --enable-shared --disable-static --enable-pic \
+              --enable-gpl --enable-version3 --enable-nonfree \
+              --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+              --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
+              --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
+              --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
+              --enable-decoder=av1_mediacodec \
+              --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
+              --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
+              --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
+              --enable-libx264 --enable-libx265 \
+              --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+              --enable-libvvenc --enable-libxeve --enable-libxevd \
+              --enable-libwebp \
+              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+              --enable-liblc3 \
+              --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+              --disable-doc --disable-debug \
+              --extra-cflags="-I$PREFIX/include -fPIC" \
+              --extra-ldflags="$LD_SHARED" \
+              --extra-libs="$EXTRA_LIBS" ; then
+            echo "::group::configure failed"
+            tail -n 120 ffbuild/config.log || true
+            echo "::endgroup::"
+            exit 1
           fi
 
+          make -j"$(nproc)"
+          make install
+
+          # ---- 组装 shared 产物 ----
           if [ -d "$OUTPUT/bin" ]; then
             cp -a "$OUTPUT/bin/." "$OUTPUT/"
             rm -rf "$OUTPUT/bin"
           fi
+          mkdir -p "$OUTPUT/lib"
 
-          if [ "$BUILD_TYPE" = "shared" ]; then
-            mkdir -p "$OUTPUT/lib"
+          echo "📦 收集第三方动态库..."
+          cp -a "$PREFIX/lib"/*.so* "$OUTPUT/lib/" 2>/dev/null || true
+          # 第三方 .so 依赖 libc++_shared，而它不在 prefix 内 → 必须补齐，否则两份 libc++ 会 SIGSEGV
+          cp -a "$SYS_LIB/libc++_shared.so" "$OUTPUT/lib/" 2>/dev/null || true
 
-            echo "📦 收集第三方动态库到 output/lib ..."
-            cp -a "$PREFIX/lib"/*.so* "$OUTPUT/lib/" 2>/dev/null || true
-            # libc++_shared.so 不在 prefix 里，必须从 NDK sysroot 补（避免两份 libc++ → SIGSEGV）
-            cp -a "$SYS_LIB/libc++_shared.so" "$OUTPUT/lib/" 2>/dev/null || true
-
-            # 兜底包装脚本：printf 逐行生成，不受 YAML 缩进影响、无前导空格
+          # wrapper：bionic 对 RUNPATH 支持不稳定，用脚本兜底（printf 生成，避免 YAML 缩进坑）
+          for bin in ffmpeg ffprobe; do
             {
               printf '%s\n' '#!/system/bin/sh'
               printf '%s\n' 'DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)'
               printf '%s\n' '[ -n "$DIR" ] || DIR=.'
-              printf '%s\n' 'export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
-              printf '%s\n' 'exec "$DIR/ffmpeg" "$@"'
-            } > "$OUTPUT/ffmpeg.sh"
-            chmod +x "$OUTPUT/ffmpeg.sh"
-
-          else
-            cp ffmpeg ffprobe "$OUTPUT/"
-            $STRIP "$OUTPUT/ffmpeg" "$OUTPUT/ffprobe"
-            rm -rf "$OUTPUT/lib"
-          fi
+              printf '%s\n' "export LD_LIBRARY_PATH=\"\$DIR/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
+              printf '%s\n' "exec \"\$DIR/${bin}\" \"\$@\""
+            } > "$OUTPUT/${bin}.sh"
+            chmod +x "$OUTPUT/${bin}.sh"
+          done
 
           {
             echo "======================================"
-            echo "FFmpeg Android Build Info"
+            echo "FFmpeg Android Build Info (SHARED)"
             echo "======================================"
             echo "Build Date    : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            echo "Build Type    : $BUILD_TYPE"
+            echo "Build Type    : shared"
             echo "FFmpeg Version: $FFMPEG_VERSION"
             echo "NDK Version   : ${{ env.NDK_VERSION }} (API $API_LEVEL)"
             echo "Target ABI    : arm64-v8a"
+            echo "C++ Runtime   : libc++_shared.so (bundled in lib/)"
             echo "RPath         : $RPATH_DIR"
             echo "======================================"
-            if [ "$BUILD_TYPE" = "shared" ]; then
-              echo "============ Dynamic Links ============"
-              readelf -d "$OUTPUT/ffmpeg" | grep -E 'NEEDED|RUNPATH|RPATH' || true
-            else
-              echo "============ Static Check ============="
-              file "$OUTPUT/ffmpeg" || true
-              readelf -d "$OUTPUT/ffmpeg" | grep NEEDED \
-                || echo "No third-party dynamic dependencies (Perfect)"
-            fi
+            echo "============ Dynamic Links ============"
+            readelf -d "$OUTPUT/ffmpeg" | grep -E 'NEEDED|RUNPATH|RPATH' || true
           } > "$OUTPUT/BUILD_INFO.txt"
 
-          echo "✅ 构建完成，输出目录："
+          echo "✅ shared 构建完成"
           ls -la "$OUTPUT"
+          ls -la "$OUTPUT/lib" | head -50
 
-          cd ..
-
-      - name: Verify linkage & ./lib rpath (${{ matrix.build_type }})
+      - name: Verify shared linkage
         run: |
           set -uo pipefail
           fail=0
           SYS_ALLOW="libc.so libm.so libdl.so libz.so liblog.so libandroid.so \
           libmediandk.so libcamera2ndk.so libEGL.so libGLESv2.so libjnigraphics.so \
-          libnativewindow.so libsync.so"
-
+          libnativewindow.so libsync.so libvulkan.so"
           is_sys() { for a in $SYS_ALLOW; do [ "$1" = "$a" ] && return 0; done; return 1; }
           needed_of() { readelf -d "$1" 2>/dev/null | awk '/NEEDED/{gsub(/[][\[\] ]/,"",$NF); print $NF}'; }
 
-          echo "======================================"
-          echo "Testing ${{ matrix.build_type }} linkage..."
-          echo "======================================"
-
+          echo "===== 1. RUNPATH 必须包含 ./lib ====="
           dyn="$(readelf -d output/ffmpeg 2>/dev/null | grep -E 'RUNPATH|RPATH' || true)"
           echo "$dyn"
-          if [ "${{ matrix.build_type }}" = "shared" ]; then
-            case "$dyn" in
-              *"./lib"*) echo "✅ 已写入相对检索路径 ./lib" ;;
-              *) echo "::error::未在 ELF 中找到 ./lib 检索路径"; fail=1 ;;
-            esac
+          case "$dyn" in
+            *"./lib"*) echo "✅ RUNPATH 含 ./lib" ;;
+            *) echo "::error::ELF 中未找到 ./lib 检索路径"; fail=1 ;;
+          esac
+
+          echo "===== 2. C++ 运行时必须唯一为 libc++_shared.so ====="
+          if [ ! -e output/lib/libc++_shared.so ]; then
+            echo "::error::缺少 output/lib/libc++_shared.so（会导致两份 libc++ → SIGSEGV）"
+            fail=1
+          else
+            echo "✅ libc++_shared.so 已打包"
           fi
 
-          if [ "${{ matrix.build_type }}" = "static" ]; then
-            for n in $(needed_of output/ffmpeg); do
-              if ! is_sys "$n"; then
-                echo "::error::ffmpeg 仍依赖非系统库: $n"
+          echo "===== 3. 所有非系统 NEEDED 必须能在 output/lib 内解析 ====="
+          for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
+            [ -f "$f" ] || continue
+            for n in $(needed_of "$f"); do
+              is_sys "$n" && continue
+              if [ ! -e "output/lib/$n" ]; then
+                echo "::error::$f 缺少依赖 $n"
                 fail=1
               fi
             done
-            [ $fail -eq 0 ] && echo "✅ 纯静态（仅依赖 Android 系统库）"
-          else
-            echo "--- NEEDED 解析检查 ---"
-            for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
-              [ -f "$f" ] || continue
-              for n in $(needed_of "$f"); do
-                is_sys "$n" && continue
-                if [ ! -e "output/lib/$n" ]; then
-                  echo "::error::$f 缺少依赖 $n（output/lib 内不存在）"
-                  fail=1
-                fi
-              done
-            done
-            [ $fail -eq 0 ] && echo "✅ 所有非系统依赖均可由 output/lib 提供"
-          fi
-
+          done
+          [ $fail -eq 0 ] && echo "✅ shared 依赖自洽（全部可由 output/lib 提供）"
           exit $fail
 
-      - name: Report 16KB page alignment
+      - name: Report 16KB page alignment (shared)
         run: |
           set -uo pipefail
-          echo "===== ELF LOAD 对齐（>=0x4000 才支持 16KB 页）====="
-          for f in output/ffmpeg output/lib/*.so*; do
+          echo "===== LOAD 对齐（>=0x4000 支持 16KB 页）====="
+          for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
             [ -f "$f" ] || continue
             al="$(readelf -lW "$f" 2>/dev/null | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')"
-            echo "$(printf '%-45s' "$f") -> ${al:-unknown}"
+            echo "$(printf '%-46s' "$f") -> ${al:-unknown}"
           done
 
-      - name: Package (${{ matrix.build_type }})
+      - name: Package (shared)
         run: |
           set -euo pipefail
           cd "${{ github.workspace }}"
-          tar -I 'xz -9e -T0' -cf ffmpeg-${{ matrix.build_type }}-arm64-v8a.tar.xz output
-          ls -lh ffmpeg-${{ matrix.build_type }}-arm64-v8a.tar.xz
+          tar -I 'xz -9e -T0' -cf ffmpeg-shared-arm64-v8a.tar.xz output
+          ls -lh ffmpeg-shared-arm64-v8a.tar.xz
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-${{ matrix.build_type }}
-          path: ${{ github.workspace }}/ffmpeg-${{ matrix.build_type }}-arm64-v8a.tar.xz
+          name: ffmpeg-shared
+          path: ${{ github.workspace }}/ffmpeg-shared-arm64-v8a.tar.xz
           retention-days: 7
 
+  # =====================================================================
+  # STATIC：全静态，隐藏 .so、用 libc++_static、不需要任何检索路径
+  # =====================================================================
+  build-static:
+    name: build-ffmpeg (static)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
+            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: Linux-ndk-${{ env.NDK_VERSION }}
+
+      - name: Restore NDK permissions (cache hit)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Download NDK (cache miss)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          wget -q --tries=3 --timeout=30 "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Download and extract prefix
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.prefix_url }}" ]; then
+            FINAL_URL="${{ inputs.prefix_url }}"
+          else
+            FINAL_URL="${{ env.DEFAULT_PREFIX_URL }}"
+          fi
+          echo "📥 下载外部库: $FINAL_URL"
+          wget -q --tries=3 --timeout=30 "$FINAL_URL" -O prefix_pkg
+
+          mkdir -p extract_dir
+          if file prefix_pkg | grep -qi "Zip archive"; then
+            unzip -q prefix_pkg -d extract_dir
+          elif file prefix_pkg | grep -qi "XZ compressed"; then
+            tar -xf prefix_pkg -C extract_dir
+          elif file prefix_pkg | grep -qi "gzip compressed"; then
+            tar -xzf prefix_pkg -C extract_dir
+          else
+            echo "::error::未知的压缩格式"
+            exit 1
+          fi
+
+          if [ -d "extract_dir/prefix" ]; then
+            mv extract_dir/prefix "${{ github.workspace }}/prefix"
+          elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
+            mv extract_dir "${{ github.workspace }}/prefix"
+          else
+            echo "::error::解压后找不到 prefix 目录"
+            exit 1
+          fi
+
+      - name: Preflight - static archives availability
+        run: |
+          set -uo pipefail
+          PREFIX="${{ github.workspace }}/prefix"
+          echo "===== 只有 .so 没有 .a（无法静态链接）====="
+          miss=0
+          for so in "$PREFIX"/lib/*.so; do
+            [ -e "$so" ] || continue
+            base="$(basename "$so")"; base="${base%%.so*}"
+            if [ ! -e "$PREFIX/lib/${base}.a" ]; then
+              echo "::warning::${base}: 只有 .so，没有 .a"
+              miss=1
+            fi
+          done
+          echo "===== 静态库清单 ====="
+          ls -1 "$PREFIX"/lib/*.a 2>/dev/null || echo "(none)"
+          echo "===== 16KB 对齐检查（.a 无对齐概念，此处仅提示 .so 来源库）====="
+          for so in "$PREFIX"/lib/*.so; do
+            [ -e "$so" ] || continue
+            al="$(readelf -lW "$so" 2>/dev/null | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')"
+            echo "$(printf '%-46s' "$(basename "$so")") -> ${al:-unknown}"
+          done
+          exit 0
+
+      - name: Build FFmpeg (static)
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # ---- static 专属参数（无任何分支变量）----
+          BUILD_TYPE="static"
+          PKG_FLAGS="--static"
+          EXTRA_LIBS="-lc++_static -lm -lz -ldl"
+
+          WORKSPACE="$(pwd)"
+          NDK_DIR="$WORKSPACE/ndk"
+          PREFIX="$WORKSPACE/prefix"
+          OUTPUT="$WORKSPACE/output"
+          FFMPEG_VERSION="${{ inputs.ffmpeg_version || env.FFMPEG_VERSION_DEFAULT }}"
+          API_LEVEL="${{ env.API_LEVEL }}"
+          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
+
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          SYS_LIB="$SYSROOT/usr/lib/${ANDROID_TRIPLE}"
+
+          export CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
+
+          # 静态：只保留 -L 与 rpath-link（链接期解析用），刻意不加 -rpath
+          LD_STATIC="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
+
+          echo "🔧 修正 pkg-config 与头文件路径..."
+          SUBDIRS=""
+          if [ -d "$PREFIX/include" ]; then
+            while IFS= read -r d; do
+              SUBDIRS="$SUBDIRS -I$PREFIX/include/${d#./}"
+            done < <(cd "$PREFIX/include" && find . -mindepth 1 -maxdepth 1 -type d)
+          fi
+          for f in "$PREFIX/lib/pkgconfig"/*.pc; do
+            [ -e "$f" ] || continue
+            sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+            if [ -n "$SUBDIRS" ] && grep -q '^Cflags:' "$f"; then
+              sed -i "s|^Cflags:.*|& $SUBDIRS|" "$f"
+            fi
+          done
+          if [ -d "$PREFIX/include" ]; then
+            find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 \
+              | while IFS= read -r -d '' h; do
+                  tgt="$PREFIX/include/$(basename "$h")"
+                  [ -e "$tgt" ] || cp -n "$h" "$tgt"
+                done
+          fi
+
+          echo "🔧 静态模式：隐藏有对应 .a 的 .so，逼迫链接器取静态库..."
+          for f in "$PREFIX/lib"/*.so*; do
+            [ -e "$f" ] || continue
+            base="$(basename "$f")"; base="${base%%.so*}"
+            if [ -e "$PREFIX/lib/${base}.a" ]; then
+              mv "$f" "${f}.bak"
+            fi
+          done
+
+          if [ ! -d "ffmpeg" ]; then
+            echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION}..."
+            if ! wget -q --tries=3 --timeout=30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"; then
+              wget -q --tries=3 --timeout=30 "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FFMPEG_VERSION}.tar.gz" -O ffmpeg-mirror.tar.gz
+              tar xzf ffmpeg-mirror.tar.gz && mv "FFmpeg-n${FFMPEG_VERSION}" ffmpeg
+            else
+              tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz" && mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+            fi
+          fi
+
+          cd ffmpeg
+          [ -f Makefile ] && { make distclean >/dev/null 2>&1 || true; }
+
+          echo "🚀 开始构建 (static)"
+          if ! ./configure \
+              --prefix="$OUTPUT" \
+              --enable-cross-compile --target-os=android \
+              --arch=aarch64 --cpu=armv8-a \
+              --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+              --sysroot="$SYSROOT" \
+              --pkg-config=pkg-config --pkg-config-flags="$PKG_FLAGS" \
+              --disable-shared --enable-static --enable-pic \
+              --enable-gpl --enable-version3 --enable-nonfree \
+              --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+              --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
+              --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
+              --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
+              --enable-decoder=av1_mediacodec \
+              --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
+              --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
+              --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
+              --enable-libx264 --enable-libx265 \
+              --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+              --enable-libvvenc --enable-libxeve --enable-libxevd \
+              --enable-libwebp \
+              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+              --enable-liblc3 \
+              --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+              --disable-doc --disable-debug \
+              --extra-cflags="-I$PREFIX/include -fPIC" \
+              --extra-ldflags="$LD_STATIC" \
+              --extra-libs="$EXTRA_LIBS" ; then
+            echo "::group::configure failed"
+            tail -n 120 ffbuild/config.log || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # 不 install，避免把 doc/examples 拖进产物
+          make -j"$(nproc)" ffmpeg ffprobe
+
+          mkdir -p "$OUTPUT"
+          cp ffmpeg ffprobe "$OUTPUT/"
+          $STRIP "$OUTPUT/ffmpeg" "$OUTPUT/ffprobe"
+
+          {
+            echo "======================================"
+            echo "FFmpeg Android Build Info (STATIC)"
+            echo "======================================"
+            echo "Build Date    : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "Build Type    : static"
+            echo "FFmpeg Version: $FFMPEG_VERSION"
+            echo "NDK Version   : ${{ env.NDK_VERSION }} (API $API_LEVEL)"
+            echo "Target ABI    : arm64-v8a"
+            echo "C++ Runtime   : libc++_static (linked in)"
+            echo "RPath         : (none, by design)"
+            echo "======================================"
+            echo "============ Static Check ============="
+            file "$OUTPUT/ffmpeg" || true
+            echo "--- NEEDED ---"
+            readelf -d "$OUTPUT/ffmpeg" | grep NEEDED \
+              || echo "No dynamic dependencies at all"
+          } > "$OUTPUT/BUILD_INFO.txt"
+
+          echo "✅ static 构建完成"
+          ls -la "$OUTPUT"
+
+      - name: Verify static linkage
+        run: |
+          set -uo pipefail
+          fail=0
+          SYS_ALLOW="libc.so libm.so libdl.so libz.so liblog.so libandroid.so \
+          libmediandk.so libcamera2ndk.so libEGL.so libGLESv2.so libjnigraphics.so \
+          libnativewindow.so libsync.so libvulkan.so"
+          is_sys() { for a in $SYS_ALLOW; do [ "$1" = "$a" ] && return 0; done; return 1; }
+          needed_of() { readelf -d "$1" 2>/dev/null | awk '/NEEDED/{gsub(/[][\[\] ]/,"",$NF); print $NF}'; }
+
+          echo "===== 1. 不允许出现 output/lib（静态产物应为单文件）====="
+          if [ -d output/lib ]; then
+            echo "::error::静态产物不应包含 lib/ 目录"
+            fail=1
+          else
+            echo "✅ 无 lib/ 目录"
+          fi
+
+          echo "===== 2. NEEDED 必须在系统白名单内 ====="
+          for f in output/ffmpeg output/ffprobe; do
+            for n in $(needed_of "$f"); do
+              if is_sys "$n"; then
+                echo "  ok  $f -> $n"
+              else
+                echo "::error::$f 依赖了非系统库: $n"
+                fail=1
+              fi
+            done
+          done
+
+          echo "===== 3. 不应残留任何 RUNPATH/RPATH ====="
+          if readelf -d output/ffmpeg 2>/dev/null | grep -qE 'RUNPATH|RPATH'; then
+            echo "::warning::静态二进制带有 RUNPATH（不影响运行，但建议清空）"
+            readelf -d output/ffmpeg | grep -E 'RUNPATH|RPATH'
+          else
+            echo "✅ 无 RUNPATH/RPATH"
+          fi
+
+          [ $fail -eq 0 ] && echo "✅ static 验收通过：仅依赖 Android 系统库"
+          exit $fail
+
+      - name: Package (static)
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+          tar -I 'xz -9e -T0' -cf ffmpeg-static-arm64-v8a.tar.xz output
+          ls -lh ffmpeg-static-arm64-v8a.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-static
+          path: ${{ github.workspace }}/ffmpeg-static-arm64-v8a.tar.xz
+          retention-days: 7
+
+  # =====================================================================
+  # RELEASE：两条线都成功后汇总
+  # =====================================================================
   release:
-    needs: build-ffmpeg
+    needs: [build-shared, build-static]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule'
     steps:
-      - name: Download Artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -417,8 +623,10 @@ jobs:
 
       - name: Prepare env & checksums
         run: |
+          set -euo pipefail
           echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
           cd artifacts
+          ls -lh
           sha256sum *.tar.xz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -433,40 +641,33 @@ jobs:
             - **NDK**: r30 (API 36)
             - **FFmpeg**: ${{ env.FFMPEG_VERSION_DEFAULT }}
 
-            ### 库检索路径：`./lib`
+            两个包由**独立的构建任务**产出，互不影响：
 
-            已写入 ELF 动态段：`RUNPATH = ./lib`，在解压目录下可直接执行：
+            ### 1. `ffmpeg-shared-arm64-v8a.tar.xz`（动态）
 
-            ```sh
-            cd output && ./ffmpeg -version
-            ```
+            - C++ 运行时：`libc++_shared.so`（已打包进 `lib/`）
+            - 库检索：ELF `RUNPATH = ./lib`，可直接 `cd output && ./ffmpeg -version`
+            - 从任意目录调用请用 wrapper：`./ffmpeg.sh -version` / `./ffprobe.sh -version`
+            - App 集成：把 `lib/*.so` 放进 `jniLibs/arm64-v8a`，`System.loadLibrary` 加载，无需 wrapper
 
-            从其它目录调用（自动定位自身目录）：
-
-            ```sh
-            ./ffmpeg.sh -version
-            ```
-
-            > Android bionic 对 DT_RPATH/DT_RUNPATH 的支持依系统版本而异，
-            > 因此同时提供 `./lib` RUNPATH 与 `ffmpeg.sh` 双保险。
-            > App 内集成请直接把 `lib/*.so` 放入 `jniLibs/arm64-v8a`。
-
-            ### 📦 包结构
-
-            **1. `ffmpeg-shared-arm64-v8a.tar.xz`（动态版）**
             ```
             output/
             ├── ffmpeg          <-- RUNPATH=./lib
             ├── ffprobe
-            ├── ffmpeg.sh       <-- 兜底 wrapper
+            ├── ffmpeg.sh       <-- 自动设置 LD_LIBRARY_PATH=$DIR/lib
+            ├── ffprobe.sh
             ├── lib/            <-- libav*.so + 第三方 .so + libc++_shared.so
             └── BUILD_INFO.txt
             ```
 
-            **2. `ffmpeg-static-arm64-v8a.tar.xz`（静态版）**
+            ### 2. `ffmpeg-static-arm64-v8a.tar.xz`（静态）
+
+            - C++ 运行时：`libc++_static`（已链入）
+            - 无 `lib/` 目录、无 RUNPATH，仅依赖 Android 系统库（bionic / mediandk / camera2ndk / vulkan 等）
+
             ```
             output/
-            ├── ffmpeg          <-- 无第三方依赖
+            ├── ffmpeg
             ├── ffprobe
             └── BUILD_INFO.txt
             ```
