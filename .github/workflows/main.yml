@@ -15,7 +15,7 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
-  LIBS_CACHE_VERSION: "v5"
+  LIBS_CACHE_VERSION: "v6"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -289,7 +289,7 @@ jobs:
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
           # ★ 文本渲染链：FreeType → FriBidi → HarfBuzz → libass
-          #   与 test.yml 的 build_stack 完全一致（顺序、configure 参数、CFLAGS/CPPFLAGS/LDFLAGS 都一样）
+          #   与 test.yml 的 build_stack 完全一致，不掺杂 fontconfig / expat
           - name: text-stack
             build: |
               set -o errexit
@@ -456,61 +456,8 @@ jobs:
                 echo "✅ text-stack [shared] ok"
               fi
 
-              # ================= 7) expat + fontconfig（本 workflow 独有）=================
-              # FFmpeg 开了 --enable-libfontconfig，所以 libass 链之外单独补这两个。
-              # 不需要 fontconfig 的话：删掉本段，并把 build-shared / build-static 里的
-              # --enable-libfontconfig 一起去掉即可。
-              echo "### expat ($LINK)"
-              if [ ! -d expat-2.6.2 ]; then
-                wget -q --tries=3 --timeout=30 \
-                  https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
-                tar xf expat-2.6.2.tar.gz
-              fi
-              (
-                cd expat-2.6.2
-                make distclean >/dev/null 2>&1 || true
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                  $LTOPT --with-pic
-                make -j"$(nproc)"
-                make install
-                make distclean >/dev/null 2>&1 || true
-              )
-
-              echo "### fontconfig ($LINK)"
-              [ -d fontconfig ] || git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git fontconfig
-              (
-                cd fontconfig
-                rm -rf _build
-                {
-                  printf '[binaries]\n'
-                  printf "c = '%s'\n" "$CC"
-                  printf "cpp = '%s'\n" "$CXX"
-                  printf "ar = '%s'\n" "$AR"
-                  printf "strip = '%s'\n" "$STRIP"
-                  printf "pkgconfig = 'pkg-config'\n"
-                  printf '\n[properties]\nneeds_exe_wrapper = true\n'
-                  printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
-                } > android.cross
-                PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-                PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
-                  -Dxml-backend=expat -Dfreetype=enabled -Dcache-build=false \
-                  -Ddoc=disabled -Dtests=disabled -Dtools=disabled
-                ninja -C _build
-                ninja -C _build install
-              )
-              # meson 已经装了 fontconfig.pc，别用 mkpc 覆盖（会丢 Requires.private，static 链接会断）
-              if [ ! -f "$PREFIX/lib/pkgconfig/fontconfig.pc" ]; then
-                mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
-              fi
-
-              if [ "$LINK" = "static" ]; then
-                test -f "$PREFIX/lib/libfontconfig.a" || { echo "::error::libfontconfig.a missing"; exit 1; }
-              else
-                test -e "$PREFIX/lib/libfontconfig.so" || { echo "::error::libfontconfig.so missing"; exit 1; }
-              fi
-              echo "✅ expat + fontconfig [$LINK] ok"
+              # 说明：字体枚举交给 FFmpeg 的 subtitles/ass 滤镜 + fontsdir= 参数，
+              #      不再构建 fontconfig / expat（Android 上没有 fonts.conf，fontconfig 无实际收益）
 
     steps:
       - uses: actions/checkout@v4
@@ -528,12 +475,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip gperf gettext \
-            python3-pip libexpat1-dev xz-utils
+            python3-pip xz-utils
 
-      - name: Upgrade meson (fontconfig 需要 >= 1.11)
+      - name: Upgrade meson
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
-          python3 -m pip install --user --break-system-packages -U "meson>=1.11.0"
+          python3 -m pip install --user --break-system-packages -U "meson>=1.4"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/meson" --version
 
@@ -702,13 +649,13 @@ jobs:
           fail=0
           for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
                      fdk-aac mp3lame opus vorbis lc3 webp \
-                     freetype expat fontconfig fribidi harfbuzz ass; do
+                     freetype fribidi harfbuzz ass; do
             if [ ! -f "$P/lib/lib${lib}.a" ]; then
               echo "::warning::缺 lib${lib}.a"
               fail=1
             fi
           done
-          for m in x265 aom vvenc xeve xevd liblc3 lc3 libwebp fdk-aac lame fontconfig; do
+          for m in x265 aom vvenc xeve xevd liblc3 lc3 libwebp fdk-aac lame; do
             [ -f "$P/lib/pkgconfig/$m.pc" ] || echo "::warning::缺 $m.pc"
           done
           [ "$fail" -eq 0 ] && echo "✅ static prefix 完整"
@@ -878,7 +825,7 @@ jobs:
             --enable-libwebp \
             --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
             --enable-liblc3 \
-            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+            --enable-libass --enable-libfreetype --enable-libfribidi \
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,./lib" \
@@ -986,7 +933,7 @@ jobs:
             done
           done
 
-          for n in libfreetype.so libfribidi.so libharfbuzz.so libfontconfig.so libc++_shared.so; do
+          for n in libfreetype.so libfribidi.so libharfbuzz.so libc++_shared.so; do
             [ -e "output/lib/$n" ] && echo "  [ok] $n" || { echo "::warning::缺 $n"; fail=1; }
           done
 
@@ -1099,7 +1046,7 @@ jobs:
             --enable-libwebp \
             --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
             --enable-liblc3 \
-            --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig \
+            --enable-libass --enable-libfreetype --enable-libfribidi \
             --disable-doc --disable-debug \
             --extra-cflags="-I$PREFIX/include -fPIC" \
             --extra-ldflags="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib" \
@@ -1208,6 +1155,12 @@ jobs:
             tar xf ffmpeg-shared-arm64-v8a.tar.xz
             cd output && ./ffmpeg.sh -version
             # 等价：LD_LIBRARY_PATH="$PWD/lib" ./ffmpeg -version
+            ```
+
+            字幕烧录请用 `fontsdir` 显式指定字体目录（本构建不含 fontconfig）：
+
+            ```sh
+            ./ffmpeg.sh -i in.mp4 -vf "subtitles=sub.srt:fontsdir=/data/local/tmp/fonts" -c:a copy out.mp4
             ```
           files: |
             artifacts/*.tar.xz
