@@ -294,20 +294,21 @@ jobs:
               set -o errexit
 
               # ================= 1) freetype =================
+              # 修复：freetype 2.15 的 autogen.sh 只生成 builds/unix/configure，
+              # 根目录没有 configure（更没有 wrapper），必须在 builds/unix 里 configure。
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
                 cd freetype
                 make distclean >/dev/null 2>&1 || true
-                # 仓库自带的 configure 只是探测外壳，依赖 builds/unix/configure
-                # 后者必须由 autogen.sh 生成；删掉外壳强制重生成
                 rm -f configure
                 if [ -x ./autogen.sh ]; then ./autogen.sh; fi
                 if [ ! -f builds/unix/configure ]; then
                   echo "::error::freetype: builds/unix/configure 未生成（autogen 失败）"
                   ls -la . | head -30
-                  ls -la builds/unix | head -30
+                  ls -la builds/unix 2>/dev/null | head -30 || true
                   exit 1
                 fi
+                cd builds/unix
                 ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
                   --without-zlib --without-png --without-bzip2 --without-harfbuzz \
@@ -420,19 +421,26 @@ jobs:
               fi
 
               # ================= 7) libass =================
+              # 修复：shared 时硬编码 -Wl,-rpath,.（不加引号），让 libass.so 从当前目录找依赖
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
                 cd libass
                 make distclean >/dev/null 2>&1 || true
                 rm -f configure
                 if [ -x ./autogen.sh ]; then ./autogen.sh; fi
+
+                ASS_LDFLAGS="-L$PREFIX/lib"
+                if [ "$LINK" = "shared" ]; then
+                  ASS_LDFLAGS="$ASS_LDFLAGS -Wl,-rpath,."
+                fi
+
                 ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
                   --disable-fontconfig \
                   --disable-require-system-font-provider \
                   CFLAGS="$EXTRA_CFLAGS" \
                   CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2" \
-                  LDFLAGS="-L$PREFIX/lib"
+                  LDFLAGS="$ASS_LDFLAGS"
                 make -j"$(nproc)"
                 make install
                 make distclean >/dev/null 2>&1 || true
@@ -454,6 +462,10 @@ jobs:
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*SONAME.*\[\(.*\)\].*/  \1/p'
                 echo "--- libass.so NEEDED ---"
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
+                echo "--- libass.so RUNPATH ---"
+                readelf -d "$PREFIX/lib/libass.so" | grep -E 'RUNPATH|RPATH' || echo "  (none)"
+                readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]' \
+                  || { echo "::error::libass.so RUNPATH 未写入 [.]"; exit 1; }
                 echo "--- prefix/lib 文件 ↔ SONAME ---"
                 for f in "$PREFIX/lib"/*.so*; do
                   [ -e "$f" ] || continue
@@ -562,13 +574,11 @@ jobs:
           } > "$HOME/.local/bin/mkpc"
           chmod +x "$HOME/.local/bin/mkpc"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # 自检：helper 必须真的会落盘
           rm -rf /tmp/mkpc_selftest && mkdir -p /tmp/mkpc_selftest
           PREFIX=/tmp/mkpc_selftest LINK=shared "$HOME/.local/bin/mkpc" selftest "self test" 0 selftestlib
           test -f /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc || { echo "::error::mkpc helper broken"; exit 1; }
           cat /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc
 
-      # ★ 同一份脚本跑两遍：static 写 PREFIX_STATIC，shared 写 PREFIX_SHARED
       - name: Build ${{ matrix.name }} (static + shared)
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         shell: bash
@@ -851,7 +861,6 @@ jobs:
           mkdir -p "$OUTPUT/lib"
           [ -d "$OUTPUT/bin" ] && { cp -a "$OUTPUT/bin/." "$OUTPUT/"; rm -rf "$OUTPUT/bin"; }
 
-          # 全量解引用拷贝，保证每个名字都是真实文件
           for f in "$PREFIX"/lib/*.so*; do
             [ -e "$f" ] || continue
             cp -aLf "$f" "$OUTPUT/lib/$(basename "$f")"
@@ -928,7 +937,7 @@ jobs:
           is_sys() { for s in $SYS; do [ "$1" = "$s" ] && return 0; done; return 1; }
 
           readelf -d output/ffmpeg | grep -E 'RUNPATH|RPATH' || true
-          readelf -d output/ffmpeg | grep -q '\./lib' && echo "✅ RUNPATH 含 ./lib" || { echo "::error::未写入 ./lib"; fail=1; }
+          readelf -d output/ffmpeg | grep -q './lib' && echo "✅ RUNPATH 含 ./lib" || { echo "::error::未写入 ./lib"; fail=1; }
 
           for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
             [ -f "$f" ] || continue
@@ -941,6 +950,9 @@ jobs:
           for n in libfreetype.so libfribidi.so libharfbuzz.so libc++_shared.so; do
             [ -e "output/lib/$n" ] && echo "  [ok] $n" || { echo "::warning::缺 $n"; fail=1; }
           done
+
+          echo "=== libass.so RUNPATH ==="
+          readelf -d output/lib/libass.so 2>/dev/null | grep -E 'RUNPATH|RPATH' || true
 
           echo "=== ldd（带 LD_LIBRARY_PATH）==="
           LD_LIBRARY_PATH="$PWD/output/lib" ldd output/lib/libass.so 2>&1 | tee /tmp/ldd.out || true
