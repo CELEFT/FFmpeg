@@ -150,10 +150,19 @@ jobs:
               cmake --install build || true
               mkpc libvvenc "Fraunhofer VVC encoder" "1.11.0" vvenc "" "-I\${includedir}/vvenc"
 
+          # ★ 关键修复：xeve 的库目标在 CMakeLists 里写死 SHARED，
+          #   -DBUILD_SHARED_LIBS=OFF 对它无效；static 变体必须把目标改成 STATIC，
+          #   否则 static prefix 会混进 libxeve.so（且根本没有 libxeve.a）。
           - name: xeve
             build: |
               [ -d xeve ] || git clone --depth 1 https://github.com/mpeg5/xeve.git xeve
               cd xeve
+              if [ "$LINK" = "static" ]; then
+                find . -name CMakeLists.txt -not -path './build/*' -exec \
+                  sed -i -E 's/add_library\(([^)]*)[[:space:]]+SHARED/add_library(\1 STATIC/' {} +
+                echo "--- add_library 目标 ---"
+                grep -rn 'add_library' --include=CMakeLists.txt . | grep -v '/build/' || true
+              fi
               rm -rf build
               cmake -S . -B build \
                 -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
@@ -167,12 +176,26 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xeve*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
+              if [ "$LINK" = "static" ]; then
+                rm -f "$PREFIX/lib/libxeve.so"*
+                test -f "$PREFIX/lib/libxeve.a" || {
+                  echo "::error::libxeve.a missing（SHARED→STATIC 改写未生效）"
+                  ls -l "$PREFIX/lib" ; exit 1
+                }
+              fi
               mkpc xeve "MPEG-5 EVC encoder" "1.0.0" xeve
 
+          # ★ 关键修复：xevd 与 xeve 同一个毛病
           - name: xevd
             build: |
               [ -d xevd ] || git clone --depth 1 https://github.com/mpeg5/xevd.git xevd
               cd xevd
+              if [ "$LINK" = "static" ]; then
+                find . -name CMakeLists.txt -not -path './build/*' -exec \
+                  sed -i -E 's/add_library\(([^)]*)[[:space:]]+SHARED/add_library(\1 STATIC/' {} +
+                echo "--- add_library 目标 ---"
+                grep -rn 'add_library' --include=CMakeLists.txt . | grep -v '/build/' || true
+              fi
               rm -rf build
               cmake -S . -B build \
                 -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
@@ -186,8 +209,17 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xevd*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
+              if [ "$LINK" = "static" ]; then
+                rm -f "$PREFIX/lib/libxevd.so"*
+                test -f "$PREFIX/lib/libxevd.a" || {
+                  echo "::error::libxevd.a missing（SHARED→STATIC 改写未生效）"
+                  ls -l "$PREFIX/lib" ; exit 1
+                }
+              fi
               mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd
 
+          # ★ 关键修复：OpenSSL 的 provider 模块（lib/ossl-modules/legacy.so）
+          #   是 DSO，no-shared 并不会关闭它；static 变体装完要清掉。
           - name: openssl
             build: |
               [ -d openssl ] || git clone --depth 1 https://github.com/openssl/openssl.git openssl
@@ -199,6 +231,9 @@ jobs:
                 $OPENSSL_SHARED no-tests
               make -j"$(nproc)"
               make install_sw
+              if [ "$LINK" = "static" ]; then
+                rm -rf "$PREFIX/lib/ossl-modules"
+              fi
               for f in "$PREFIX"/lib/pkgconfig/*.pc; do
                 [ -e "$f" ] || continue
                 sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
@@ -659,7 +694,7 @@ jobs:
             [ -f "$P/lib/pkgconfig/$m.pc" ] || echo "::warning::缺 $m.pc"
           done
           [ "$fail" -eq 0 ] && echo "✅ static prefix 完整"
-          exit 0
+          exit "$fail"
 
       - name: Verify shared prefix (.so + NEEDED closure)
         shell: bash
