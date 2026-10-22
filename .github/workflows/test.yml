@@ -75,7 +75,13 @@ jobs:
             fi
 
             local BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
+
+            # ★ 唯一修改点：shared 时硬编码 rpath "."，从进程当前目录查找依赖
+            # 注意：不能写成 -Wl,-rpath,'.'，单引号在变量展开后是字面字符，会污染 RUNPATH
             local BASE_LDFLAGS="-L$PREFIX/lib"
+            if [ "$LINK" = "shared" ]; then
+              BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
+            fi
 
             # 1. FreeType (Autotools)
             echo "### FreeType ($LINK)"
@@ -91,11 +97,10 @@ jobs:
               make install
             )
 
-            # 2. FriBidi (Meson)  ← 已替换为 Meson 构建
+            # 2. FriBidi (Meson)
             echo "### FriBidi ($LINK)"
             ( cd fribidi
               rm -rf _build
-              # 动态生成针对 fribidi 的 Meson 交叉编译文件
               cat > fribidi.cross <<EOF
           [binaries]
           c = '$CC'
@@ -171,7 +176,7 @@ jobs:
               ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
             fi
 
-            # 5. libass (Autotools)
+            # 5. libass (Autotools) — 用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
             echo "### libass ($LINK)"
             ( cd libass
               make distclean >/dev/null 2>&1 || true
@@ -218,11 +223,25 @@ jobs:
           ls -la "$PREFIX_SHARED/lib/libass.so"*
           REAL=$(readlink -f "$PREFIX_SHARED/lib/libass.so")
           file "$REAL"
+
           echo "=== NEEDED / SONAME ==="
           readelf -d "$REAL" | grep -E 'NEEDED|SONAME' || true
+
+          echo "=== RUNPATH / RPATH（应包含 [.]）==="
+          RP=$(readelf -d "$REAL" | grep -E 'RUNPATH|RPATH' || true)
+          echo "$RP"
+          if [ -z "$RP" ]; then
+            echo "::error::libass.so 未写入 RUNPATH/RPATH"
+            exit 1
+          fi
+          if ! echo "$RP" | grep -qE '\[\.\]'; then
+            echo "::error::RUNPATH 中找不到 [.]"
+            exit 1
+          fi
+          echo "✅ RUNPATH 已含 [.]"
+
           echo
-          echo "⚠️  如果要把 .so 直接打包进 APK 的 libs/arm64-v8a/，"
-          echo "   注意当前 SONAME 通常是 libass.so.9，打包工具可能需要重命名"
+          echo "⚠️  当前 SONAME 通常是 libass.so.9，打包进 APK libs/ 时注意重命名"
           echo "✅ shared libass OK"
 
       - name: Collect artifacts
