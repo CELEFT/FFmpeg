@@ -289,33 +289,44 @@ jobs:
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
           # ★ 文本渲染链必须同一 job 顺序构建
+          #   1)~5) + 7) 段与 test.yml 的 build_stack 完全一致（FreeType → FriBidi → HarfBuzz → libass）
+          #   额外的 2) expat / 3) fontconfig 是本 workflow 需要的（FFmpeg 开了 --enable-libfontconfig）
           - name: text-stack
             build: |
               set -o errexit
 
-              # ================= 1) freetype =================
-              # 修复：freetype 2.15 的 autogen.sh 只生成 builds/unix/configure，
-              # 根目录没有 configure（更没有 wrapper），必须在 builds/unix 里 configure。
+              # ===== 变量名对齐 test.yml 的 build_stack =====
+              if [ "$LINK" = "static" ]; then
+                CFLAGS_EXTRA="-O2 -fPIC"
+              else
+                CFLAGS_EXTRA="-O2"
+              fi
+
+              BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
+
+              # shared 时硬编码 rpath "."，从进程当前目录查找依赖
+              # 注意：不能写成 -Wl,-rpath,'.'，单引号在变量展开后是字面字符，会污染 RUNPATH
+              BASE_LDFLAGS="-L$PREFIX/lib"
+              if [ "$LINK" = "shared" ]; then
+                BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
+              fi
+
+              # ================= 1) FreeType (Autotools) —— 照搬 test.yml =================
+              echo "### FreeType ($LINK)"
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
                 cd freetype
                 make distclean >/dev/null 2>&1 || true
-                rm -f configure
-                if [ -x ./autogen.sh ]; then ./autogen.sh; fi
-                if [ ! -f builds/unix/configure ]; then
-                  echo "::error::freetype: builds/unix/configure 未生成（autogen 失败）"
-                  ls -la . | head -30
-                  ls -la builds/unix 2>/dev/null | head -30 || true
-                  exit 1
-                fi
-                cd builds/unix
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                ./autogen.sh
+                # 兜底：个别 git 版本 autogen 只在 builds/unix 下生成 configure（不改动正常路径）
+                [ -f configure ] || { echo "::warning::freetype 顶层无 configure，改用 builds/unix"; cd builds/unix; }
+                ./configure \
+                  --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
                   --without-zlib --without-png --without-bzip2 --without-harfbuzz \
-                  CFLAGS="$EXTRA_CFLAGS"
+                  CFLAGS="$CFLAGS_EXTRA"
                 make -j"$(nproc)"
                 make install
-                make distclean >/dev/null 2>&1 || true
               )
 
               # ================= 2) expat =================
@@ -356,7 +367,8 @@ jobs:
               )
               mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
 
-              # ================= 4) fribidi =================
+              # ================= 4) FriBidi (Meson) —— 照搬 test.yml =================
+              echo "### FriBidi ($LINK)"
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
                 cd fribidi
@@ -369,10 +381,15 @@ jobs:
                   printf "strip = '%s'\n" "$STRIP"
                   printf "pkgconfig = 'pkg-config'\n"
                   printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
-                } > android.cross
-                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
-                  -Ddocs=false -Ddeprecated=false -Db_staticpic=true
+                } > fribidi.cross
+                PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+                meson setup _build --cross-file fribidi.cross \
+                  --prefix="$PREFIX" \
+                  --default-library="$MESON_LIB" \
+                  --buildtype=release \
+                  -Ddocs=false \
+                  -Ddeprecated=false \
+                  -Db_staticpic=true
                 ninja -C _build
                 ninja -C _build install
               )
@@ -382,7 +399,8 @@ jobs:
                 test -f "$PREFIX/lib/libfribidi.a" || { echo "::error::libfribidi.a missing"; exit 1; }
               fi
 
-              # ================= 5) harfbuzz =================
+              # ================= 5) HarfBuzz (Meson) —— 照搬 test.yml =================
+              echo "### HarfBuzz ($LINK)"
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
                 cd harfbuzz
@@ -397,9 +415,13 @@ jobs:
                   printf '\n[properties]\nneeds_exe_wrapper = true\n'
                   printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
                 } > android.cross
-                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
-                  -Db_staticpic=true -Dfreetype=enabled \
+                PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+                meson setup _build --cross-file android.cross \
+                  --prefix="$PREFIX" \
+                  --default-library="$MESON_LIB" \
+                  --buildtype=release \
+                  -Db_staticpic=true \
+                  -Dfreetype=enabled \
                   -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
                   -Dicu=disabled -Dgraphite2=disabled \
                   -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
@@ -408,42 +430,40 @@ jobs:
               )
 
               # ================= 6) 头文件归一化（复制，不用软链）=================
+              # 说明：test.yml 里用 ln -sf 绝对路径软链，打进 artifact 换机器后会悬空，
+              #      这里仍用复制（内容与 test.yml 等价，只是形式更适合打包分发）
               for sub in fribidi harfbuzz; do
                 [ -d "$PREFIX/include/$sub" ] || continue
-                find "$PREFIX/include/$sub" -name '*.h' -print0 \
-                  | while IFS= read -r -d '' h; do
-                      tgt="$PREFIX/include/$(basename "$h")"
-                      [ -e "$tgt" ] || cp -n "$h" "$tgt"
-                    done
+                find "$PREFIX/include/$sub" -name '*.h' -print0 |
+                while IFS= read -r -d '' h; do
+                  tgt="$PREFIX/include/$(basename "$h")"
+                  [ -e "$tgt" ] || cp -n "$h" "$tgt"
+                done
               done
               if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
                 cp -n "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # ================= 7) libass =================
-              # 修复：shared 时硬编码 -Wl,-rpath,.（不加引号），让 libass.so 从当前目录找依赖
+              # ================= 7) libass (Autotools) —— 照搬 test.yml =================
+              #    使用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
+              echo "### libass ($LINK)"
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
                 cd libass
                 make distclean >/dev/null 2>&1 || true
-                rm -f configure
-                if [ -x ./autogen.sh ]; then ./autogen.sh; fi
-
-                ASS_LDFLAGS="-L$PREFIX/lib"
-                if [ "$LINK" = "shared" ]; then
-                  ASS_LDFLAGS="$ASS_LDFLAGS -Wl,-rpath,."
-                fi
-
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                ./autogen.sh
+                PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+                PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+                ./configure \
+                  --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
                   --disable-fontconfig \
                   --disable-require-system-font-provider \
-                  CFLAGS="$EXTRA_CFLAGS" \
-                  CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2" \
-                  LDFLAGS="$ASS_LDFLAGS"
+                  CFLAGS="$CFLAGS_EXTRA" \
+                  CPPFLAGS="$BASE_CPPFLAGS" \
+                  LDFLAGS="$BASE_LDFLAGS"
                 make -j"$(nproc)"
                 make install
-                make distclean >/dev/null 2>&1 || true
               )
 
               # ================= 8) 本 job 自检 =================
@@ -464,8 +484,10 @@ jobs:
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
                 echo "--- libass.so RUNPATH ---"
                 readelf -d "$PREFIX/lib/libass.so" | grep -E 'RUNPATH|RPATH' || echo "  (none)"
-                readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]' \
-                  || { echo "::error::libass.so RUNPATH 未写入 [.]"; exit 1; }
+                if ! readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]'; then
+                  echo "::error::libass.so RUNPATH 未写入 [.]"
+                  exit 1
+                fi
                 echo "--- prefix/lib 文件 ↔ SONAME ---"
                 for f in "$PREFIX/lib"/*.so*; do
                   [ -e "$f" ] || continue
@@ -752,312 +774,7 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 3：独立构建 libass（freetype + fribidi + harfbuzz + libass）
-  # 来源：原 test.yml，合并到 main.yml 后保留完整验证与独立 artifacts
-  # =====================================================================
-  build-libass:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext libexpat1-dev xz-utils
-
-      - name: Cache NDK
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ndk
-          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
-
-      - name: Restore NDK permissions (cache hit)
-        if: steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x "${{ github.workspace }}/ndk"
-
-      - name: Download and Unpack NDK (cache miss)
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
-        run: |
-          wget -q "${{ env.NDK_URL }}" -O ndk.zip
-          unzip -q ndk.zip
-          mv android-ndk-r30* "${{ github.workspace }}/ndk"
-          rm ndk.zip
-          chmod -R +x "${{ github.workspace }}/ndk"
-
-      - name: Set toolchain env
-        run: |
-          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          {
-            echo "TOOLCHAIN=$TOOLCHAIN"
-            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
-            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
-            echo "AR=$TOOLCHAIN/bin/llvm-ar"
-            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
-            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
-            echo "PREFIX_STATIC=${{ github.workspace }}/prefix-static"
-            echo "PREFIX_SHARED=${{ github.workspace }}/prefix-shared"
-          } >> "$GITHUB_ENV"
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-
-      - name: Clone sources
-        run: |
-          git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git
-          git clone --depth 1 https://github.com/fribidi/fribidi.git
-          git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git
-          git clone --depth 1 https://github.com/libass/libass.git
-
-      - name: Build stack (static + shared)
-        run: |
-          set -euo pipefail
-
-          build_stack() {
-            local LINK="$1"
-            local PREFIX="$2"
-
-            echo "::group::=== Building $LINK stack into $PREFIX ==="
-            mkdir -p "$PREFIX"
-
-            local MESON_LIB CFLAGS_EXTRA LTOPT
-            if [ "$LINK" = "static" ]; then
-              MESON_LIB="static"
-              CFLAGS_EXTRA="-O2 -fPIC"
-              LTOPT="--enable-static --disable-shared"
-            else
-              MESON_LIB="shared"
-              CFLAGS_EXTRA="-O2"
-              LTOPT="--disable-static --enable-shared"
-            fi
-
-            local BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
-
-            # shared 时硬编码 rpath "."，从进程当前目录查找依赖
-            local BASE_LDFLAGS="-L$PREFIX/lib"
-            if [ "$LINK" = "shared" ]; then
-              BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
-            fi
-
-            # 1. FreeType (Autotools) — freetype 2.15 的 configure 在 builds/unix 下
-            echo "### FreeType ($LINK)"
-            ( cd freetype
-              make distclean >/dev/null 2>&1 || true
-              rm -f configure
-              if [ -x ./autogen.sh ]; then ./autogen.sh; fi
-              if [ ! -f builds/unix/configure ]; then
-                echo "::error::freetype: builds/unix/configure 未生成（autogen 失败）"
-                ls -la . | head -30
-                ls -la builds/unix 2>/dev/null | head -30 || true
-                exit 1
-              fi
-              cd builds/unix
-              ./configure \
-                --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                $LTOPT --with-pic \
-                --without-zlib --without-png --without-bzip2 --without-harfbuzz \
-                CFLAGS="$CFLAGS_EXTRA"
-              make -j"$(nproc)"
-              make install
-            )
-
-            # 2. FriBidi (Meson)
-            echo "### FriBidi ($LINK)"
-            ( cd fribidi
-              rm -rf _build
-              cat > fribidi.cross <<EOF
-          [binaries]
-          c = '$CC'
-          cpp = '$CXX'
-          ar = '$AR'
-          strip = '$STRIP'
-          pkgconfig = 'pkg-config'
-
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-          EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file fribidi.cross \
-                --prefix="$PREFIX" \
-                --default-library="$MESON_LIB" \
-                --buildtype=release \
-                -Ddocs=false \
-                -Ddeprecated=false \
-                -Db_staticpic=true
-              ninja -C _build
-              ninja -C _build install
-            )
-
-            # 3. HarfBuzz (Meson)
-            echo "### HarfBuzz ($LINK)"
-            ( cd harfbuzz
-              rm -rf _build
-              cat > android.cross <<EOF
-          [binaries]
-          c = '$CC'
-          cpp = '$CXX'
-          ar = '$AR'
-          strip = '$STRIP'
-          pkgconfig = 'pkg-config'
-
-          [properties]
-          needs_exe_wrapper = true
-
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-          EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file android.cross \
-                --prefix="$PREFIX" \
-                --default-library="$MESON_LIB" \
-                --buildtype=release \
-                -Db_staticpic=true \
-                -Dfreetype=enabled \
-                -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
-                -Dicu=disabled -Dgraphite2=disabled \
-                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
-              ninja -C _build
-              ninja -C _build install
-            )
-
-            # 4. 头文件归一化（复制，不用软链，避免 artifact 解压后失效）
-            echo "### Normalizing headers"
-            for sub in fribidi harfbuzz; do
-              if [ -d "$PREFIX/include/$sub" ]; then
-                find "$PREFIX/include/$sub" -name '*.h' -print0 \
-                  | while IFS= read -r -d '' h; do
-                      tgt="$PREFIX/include/$(basename "$h")"
-                      [ -e "$tgt" ] || cp -n "$h" "$tgt"
-                    done
-              fi
-            done
-            if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
-              cp -n "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
-            fi
-
-            # 5. libass (Autotools) — 用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
-            echo "### libass ($LINK)"
-            ( cd libass
-              make distclean >/dev/null 2>&1 || true
-              rm -f configure
-              if [ -x ./autogen.sh ]; then ./autogen.sh; fi
-              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              ./configure \
-                --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                $LTOPT --with-pic \
-                --disable-fontconfig \
-                --disable-require-system-font-provider \
-                CFLAGS="$CFLAGS_EXTRA" \
-                CPPFLAGS="$BASE_CPPFLAGS" \
-                LDFLAGS="$BASE_LDFLAGS"
-              make -j"$(nproc)"
-              make install
-            )
-
-            echo "::endgroup::"
-          }
-
-          build_stack static  "$PREFIX_STATIC"
-          build_stack shared  "$PREFIX_SHARED"
-
-      - name: Verify static libass
-        run: |
-          set -euxo pipefail
-          echo "=== libass.a ==="
-          test -s "$PREFIX_STATIC/lib/libass.a"
-          ls -la "$PREFIX_STATIC/lib/libass.a"
-          echo "=== 成员列表（前几项）==="
-          ar t "$PREFIX_STATIC/lib/libass.a" | head -5
-          echo "=== 抽一个 .o 看架构 ==="
-          TMP=$(mktemp -d)
-          ( cd "$TMP" && ar x "$PREFIX_STATIC/lib/libass.a" )
-          file "$TMP"/*.o | head -3 | tee /tmp/arch.txt
-          grep -q "ARM aarch64" /tmp/arch.txt || (echo "❌ 架构不是 aarch64"; exit 1)
-          echo "✅ static libass OK"
-
-      - name: Verify shared libass
-        run: |
-          set -euxo pipefail
-          echo "=== libass.so* ==="
-          ls -la "$PREFIX_SHARED/lib/libass.so"*
-          REAL=$(readlink -f "$PREFIX_SHARED/lib/libass.so")
-          file "$REAL"
-
-          echo "=== NEEDED / SONAME ==="
-          readelf -d "$REAL" | grep -E 'NEEDED|SONAME' || true
-
-          echo "=== RUNPATH / RPATH（应包含 [.]）==="
-          RP=$(readelf -d "$REAL" | grep -E 'RUNPATH|RPATH' || true)
-          echo "$RP"
-          if [ -z "$RP" ]; then
-            echo "::error::libass.so 未写入 RUNPATH/RPATH"
-            exit 1
-          fi
-          if ! echo "$RP" | grep -qE '\[\.\]'; then
-            echo "::error::RUNPATH 中找不到 [.]"
-            exit 1
-          fi
-          echo "✅ RUNPATH 已含 [.]"
-
-          echo
-          echo "⚠️  当前 SONAME 通常是 libass.so.9，打包进 APK libs/ 时注意重命名"
-          echo "✅ shared libass OK"
-
-      - name: Collect artifacts
-        run: |
-          set -euxo pipefail
-          mkdir -p artifacts/static/lib/pkgconfig artifacts/static/include \
-                   artifacts/shared/lib/pkgconfig artifacts/shared/include
-
-          cp -a "$PREFIX_STATIC"/lib/*.a artifacts/static/lib/
-          cp -a "$PREFIX_STATIC"/lib/pkgconfig/*.pc artifacts/static/lib/pkgconfig/ 2>/dev/null || true
-          cp -a "$PREFIX_STATIC"/include/. artifacts/static/include/
-
-          cp -a "$PREFIX_SHARED"/lib/*.so* artifacts/shared/lib/
-          cp -a "$PREFIX_SHARED"/lib/pkgconfig/*.pc artifacts/shared/lib/pkgconfig/ 2>/dev/null || true
-          cp -a "$PREFIX_SHARED"/include/. artifacts/shared/include/
-
-          echo "=== static files ==="
-          find artifacts/static -type f | sort
-          echo "=== shared files ==="
-          find artifacts/shared -type f | sort
-
-      - name: Package (libass static)
-        run: |
-          cd "${{ github.workspace }}"
-          tar -I 'xz -9e -T0' -cf libass-static-arm64-v8a.tar.xz -C artifacts/static .
-          ls -lh libass-static-arm64-v8a.tar.xz
-
-      - name: Package (libass shared)
-        run: |
-          cd "${{ github.workspace }}"
-          tar -I 'xz -9e -T0' -cf libass-shared-arm64-v8a.tar.xz -C artifacts/shared .
-          ls -lh libass-shared-arm64-v8a.tar.xz
-
-      - name: Upload libass static
-        uses: actions/upload-artifact@v4
-        with:
-          name: libass-static
-          path: ${{ github.workspace }}/libass-static-arm64-v8a.tar.xz
-          retention-days: 1
-
-      - name: Upload libass shared
-        uses: actions/upload-artifact@v4
-        with:
-          name: libass-shared
-          path: ${{ github.workspace }}/libass-shared-arm64-v8a.tar.xz
-          retention-days: 1
-
-  # =====================================================================
-  # Job 4：FFmpeg shared（用 shared prefix，带 ./lib + wrapper + 闭包）
+  # Job 3：FFmpeg shared（用 shared prefix，带 ./lib + wrapper + 闭包）
   # =====================================================================
   build-shared:
     needs: combine-prefix
@@ -1279,7 +996,7 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 5：FFmpeg static（用 static prefix，里面没有 .so，无需隐藏）
+  # Job 4：FFmpeg static（用 static prefix，里面没有 .so，无需隐藏）
   # =====================================================================
   build-static:
     needs: combine-prefix
@@ -1421,10 +1138,10 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 6：发布
+  # Job 5：发布
   # =====================================================================
   release:
-    needs: [build-shared, build-static, build-libass]
+    needs: [build-shared, build-static]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1435,13 +1152,6 @@ jobs:
         with:
           path: artifacts
           pattern: ffmpeg-*
-          merge-multiple: true
-
-      - name: Download libass artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: libass-*
           merge-multiple: true
 
       - name: Download prefix tarballs
@@ -1470,14 +1180,12 @@ jobs:
             - **NDK**: r30 / API 36
             - **Trigger**: ${{ github.event_name }}
 
-            | 文件 | 说明 |
-            |---|---|
-            | `ffmpeg-shared-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe,ffmpeg.sh,ffprobe.sh,lib/}`，RUNPATH=`./lib`，全部第三方 `.so` 已打齐 |
-            | `ffmpeg-static-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe}`，仅依赖 Android 系统库 |
-            | `libass-static-arm64-v8a.tar.xz` | 独立 libass 静态构建（freetype + fribidi + harfbuzz + libass），`lib/*.a` + `lib/pkgconfig/*.pc` + `include/` |
-            | `libass-shared-arm64-v8a.tar.xz` | 独立 libass 动态构建（同上依赖），`lib/*.so*` + `lib/pkgconfig/*.pc` + `include/`，RUNPATH=`.` |
-            | `prefix-shared-arm64-v8a.tar.xz` | 纯动态外部库（`.so` + `.pc` + `include`） |
-            | `prefix-static-arm64-v8a.tar.xz` | 纯静态外部库（`.a` + `.pc` + `include`） |
+            文件 | 说明 |
+            ---|---|
+            `ffmpeg-shared-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe,ffmpeg.sh,ffprobe.sh,lib/}`，RUNPATH=`./lib`，全部第三方 `.so` 已打齐 |
+            `ffmpeg-static-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe}`，仅依赖 Android 系统库 |
+            `prefix-shared-arm64-v8a.tar.xz` | 纯动态外部库（`.so` + `.pc` + `include`） |
+            `prefix-static-arm64-v8a.tar.xz` | 纯静态外部库（`.a` + `.pc` + `include`） |
 
             ```sh
             tar xf ffmpeg-shared-arm64-v8a.tar.xz
