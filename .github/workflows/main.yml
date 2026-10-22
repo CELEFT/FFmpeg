@@ -288,14 +288,13 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          # ★ 文本渲染链必须同一 job 顺序构建
-          #   1)~5) + 7) 段与 test.yml 的 build_stack 完全一致（FreeType → FriBidi → HarfBuzz → libass）
-          #   额外的 2) expat / 3) fontconfig 是本 workflow 需要的（FFmpeg 开了 --enable-libfontconfig）
+          # ★ 文本渲染链：FreeType → FriBidi → HarfBuzz → libass
+          #   与 test.yml 的 build_stack 完全一致（顺序、configure 参数、CFLAGS/CPPFLAGS/LDFLAGS 都一样）
           - name: text-stack
             build: |
               set -o errexit
 
-              # ===== 变量名对齐 test.yml 的 build_stack =====
+              # ===== 变量与 test.yml 的 build_stack 对齐 =====
               if [ "$LINK" = "static" ]; then
                 CFLAGS_EXTRA="-O2 -fPIC"
               else
@@ -311,15 +310,13 @@ jobs:
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
               fi
 
-              # ================= 1) FreeType (Autotools) —— 照搬 test.yml =================
+              # ================= 1) FreeType (Autotools) =================
               echo "### FreeType ($LINK)"
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
                 cd freetype
                 make distclean >/dev/null 2>&1 || true
                 ./autogen.sh
-                # 兜底：个别 git 版本 autogen 只在 builds/unix 下生成 configure（不改动正常路径）
-                [ -f configure ] || { echo "::warning::freetype 顶层无 configure，改用 builds/unix"; cd builds/unix; }
                 ./configure \
                   --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
                   $LTOPT --with-pic \
@@ -329,45 +326,7 @@ jobs:
                 make install
               )
 
-              # ================= 2) expat =================
-              if [ ! -d expat-2.6.2 ]; then
-                wget -q https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
-                tar xf expat-2.6.2.tar.gz
-              fi
-              (
-                cd expat-2.6.2
-                make distclean >/dev/null 2>&1 || true
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                  $LTOPT --with-pic
-                make -j"$(nproc)"
-                make install
-                make distclean >/dev/null 2>&1 || true
-              )
-
-              # ================= 3) fontconfig (meson >= 1.11) =================
-              [ -d fontconfig ] || git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git fontconfig
-              (
-                cd fontconfig
-                rm -rf _build
-                {
-                  printf '[binaries]\n'
-                  printf "c = '%s'\n" "$CC"
-                  printf "cpp = '%s'\n" "$CXX"
-                  printf "ar = '%s'\n" "$AR"
-                  printf "strip = '%s'\n" "$STRIP"
-                  printf "pkgconfig = 'pkg-config'\n"
-                  printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
-                } > android.cross
-                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
-                  -Dxml-backend=expat -Dfreetype=enabled \
-                  -Ddoc=disabled -Dtests=disabled -Dtools=disabled
-                ninja -C _build
-                ninja -C _build install
-              )
-              mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
-
-              # ================= 4) FriBidi (Meson) —— 照搬 test.yml =================
+              # ================= 2) FriBidi (Meson) =================
               echo "### FriBidi ($LINK)"
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
@@ -399,7 +358,7 @@ jobs:
                 test -f "$PREFIX/lib/libfribidi.a" || { echo "::error::libfribidi.a missing"; exit 1; }
               fi
 
-              # ================= 5) HarfBuzz (Meson) —— 照搬 test.yml =================
+              # ================= 3) HarfBuzz (Meson) =================
               echo "### HarfBuzz ($LINK)"
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
@@ -429,23 +388,21 @@ jobs:
                 ninja -C _build install
               )
 
-              # ================= 6) 头文件归一化（复制，不用软链）=================
-              # 说明：test.yml 里用 ln -sf 绝对路径软链，打进 artifact 换机器后会悬空，
-              #      这里仍用复制（内容与 test.yml 等价，只是形式更适合打包分发）
+              # ================= 4) 头文件归一化 =================
+              # 与 test.yml 等价，唯一差别：软链目标写成相对路径（绝对路径打进 prefix tarball 会悬空）
               for sub in fribidi harfbuzz; do
                 [ -d "$PREFIX/include/$sub" ] || continue
-                find "$PREFIX/include/$sub" -name '*.h' -print0 |
-                while IFS= read -r -d '' h; do
-                  tgt="$PREFIX/include/$(basename "$h")"
-                  [ -e "$tgt" ] || cp -n "$h" "$tgt"
+                for h in "$PREFIX/include/$sub"/*.h; do
+                  [ -e "$h" ] || continue
+                  ln -sf "$sub/$(basename "$h")" "$PREFIX/include/$(basename "$h")"
                 done
               done
               if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
-                cp -n "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
+                ln -sf "freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # ================= 7) libass (Autotools) —— 照搬 test.yml =================
-              #    使用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
+              # ================= 5) libass (Autotools) =================
+              #    用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
               echo "### libass ($LINK)"
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
@@ -466,11 +423,11 @@ jobs:
                 make install
               )
 
-              # ================= 8) 本 job 自检 =================
+              # ================= 6) 文本链自检 =================
               if [ "$LINK" = "static" ]; then
                 test -s "$PREFIX/lib/libass.a" || { echo "::error::libass.a missing"; exit 1; }
-                for l in freetype fribidi harfbuzz expat fontconfig ass; do
-                  test -f "$PREFIX/lib/lib${l}.a" || echo "::warning::缺 lib${l}.a"
+                for l in freetype fribidi harfbuzz ass; do
+                  test -f "$PREFIX/lib/lib${l}.a" || { echo "::error::缺 lib${l}.a"; exit 1; }
                 done
                 if find "$PREFIX/lib" -name '*.so*' | grep -q .; then
                   echo "::error::static prefix 出现 .so"; find "$PREFIX/lib" -name '*.so*'; exit 1
@@ -484,7 +441,9 @@ jobs:
                 readelf -d "$PREFIX/lib/libass.so" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p'
                 echo "--- libass.so RUNPATH ---"
                 readelf -d "$PREFIX/lib/libass.so" | grep -E 'RUNPATH|RPATH' || echo "  (none)"
-                if ! readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]'; then
+                if readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]'; then
+                  echo "✅ RUNPATH 已含 [.]"
+                else
                   echo "::error::libass.so RUNPATH 未写入 [.]"
                   exit 1
                 fi
@@ -496,6 +455,62 @@ jobs:
                 done
                 echo "✅ text-stack [shared] ok"
               fi
+
+              # ================= 7) expat + fontconfig（本 workflow 独有）=================
+              # FFmpeg 开了 --enable-libfontconfig，所以 libass 链之外单独补这两个。
+              # 不需要 fontconfig 的话：删掉本段，并把 build-shared / build-static 里的
+              # --enable-libfontconfig 一起去掉即可。
+              echo "### expat ($LINK)"
+              if [ ! -d expat-2.6.2 ]; then
+                wget -q --tries=3 --timeout=30 \
+                  https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz
+                tar xf expat-2.6.2.tar.gz
+              fi
+              (
+                cd expat-2.6.2
+                make distclean >/dev/null 2>&1 || true
+                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                  $LTOPT --with-pic
+                make -j"$(nproc)"
+                make install
+                make distclean >/dev/null 2>&1 || true
+              )
+
+              echo "### fontconfig ($LINK)"
+              [ -d fontconfig ] || git clone --depth 1 https://gitlab.freedesktop.org/fontconfig/fontconfig.git fontconfig
+              (
+                cd fontconfig
+                rm -rf _build
+                {
+                  printf '[binaries]\n'
+                  printf "c = '%s'\n" "$CC"
+                  printf "cpp = '%s'\n" "$CXX"
+                  printf "ar = '%s'\n" "$AR"
+                  printf "strip = '%s'\n" "$STRIP"
+                  printf "pkgconfig = 'pkg-config'\n"
+                  printf '\n[properties]\nneeds_exe_wrapper = true\n'
+                  printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
+                } > android.cross
+                PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+                PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
+                  --default-library="$MESON_LIB" --buildtype=release \
+                  -Dxml-backend=expat -Dfreetype=enabled -Dcache-build=false \
+                  -Ddoc=disabled -Dtests=disabled -Dtools=disabled
+                ninja -C _build
+                ninja -C _build install
+              )
+              # meson 已经装了 fontconfig.pc，别用 mkpc 覆盖（会丢 Requires.private，static 链接会断）
+              if [ ! -f "$PREFIX/lib/pkgconfig/fontconfig.pc" ]; then
+                mkpc fontconfig "Font configuration library" "2.16.2" fontconfig "-lfreetype -lexpat -lm"
+              fi
+
+              if [ "$LINK" = "static" ]; then
+                test -f "$PREFIX/lib/libfontconfig.a" || { echo "::error::libfontconfig.a missing"; exit 1; }
+              else
+                test -e "$PREFIX/lib/libfontconfig.so" || { echo "::error::libfontconfig.so missing"; exit 1; }
+              fi
+              echo "✅ expat + fontconfig [$LINK] ok"
 
     steps:
       - uses: actions/checkout@v4
@@ -609,7 +624,9 @@ jobs:
           cat > /tmp/lib_build.sh <<'__LIB_EOF__'
           ${{ matrix.build }}
           __LIB_EOF__
-          cat -n /tmp/lib_build.sh | head -5
+          # 不用 `cat | head`，避免 SIGPIPE 触发 pipefail
+          sed -n '1,5p' /tmp/lib_build.sh
+          bash -n /tmp/lib_build.sh || { echo "::error::拼装后的构建脚本有语法错误"; exit 1; }
 
           run_variant() {
             local link="$1" prefix="$2"
@@ -691,7 +708,7 @@ jobs:
               fail=1
             fi
           done
-          for m in x265 aom vvenc xeve xevd liblc3 lc3 libwebp fdk-aac lame; do
+          for m in x265 aom vvenc xeve xevd liblc3 lc3 libwebp fdk-aac lame fontconfig; do
             [ -f "$P/lib/pkgconfig/$m.pc" ] || echo "::warning::缺 $m.pc"
           done
           [ "$fail" -eq 0 ] && echo "✅ static prefix 完整"
@@ -969,7 +986,7 @@ jobs:
             done
           done
 
-          for n in libfreetype.so libfribidi.so libharfbuzz.so libc++_shared.so; do
+          for n in libfreetype.so libfribidi.so libharfbuzz.so libfontconfig.so libc++_shared.so; do
             [ -e "output/lib/$n" ] && echo "  [ok] $n" || { echo "::warning::缺 $n"; fail=1; }
           done
 
