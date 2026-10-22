@@ -22,7 +22,9 @@ concurrency:
   cancel-in-progress: true
 
 # =====================================================================
-# Job 1：每个库内部循环构建 static / shared 两套 prefix
+# Job 1：外部库
+#   mode=both → 一次构建出 .a + .so，随后 split 到两个 prefix
+#   mode=dual → 构建系统一次只能出一种，分步构建
 # =====================================================================
 jobs:
   build-libs:
@@ -32,6 +34,8 @@ jobs:
       matrix:
         include:
           - name: x264
+            mode: both
+            libs: "x264"
             build: |
               [ -d x264 ] || git clone --depth 1 https://code.videolan.org/videolan/x264.git x264
               cd x264
@@ -43,6 +47,8 @@ jobs:
               make install
 
           - name: x265
+            mode: both
+            libs: "x265"
             build: |
               [ -d x265_git ] || git clone --depth 1 https://bitbucket.org/multicoreware/x265_git.git x265_git
               cd x265_git
@@ -61,6 +67,8 @@ jobs:
               mkpc x265 "H.265/HEVC encoder" "4.1" x265
 
           - name: dav1d
+            mode: both
+            libs: "dav1d"
             build: |
               [ -d dav1d ] || git clone --depth 1 https://code.videolan.org/videolan/dav1d.git dav1d
               cd dav1d
@@ -82,6 +90,8 @@ jobs:
               ninja -C _build install
 
           - name: libvpx
+            mode: both
+            libs: "vpx"
             build: |
               [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
               cd libvpx
@@ -98,8 +108,10 @@ jobs:
               make -j"$(nproc)"
               make install
 
-          # ★ aom 认 BUILD_SHARED_LIBS，不认 ENABLE_SHARED
+          # ★ aom/svt-av1/vvenc：只有 BUILD_SHARED_LIBS，一次一种 → 分步构建
           - name: libaom
+            mode: dual
+            libs: "aom"
             build: |
               [ -d aom ] || git clone --depth 1 https://aomedia.googlesource.com/aom aom
               cd aom
@@ -120,6 +132,8 @@ jobs:
               fi
 
           - name: svt-av1
+            mode: dual
+            libs: "SvtAv1Enc"
             build: |
               [ -d SVT-AV1 ] || git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git SVT-AV1
               cd SVT-AV1
@@ -135,6 +149,8 @@ jobs:
               cmake --install build
 
           - name: vvenc
+            mode: dual
+            libs: "vvenc"
             build: |
               [ -d vvenc ] || git clone --depth 1 https://github.com/fraunhoferhhi/vvenc.git vvenc
               cd vvenc
@@ -150,9 +166,11 @@ jobs:
               cmake --install build || true
               mkpc libvvenc "Fraunhofer VVC encoder" "1.11.0" vvenc "" "-I\${includedir}/vvenc"
 
-          # ★ 产物层面归一化：xeve 只会装出 libxeve.a（即使 BUILD_SHARED_LIBS=ON），
-          #   所以这里只构建一次，最后交给 norm_lib 决定 static 留 .a / shared 合成 .so。
+          # ★ xeve：install 只装 libxeve.a；libxeve.so 由动态目标生成在 build/lib 下，
+          #   需要构建后主动捞出来，才能同时满足 static/shared 两个 prefix。
           - name: xeve
+            mode: both
+            libs: "xeve"
             build: |
               [ -d xeve ] || git clone --depth 1 https://github.com/mpeg5/xeve.git xeve
               cd xeve
@@ -162,20 +180,36 @@ jobs:
                 -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
                 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="$PREFIX" -DSET_PROF=MAIN \
-                -DBUILD_SHARED_LIBS="$CMAKE_SHARED_LIBS" \
+                -DBUILD_SHARED_LIBS=ON \
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               cmake --build build -j"$(nproc)"
               cmake --install build || true
-              # 新版本会额外装一份到 lib/xeve/ 下，清掉避免重复
+
               rm -rf "$PREFIX/lib/xeve"
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
+
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xeve*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
-              mkpc xeve "MPEG-5 EVC encoder" "1.0.0" xeve "" "-I\${includedir}/xeve"
-              norm_lib xeve
 
-          # ★ 产物层面归一化：xevd 同理（只装 libxevd.a）
+              # ★ 关键：install 不装 .so，从 build 目录把 .a / .so 都捞齐
+              echo "--- xeve build 产物 ---"
+              find build \( -name 'libxeve*.a' -o -name 'libxeve*.so*' \) 2>/dev/null | sort || true
+              find build -name 'libxeve.a' -exec cp -af {} "$PREFIX/lib/" \; 2>/dev/null || true
+              find build -name 'libxeve*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
+              # 动态库目标名可能是 xeve_dynamic → 补一个 libxeve.so 别名
+              if [ ! -e "$PREFIX/lib/libxeve.so" ]; then
+                cand=$(ls -1 "$PREFIX"/lib/libxeve*.so* 2>/dev/null | head -1 || true)
+                [ -n "$cand" ] && { cp -aLf "$cand" "$PREFIX/lib/libxeve.so"; echo "🔧 libxeve.so <- $cand"; }
+              fi
+
+              test -f "$PREFIX/lib/libxeve.a"  || echo "::warning::xeve: 未找到 libxeve.a"
+              test -e "$PREFIX/lib/libxeve.so" || echo "::warning::xeve: 未找到 libxeve.so（split 阶段由 .a 合成）"
+              mkpc xeve "MPEG-5 EVC encoder" "1.0.0" xeve "" "-I\${includedir}/xeve"
+
+          # ★ xevd：与 xeve 同一套处理（构建时有 xevd_dynamic 目标，但 install 只装 .a）
           - name: xevd
+            mode: both
+            libs: "xevd"
             build: |
               [ -d xevd ] || git clone --depth 1 https://github.com/mpeg5/xevd.git xevd
               cd xevd
@@ -185,46 +219,63 @@ jobs:
                 -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
                 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-                -DBUILD_SHARED_LIBS="$CMAKE_SHARED_LIBS" \
+                -DBUILD_SHARED_LIBS=ON \
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               cmake --build build -j"$(nproc)"
               cmake --install build || true
+
               rm -rf "$PREFIX/lib/xevd"
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
+
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xevd*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
-              mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd
-              norm_lib xevd
 
-          # ★ openssl：static 用 no-shared，shared 用 shared no-static，
-          #   最后统一由 norm_lib + 清理 ossl-modules 收尾。
+              echo "--- xevd build 产物 ---"
+              find build \( -name 'libxevd*.a' -o -name 'libxevd*.so*' \) 2>/dev/null | sort || true
+              find build -name 'libxevd.a' -exec cp -af {} "$PREFIX/lib/" \; 2>/dev/null || true
+              find build -name 'libxevd*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
+              if [ ! -e "$PREFIX/lib/libxevd.so" ]; then
+                cand=$(ls -1 "$PREFIX"/lib/libxevd*.so* 2>/dev/null | head -1 || true)
+                [ -n "$cand" ] && { cp -aLf "$cand" "$PREFIX/lib/libxevd.so"; echo "🔧 libxevd.so <- $cand"; }
+              fi
+
+              test -f "$PREFIX/lib/libxevd.a"  || echo "::warning::xevd: 未找到 libxevd.a"
+              test -e "$PREFIX/lib/libxevd.so" || echo "::warning::xevd: 未找到 libxevd.so（split 阶段由 .a 合成）"
+              mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd "" "-I\${includedir}/xevd"
+
+          # ★ openssl：
+          #   shared              → libcrypto/.libssl 的 .a 与 .so 一起建（默认 static 未被关闭）
+          #   no-shared           → 仅静态（兼容 mode=dual 时的 static 变体）
+          #   shared no-static    → 仅动态
+          # 末尾清掉 ossl-modules/engines-*（运行时 DSO，FFmpeg 用 default provider 不需要）
           - name: openssl
+            mode: both
+            libs: "ssl crypto"
             build: |
               [ -d openssl ] || git clone --depth 1 https://github.com/openssl/openssl.git openssl
               cd openssl
               make clean >/dev/null 2>&1 || true
               export ANDROID_NDK_ROOT="$NDK"
-              if [ "$LINK" = "static" ]; then
-                ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" \
-                  --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib \
-                  no-shared no-tests
-              else
-                ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" \
-                  --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib \
-                  shared no-static no-tests
-              fi
+              if [ "$LINK" = "static" ]; then OSSL_MODE="no-shared"; else OSSL_MODE="shared"; fi
+              echo "openssl mode: $OSSL_MODE ($LINK)"
+              ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" \
+                --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib \
+                $OSSL_MODE no-tests
               make -j"$(nproc)"
               make install_sw
-              # provider 模块是 DSO，no-shared 也关不掉；static 前缀必须清掉
-              [ "$LINK" = "static" ] && rm -rf "$PREFIX/lib/ossl-modules"
-              norm_lib ssl
-              norm_lib crypto
-              for f in "$PREFIX"/lib/pkgconfig/*.pc; do
-                [ -e "$f" ] || continue
-                sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
-              done
+              rm -rf "$PREFIX/lib/ossl-modules" "$PREFIX"/lib/engines-*
+              echo "--- openssl lib ---"
+              ls -1 "$PREFIX/lib" | sort | head -40
+              [ "$LINK" = "static" ] || {
+                test -e "$PREFIX/lib/libcrypto.so" || echo "::warning::openssl: 缺 libcrypto.so"
+                test -e "$PREFIX/lib/libssl.so"    || echo "::warning::openssl: 缺 libssl.so"
+              }
+              test -f "$PREFIX/lib/libcrypto.a" || echo "::warning::openssl: 缺 libcrypto.a"
+              test -f "$PREFIX/lib/libssl.a"    || echo "::warning::openssl: 缺 libssl.a"
 
           - name: fdk-aac
+            mode: both
+            libs: "fdk-aac"
             build: |
               [ -d fdk-aac ] || git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git fdk-aac
               cd fdk-aac
@@ -238,6 +289,8 @@ jobs:
               mkpc fdk-aac "Fraunhofer FDK AAC" "2.0.3" fdk-aac
 
           - name: lame
+            mode: both
+            libs: "mp3lame"
             build: |
               if [ ! -d lame-3.100 ]; then
                 wget -q https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
@@ -253,6 +306,8 @@ jobs:
               mkpc lame "MP3 encoding library" "3.100" mp3lame
 
           - name: opus
+            mode: both
+            libs: "opus"
             build: |
               [ -d opus ] || git clone --depth 1 https://github.com/xiph/opus.git opus
               cd opus
@@ -263,6 +318,8 @@ jobs:
               make install
 
           - name: vorbis
+            mode: both
+            libs: "ogg vorbis"
             build: |
               [ -d ogg ] || git clone --depth 1 https://github.com/xiph/ogg.git ogg
               cd ogg
@@ -278,8 +335,10 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" $LTOPT --with-pic
               make -j"$(nproc)" && make install
 
-          # ★ lc3：按 variant 分别产出 .a / .so，.pc 名字必须同时有 liblc3 与 lc3
+          # ★ 同一批 .o 直接产出 .a 与 .so，无需分步
           - name: lc3
+            mode: both
+            libs: "lc3"
             build: |
               [ -d liblc3 ] || git clone --depth 1 https://android.googlesource.com/platform/external/liblc3 liblc3
               cd liblc3
@@ -287,16 +346,15 @@ jobs:
               for f in src/*.c; do
                 $CC -O2 -fPIC -Iinclude -c "$f" -o "obj/$(basename "${f%.c}").o"
               done
-              if [ "$LINK" = "static" ]; then
-                $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
-              else
-                $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
-              fi
+              $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
+              $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
               find include -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
               mkpc liblc3 "Low Complexity Communication Codec" "1.1.0" lc3 "-lm"
               mkpc lc3    "Low Complexity Communication Codec" "1.1.0" lc3 "-lm"
 
           - name: webp
+            mode: both
+            libs: "webp"
             build: |
               [ -d libwebp ] || git clone --depth 1 https://github.com/webmproject/libwebp.git libwebp
               cd libwebp
@@ -308,8 +366,10 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          # ★ 文本渲染链：FreeType → FriBidi → HarfBuzz → libass（与 test.yml 完全一致）
+          # ★ 文本链：一次构建同时出 .a 与 .so
           - name: text-stack
+            mode: both
+            libs: "freetype fribidi harfbuzz ass"
             build: |
               set -o errexit
 
@@ -321,12 +381,12 @@ jobs:
 
               BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
 
+              # 只要会产出 .so（shared / both），就必须写 rpath "."
               BASE_LDFLAGS="-L$PREFIX/lib"
-              if [ "$LINK" = "shared" ]; then
+              if [ "$LINK" != "static" ]; then
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
               fi
 
-              # ================= 1) FreeType =================
               echo "### FreeType ($LINK)"
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
@@ -342,7 +402,6 @@ jobs:
                 make install
               )
 
-              # ================= 2) FriBidi =================
               echo "### FriBidi ($LINK)"
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
@@ -367,7 +426,6 @@ jobs:
                 ninja -C _build install
               )
 
-              # ================= 3) HarfBuzz =================
               echo "### HarfBuzz ($LINK)"
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
@@ -396,7 +454,6 @@ jobs:
                 ninja -C _build install
               )
 
-              # ================= 4) 头文件归一化 =================
               for sub in fribidi harfbuzz; do
                 [ -d "$PREFIX/include/$sub" ] || continue
                 for h in "$PREFIX/include/$sub"/*.h; do
@@ -408,7 +465,6 @@ jobs:
                 ln -sf "freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # ================= 5) libass =================
               echo "### libass ($LINK)"
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
@@ -429,27 +485,11 @@ jobs:
                 make install
               )
 
-              # ================= 6) 自检（有库即过）=================
-              if [ "$LINK" = "static" ]; then
-                for l in freetype fribidi harfbuzz ass; do
-                  if [ -f "$PREFIX/lib/lib${l}.a" ] || [ -e "$PREFIX/lib/lib${l}.so" ]; then :; else
-                    echo "::warning::text-stack[static] 缺 lib${l}"; fi
-                done
-                find "$PREFIX/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -print -delete 2>/dev/null || true
-                echo "✅ text-stack [static] ok"
-              else
-                for l in freetype fribidi harfbuzz ass; do
-                  if [ -e "$PREFIX/lib/lib${l}.so" ] || [ -f "$PREFIX/lib/lib${l}.a" ]; then :; else
-                    echo "::warning::text-stack[shared] 缺 lib${l}"; fi
-                done
-                if [ -e "$PREFIX/lib/libass.so" ]; then
-                  readelf -d "$PREFIX/lib/libass.so" | grep -E 'RUNPATH|RPATH' || echo "  (no runpath)"
-                  readelf -d "$PREFIX/lib/libass.so" | grep -qE '\[\.\]' \
-                    && echo "✅ libass.so RUNPATH 含 [.]" \
-                    || echo "::warning::libass.so RUNPATH 未含 [.]"
-                fi
-                echo "✅ text-stack [shared] ok"
-              fi
+              for l in freetype fribidi harfbuzz ass; do
+                [ -f "$PREFIX/lib/lib${l}.a" ] || echo "::warning::text-stack: 未产出 lib${l}.a"
+                [ -e "$PREFIX/lib/lib${l}.so" ] || echo "::warning::text-stack: 未产出 lib${l}.so"
+              done
+              echo "✅ text-stack [$LINK] ok"
 
     steps:
       - uses: actions/checkout@v4
@@ -555,9 +595,12 @@ jobs:
           test -f /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc || { echo "::error::mkpc helper broken"; exit 1; }
           cat /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc
 
-      - name: Build ${{ matrix.name }} (static + shared)
+      - name: Build ${{ matrix.name }} (${{ matrix.mode }})
         if: steps.cache-prefix.outputs.cache-hit != 'true'
         shell: bash
+        env:
+          MODE: ${{ matrix.mode }}
+          LIBS: ${{ matrix.libs }}
         run: |
           set -euo pipefail
           cat > /tmp/lib_build.sh <<'__LIB_EOF__'
@@ -566,54 +609,33 @@ jobs:
           sed -n '1,5p' /tmp/lib_build.sh
           bash -n /tmp/lib_build.sh || { echo "::error::拼装后的构建脚本有语法错误"; exit 1; }
 
-          # ★ 产物层面归一化：不要求各库都支持分步构建，
-          #   构建完再决定这个前缀里留 .a 还是 .so（有 .a 无 .so 时从 .a 合成 .so）。
-          norm_lib() {
-            local n="$1"
-            local a="$PREFIX/lib/lib${n}.a"
-            local so="$PREFIX/lib/lib${n}.so"
-            if [ "$LINK" = "static" ]; then
-              rm -f "$PREFIX"/lib/lib${n}.so "$PREFIX"/lib/lib${n}.so.*
-              if [ -f "$a" ]; then echo "✅ ${n}: lib${n}.a（static）"
-              else echo "::warning::${n}: static 前缀缺 lib${n}.a"; fi
-              return 0
-            fi
-            rm -f "$PREFIX"/lib/lib${n}.so.*
-            if [ ! -e "$so" ] && [ -f "$a" ]; then
-              if $CC -shared -o "$so" -Wl,-soname,"lib${n}.so" \
-                   -Wl,--whole-archive "$a" -Wl,--no-whole-archive -lm; then
-                echo "🔧 ${n}: 由 .a 合成 lib${n}.so（对象均为 PIC）"
-              else
-                echo "::warning::${n}: lib${n}.so 合成失败，保留 .a"
-              fi
-            fi
-            if [ -e "$so" ]; then
-              rm -f "$a"
-              echo "✅ ${n}: lib${n}.so（shared）"
-            else
-              echo "::warning::${n}: shared 前缀只有 lib${n}.a"
-            fi
-            return 0
+          WS="${{ github.workspace }}"
+          STAGE="$WS/stage/${{ matrix.name }}"
+
+          set_env() {
+            export EXTRA_CFLAGS="-O2 -fPIC"
+            case "$1" in
+              static) export LTOPT="--enable-static --disable-shared"
+                      export MESON_LIB="static"
+                      export CMAKE_SHARED_LIBS="OFF"
+                      export OPENSSL_SHARED="no-shared" ;;
+              shared) export LTOPT="--disable-static --enable-shared"
+                      export MESON_LIB="shared"
+                      export CMAKE_SHARED_LIBS="ON"
+                      export OPENSSL_SHARED="shared no-static" ;;
+              both)   export LTOPT="--enable-static --enable-shared"
+                      export MESON_LIB="both"
+                      export CMAKE_SHARED_LIBS="ON"
+                      export OPENSSL_SHARED="shared" ;;
+            esac
           }
-          export -f norm_lib
 
           run_variant() {
             local link="$1" prefix="$2"
             echo "::group::=== ${{ matrix.name }} [$link] ==="
             export LINK="$link"
             export PREFIX="$prefix"
-            export EXTRA_CFLAGS="-O2 -fPIC"
-            if [ "$link" = "static" ]; then
-              export LTOPT="--enable-static --disable-shared"
-              export MESON_LIB="static"
-              export CMAKE_SHARED_LIBS="OFF"
-              export OPENSSL_SHARED="no-shared"
-            else
-              export LTOPT="--disable-static --enable-shared"
-              export MESON_LIB="shared"
-              export CMAKE_SHARED_LIBS="ON"
-              export OPENSSL_SHARED="shared"
-            fi
+            set_env "$link"
             export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
             export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
             export PKG_CONFIG_ALLOW_CROSS=1
@@ -622,8 +644,103 @@ jobs:
             echo "::endgroup::"
           }
 
-          run_variant static "$PREFIX_STATIC"
-          run_variant shared "$PREFIX_SHARED"
+          synth_so() {   # $1=lib名 $2=源.a $3=输出目录
+            local n="$1" a="$2" out="$3"
+            [ -f "$a" ] || return 1
+            $CC -shared -Wl,-soname,"lib${n}.so" -o "$out/lib${n}.so" \
+              -Wl,--whole-archive "$a" -Wl,--no-whole-archive -lm
+          }
+
+          split_stage() {
+            mkdir -p "$PREFIX_STATIC/lib/pkgconfig" "$PREFIX_STATIC/include" \
+                     "$PREFIX_SHARED/lib/pkgconfig" "$PREFIX_SHARED/include"
+
+            if [ -d "$STAGE/include" ]; then
+              cp -a "$STAGE/include/." "$PREFIX_STATIC/include/"
+              cp -a "$STAGE/include/." "$PREFIX_SHARED/include/"
+            fi
+
+            for d in "$PREFIX_STATIC" "$PREFIX_SHARED"; do
+              [ -d "$STAGE/lib/pkgconfig" ] || continue
+              cp -a "$STAGE/lib/pkgconfig/." "$d/lib/pkgconfig/"
+              for pc in "$d/lib/pkgconfig"/*.pc; do
+                [ -e "$pc" ] || continue
+                sed -i "s|$STAGE|$d|g; s|^prefix=.*|prefix=$d|" "$pc"
+              done
+            done
+
+            local l cand
+            for l in $LIBS; do
+              [ -f "$STAGE/lib/lib${l}.a" ] && cp -af "$STAGE/lib/lib${l}.a" "$PREFIX_STATIC/lib/"
+              rm -f "$PREFIX_STATIC"/lib/lib${l}.so "$PREFIX_STATIC"/lib/lib${l}.so.*
+
+              rm -f "$PREFIX_SHARED"/lib/lib${l}.a
+              if [ ! -e "$PREFIX_SHARED/lib/lib${l}.so" ] && [ -e "$STAGE/lib/lib${l}.so" ]; then
+                cp -aLf "$STAGE"/lib/lib${l}.so* "$PREFIX_SHARED/lib/" 2>/dev/null || true
+              fi
+              if [ ! -e "$PREFIX_SHARED/lib/lib${l}.so" ]; then
+                cand=$(find "$WS" -maxdepth 6 -name "lib${l}.so*" \
+                        -not -path "$WS/prefixes/*" -not -path "$WS/stage/*" \
+                        -not -path "$WS/ndk/*" -print -quit 2>/dev/null || true)
+                if [ -n "$cand" ]; then
+                  cp -aLf "$cand" "$PREFIX_SHARED/lib/"
+                  echo "🔧 ${l}: 从构建目录补入 $(basename "$cand")"
+                fi
+              fi
+              if [ ! -e "$PREFIX_SHARED/lib/lib${l}.so" ] && [ -f "$PREFIX_STATIC/lib/lib${l}.a" ]; then
+                echo "🔧 ${l}: 由 lib${l}.a 合成 lib${l}.so"
+                synth_so "$l" "$PREFIX_STATIC/lib/lib${l}.a" "$PREFIX_SHARED" \
+                  || echo "::warning::${l}: .so 合成失败"
+              fi
+            done
+
+            rm -rf "$PREFIX_STATIC/lib/ossl-modules"
+          }
+
+          enforce() {
+            find "$PREFIX_STATIC/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -delete 2>/dev/null || true
+            find "$PREFIX_SHARED/lib" -maxdepth 1 -name '*.a' -delete 2>/dev/null || true
+            rm -rf "$PREFIX_STATIC/lib/ossl-modules"
+          }
+
+          check_side() {
+            local l
+            for l in $LIBS; do
+              if [ "$1" = "static" ]; then
+                [ -f "$PREFIX_STATIC/lib/lib${l}.a" ] || return 1
+              else
+                [ -e "$PREFIX_SHARED/lib/lib${l}.so" ] || return 1
+              fi
+            done
+            return 0
+          }
+
+          if [ "${MODE:-dual}" = "both" ]; then
+            echo "🚀 both：单次构建 → 产物分离"
+            rm -rf "$STAGE"
+            run_variant both "$STAGE"
+            split_stage
+
+            if ! check_side static; then
+              echo "::warning::both 构建未产出完整静态库，补跑 static"
+              run_variant static "$PREFIX_STATIC"
+            fi
+            if ! check_side shared; then
+              echo "::warning::both 构建未产出完整动态库，补跑 shared"
+              run_variant shared "$PREFIX_SHARED"
+            fi
+          else
+            echo "🚀 dual：分步构建"
+            run_variant static "$PREFIX_STATIC"
+            run_variant shared "$PREFIX_SHARED"
+          fi
+
+          enforce
+
+          echo "--- static/lib ---"
+          ls -1 "$PREFIX_STATIC/lib" 2>/dev/null || true
+          echo "--- shared/lib ---"
+          ls -1 "$PREFIX_SHARED/lib" 2>/dev/null || true
 
       - name: Upload ${{ matrix.name }} prefixes
         if: steps.cache-prefix.outputs.cache-hit != 'true'
@@ -636,7 +753,7 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 2：合并两个 prefix；只做「产物分离 + 有库即过」的校验
+  # Job 2：合并；只做「有库即过」校验 + 兜底清理
   # =====================================================================
   combine-prefix:
     needs: build-libs
@@ -664,7 +781,6 @@ jobs:
           P="${{ github.workspace }}/prefixes/static"
           mkdir -p "$P/lib" "$P/stray"
           rm -rf "$P/lib/ossl-modules"
-          # 漏进来的 .so 一律移出 lib（不中断流水线）
           find "$P/lib" \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null |
             while IFS= read -r -d '' f; do
               echo "::warning::static 前缀里的 .so 已移出：${f#"$P"/}"
@@ -673,12 +789,12 @@ jobs:
           echo "a=$(find "$P/lib" -name '*.a' | wc -l)  so=$(find "$P/lib" -name '*.so*' | wc -l)  pc=$(find "$P/lib/pkgconfig" -name '*.pc' | wc -l)"
           miss=""
           for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
-                     fdk-aac mp3lame opus vorbis lc3 webp \
+                     fdk-aac mp3lame opus ogg vorbis lc3 webp \
                      freetype fribidi harfbuzz ass; do
             if [ -f "$P/lib/lib${lib}.a" ] || [ -e "$P/lib/lib${lib}.so" ]; then :; else
-              echo "::warning::缺 lib${lib}（.a/.so 都没有）"; miss="$miss $lib"; fi
+              echo "::warning::缺 lib${lib}"; miss="$miss $lib"; fi
           done
-          [ -z "$miss" ] && echo "✅ static prefix：所有库都在（有库即过）" || echo "⚠️ 缺：$miss"
+          [ -z "$miss" ] && echo "✅ static prefix：全部库就位" || echo "⚠️ 缺：$miss"
           exit 0
 
       - name: Normalize shared prefix (.so only)
@@ -688,7 +804,6 @@ jobs:
           P="${{ github.workspace }}/prefixes/shared"
           L="$P/lib"
           mkdir -p "$L" "$P/stray"
-          # shared 前缀里的 .a 无用；只留 .so（xeve/xevd 已在 build-libs 里合成 .so）
           find "$L" -maxdepth 1 -name '*.a' -print0 2>/dev/null |
             while IFS= read -r -d '' f; do
               echo "::warning::shared 前缀里的 .a 已移出：$(basename "$f")"
@@ -697,10 +812,10 @@ jobs:
           echo "so=$(find "$L" -name '*.so*' | wc -l)  a=$(find "$L" -name '*.a' | wc -l)  pc=$(find "$L/pkgconfig" -name '*.pc' | wc -l)"
           miss=""
           for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
-                     fdk-aac mp3lame opus vorbis lc3 webp \
+                     fdk-aac mp3lame opus ogg vorbis lc3 webp \
                      freetype fribidi harfbuzz ass; do
             if [ -e "$L/lib${lib}.so" ] || [ -f "$L/lib${lib}.a" ]; then :; else
-              echo "::warning::缺 lib${lib}（.so/.a 都没有）"; miss="$miss $lib"; fi
+              echo "::warning::缺 lib${lib}"; miss="$miss $lib"; fi
           done
 
           echo "===== 文件 ↔ SONAME ====="
@@ -727,7 +842,7 @@ jobs:
               fi
             done
           done
-          [ -z "$miss" ] && echo "✅ shared prefix：所有库都在（有库即过）" || echo "⚠️ 缺：$miss"
+          [ -z "$miss" ] && echo "✅ shared prefix：全部库就位" || echo "⚠️ 缺：$miss"
           exit 0
 
       - name: Save prefixes cache
@@ -1171,7 +1286,7 @@ jobs:
 
             文件 | 说明 |
             ---|---|
-            `ffmpeg-shared-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe,ffmpeg.sh,ffprobe.sh,lib/}`，RUNPATH=`./lib`，全部第三方 `.so` 已打齐 |
+            `ffmpeg-shared-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe,ffmpeg.sh,ffprobe.sh,lib/}`，RUNPATH=`./lib` |
             `ffmpeg-static-arm64-v8a.tar.xz` | `output/{ffmpeg,ffprobe}`，仅依赖 Android 系统库 |
             `prefix-shared-arm64-v8a.tar.xz` | 纯动态外部库（`.so` + `.pc` + `include`） |
             `prefix-static-arm64-v8a.tar.xz` | 纯静态外部库（`.a` + `.pc` + `include`） |
