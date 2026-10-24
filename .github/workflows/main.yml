@@ -2,7 +2,7 @@ name: Build external libs for Android (arm64-v8a)
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, main ]
     tags: [ 'v*' ]
   workflow_dispatch:
   schedule:
@@ -14,17 +14,16 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
-  LIBS_CACHE_VERSION: "p1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# =====================================================================
-# Job 1：外部库。每个库跑两遍：static → prefix/static，shared → prefix/shared
-# 构建完立刻用 find 做动静态分离（static 删 .so*，shared 删 .a）
-# =====================================================================
 jobs:
+  # =====================================================================
+  # Job 1：外部库。每库两遍：static → prefix/static，shared → prefix/shared
+  #        NDK 每次重新下载（与 test.yml 一致，不用任何缓存）
+  # =====================================================================
   build-libs:
     runs-on: ubuntu-latest
     strategy:
@@ -43,7 +42,7 @@ jobs:
               make -j"$(nproc)"
               make install
 
-          # ★ x265 的 ENABLE_SHARED 在交叉编译下不一定出 .so，缺则由 .a 合成
+          # x265：ENABLE_SHARED 在交叉编译下不一定出 .so → 缺则由 .a 合成
           - name: x265
             libs: "x265"
             build: |
@@ -64,7 +63,7 @@ jobs:
               if [ "$LINK" = "shared" ]; then
                 find build -name 'libx265*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
                 if [ ! -e "$PREFIX/lib/libx265.so" ] && [ -f "$PREFIX/lib/libx265.a" ]; then
-                  echo "🔧 x265: 由 libx265.a 合成 libx265.so"
+                  echo "x265: 由 libx265.a 合成 libx265.so"
                   $CXX -shared -Wl,-soname,libx265.so -o "$PREFIX/lib/libx265.so" \
                     -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive \
                     -lc++_static -lm || echo "::warning::x265: .so 合成失败"
@@ -166,7 +165,7 @@ jobs:
               cmake --install build || true
               mkpc libvvenc "Fraunhofer VVC encoder" "1.11.0" vvenc "" "-I\${includedir}/vvenc"
 
-          # ★ xeve：install 只装 .a，.so 留在 build/ → find 捞出来；仍无则用 .a 合成
+          # xeve：install 只装 .a，.so 在 build/ → 捞；仍无则用 .a 合成
           - name: xeve
             libs: "xeve"
             build: |
@@ -188,15 +187,11 @@ jobs:
               find . -maxdepth 3 -name 'xeve*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
               echo "--- xeve build 产物 ---"
               find build \( -name 'libxeve*.a' -o -name 'libxeve*.so*' \) 2>/dev/null | sort || true
-              find build -name 'libxeve.a' -exec cp -af {} "$PREFIX/lib/" \; 2>/dev/null || true
+              find build -name 'libxeve.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxeve*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
-              if [ ! -e "$PREFIX/lib/libxeve.so" ]; then
-                cand=$(find "$PREFIX/lib" -maxdepth 1 -name 'libxeve*.so*' -print -quit 2>/dev/null || true)
-                [ -n "$cand" ] && cp -aLf "$cand" "$PREFIX/lib/libxeve.so"
-              fi
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxeve.so" ] \
                  && [ -f "$PREFIX/lib/libxeve.a" ]; then
-                echo "🔧 xeve: 由 libxeve.a 合成 libxeve.so"
+                echo "xeve: 由 libxeve.a 合成 libxeve.so"
                 $CC -shared -Wl,-soname,libxeve.so -o "$PREFIX/lib/libxeve.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxeve.a" -Wl,--no-whole-archive -lm \
                   || echo "::warning::xeve: .so 合成失败"
@@ -224,22 +219,18 @@ jobs:
               find . -maxdepth 3 -name 'xevd*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
               echo "--- xevd build 产物 ---"
               find build \( -name 'libxevd*.a' -o -name 'libxevd*.so*' \) 2>/dev/null | sort || true
-              find build -name 'libxevd.a' -exec cp -af {} "$PREFIX/lib/" \; 2>/dev/null || true
+              find build -name 'libxevd.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxevd*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
-              if [ ! -e "$PREFIX/lib/libxevd.so" ]; then
-                cand=$(find "$PREFIX/lib" -maxdepth 1 -name 'libxevd*.so*' -print -quit 2>/dev/null || true)
-                [ -n "$cand" ] && cp -aLf "$cand" "$PREFIX/lib/libxevd.so"
-              fi
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxevd.so" ] \
                  && [ -f "$PREFIX/lib/libxevd.a" ]; then
-                echo "🔧 xevd: 由 libxevd.a 合成 libxevd.so"
+                echo "xevd: 由 libxevd.a 合成 libxevd.so"
                 $CC -shared -Wl,-soname,libxevd.so -o "$PREFIX/lib/libxevd.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxevd.a" -Wl,--no-whole-archive -lm \
                   || echo "::warning::xevd: .so 合成失败"
               fi
               mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd "" "-I\${includedir}/xevd"
 
-          # ★ openssl：static=no-shared，shared=shared；provider/engine 模块一律清掉
+          # openssl：static=no-shared，shared=shared；provider/engine 模块一律清掉
           - name: openssl
             libs: "ssl crypto"
             build: |
@@ -258,13 +249,12 @@ jobs:
               echo "--- openssl 构建后 ---"
               ls -1 "$PREFIX/lib" | sort | grep -E 'ssl|crypto' || true
               for l in crypto ssl; do
-                if [ "$LINK" = "shared" ]; then
-                  if [ ! -e "$PREFIX/lib/lib${l}.so" ] && [ -f "$PREFIX/lib/lib${l}.a" ]; then
-                    echo "🔧 openssl: 由 lib${l}.a 合成 lib${l}.so"
-                    $CC -shared -Wl,-soname,"lib${l}.so" -o "$PREFIX/lib/lib${l}.so" \
-                      -Wl,--whole-archive "$PREFIX/lib/lib${l}.a" -Wl,--no-whole-archive \
-                      -ldl -pthread || echo "::warning::openssl: lib${l}.so 合成失败"
-                  fi
+                if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/lib${l}.so" ] \
+                   && [ -f "$PREFIX/lib/lib${l}.a" ]; then
+                  echo "openssl: 由 lib${l}.a 合成 lib${l}.so"
+                  $CC -shared -Wl,-soname,"lib${l}.so" -o "$PREFIX/lib/lib${l}.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/lib${l}.a" -Wl,--no-whole-archive \
+                    -ldl -pthread || echo "::warning::openssl: lib${l}.so 合成失败"
                 fi
               done
               for f in "$PREFIX"/lib/pkgconfig/*.pc; do
@@ -309,26 +299,35 @@ jobs:
               cd opus
               make distclean >/dev/null 2>&1 || true
               [ -x configure ] || ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" $LTOPT --with-pic
+              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
+                --build=x86_64-pc-linux-gnu \
+                CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP" \
+                CFLAGS="$EXTRA_CFLAGS" LDFLAGS="" \
+                $LTOPT --with-pic
               make -j"$(nproc)"
               make install
 
           - name: vorbis
             libs: "ogg vorbis vorbisenc vorbisfile"
             build: |
-              [ -d ogg ] || git clone --depth 1 https://github.com/xiph/ogg.git ogg
-              cd ogg
-              make distclean >/dev/null 2>&1 || true
-              [ -x configure ] || ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" $LTOPT --with-pic
-              make -j"$(nproc)" && make install
-              cd ..
-              [ -d vorbis ] || git clone --depth 1 https://github.com/xiph/vorbis.git vorbis
-              cd vorbis
-              make distclean >/dev/null 2>&1 || true
-              [ -x configure ] || ./autogen.sh
-              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" $LTOPT --with-pic
-              make -j"$(nproc)" && make install
+              v_build() {
+                local dir="$1" url="$2"
+                [ -d "$dir" ] || git clone --depth 1 "$url" "$dir"
+                (
+                  cd "$dir"
+                  git clean -xdf >/dev/null 2>&1 || true
+                  autoreconf -fiv >/dev/null 2>&1 || autoreconf -fiv
+                  ./configure --prefix="$PREFIX" --build=x86_64-pc-linux-gnu \
+                    --host="$ANDROID_TRIPLE" \
+                    CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP" \
+                    CFLAGS="$EXTRA_CFLAGS" CXXFLAGS="$EXTRA_CFLAGS" LDFLAGS="" \
+                    $LTOPT --with-pic
+                  make -j"$(nproc)"
+                  make install
+                )
+              }
+              v_build ogg    https://github.com/xiph/ogg.git
+              v_build vorbis https://github.com/xiph/vorbis.git
 
           - name: lc3
             libs: "lc3"
@@ -362,8 +361,7 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          # ★ 文本链：FreeType → FriBidi → HarfBuzz → libass
-          #   shared 变体给 libass 写 -Wl,-rpath,.（运行时从进程当前目录找依赖）
+          # 文本链：完全照搬 test.yml 的 build_stack
           - name: text-stack
             libs: "freetype fribidi harfbuzz ass"
             build: |
@@ -377,7 +375,6 @@ jobs:
 
               BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
 
-              # ★ shared：-Wl,-rpath,.（不加引号，避免单引号污染 RUNPATH）
               BASE_LDFLAGS="-L$PREFIX/lib"
               if [ "$LINK" = "shared" ]; then
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
@@ -501,51 +498,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore prefix cache
-        id: cache-prefix
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/prefix
-          key: ${{ runner.os }}-libs-prefix-${{ env.LIBS_CACHE_VERSION }}
-
+      # 宿主依赖：与 test.yml 完全一致
       - name: Install host dependencies
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip gperf gettext \
-            python3-pip xz-utils
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool pkg-config \
+            nasm yasm cmake meson ninja-build git wget unzip \
+            gperf gettext libexpat1-dev python3-pip xz-utils
 
       - name: Upgrade meson
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           python3 -m pip install --user --break-system-packages -U "meson>=1.4"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/meson" --version
 
-      - name: Cache NDK
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ndk
-          key: ${{ runner.os }}-ndk-${{ env.NDK_VERSION }}
-
-      - name: Restore NDK permissions (cache hit)
-        if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit == 'true'
-        run: chmod -R +x "${{ github.workspace }}/ndk"
-
-      - name: Download NDK (cache miss)
-        if: steps.cache-prefix.outputs.cache-hit != 'true' && steps.cache-ndk.outputs.cache-hit != 'true'
+      # ★ 与 test.yml 一致：每次重新下载解压 NDK（不使用任何缓存）
+      - name: Download and Unpack NDK
         run: |
+          set -euo pipefail
+          df -h / | tail -1
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
           mv android-ndk-r30* "${{ github.workspace }}/ndk"
           rm -f ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
+          df -h / | tail -1
 
       - name: Set toolchain env
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
           {
@@ -562,8 +542,17 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
+      # ★ 冒烟测试：先确认编译器能出可执行文件，再谈各库构建
+      - name: Verify toolchain
+        run: |
+          set -euxo pipefail
+          printf 'int main(void){return 0;}\n' > /tmp/smoke.c
+          "$CC" /tmp/smoke.c -o /tmp/smoke.out
+          file /tmp/smoke.out
+          "$CXX" /tmp/smoke.c -o /tmp/smoke.out
+          echo "✅ 编译器可正常创建可执行文件"
+
       - name: Install mkpc helper
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$HOME/.local/bin"
           {
@@ -599,34 +588,52 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           rm -rf /tmp/mkpc_selftest && mkdir -p /tmp/mkpc_selftest
           PREFIX=/tmp/mkpc_selftest LINK=shared "$HOME/.local/bin/mkpc" selftest "self test" 0 selftestlib
-          test -f /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc || { echo "::error::mkpc helper broken"; exit 1; }
-          cat /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc
+          test -f /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc
 
       - name: Build ${{ matrix.name }} (static + shared)
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         shell: bash
         env:
           LIBS: ${{ matrix.libs }}
         run: |
           set -euo pipefail
+
+          # 失败时自动 dump config.log / CMakeError.log，别再靠猜
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            if [ "$rc" -ne 0 ]; then
+              echo "::group::失败诊断 — ${{ matrix.name }} [$LINK]"
+              find "${{ github.workspace }}" -maxdepth 5 -name config.log \
+                   -not -path "*/ndk/*" -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f ==============="; tail -60 "$f"
+                done
+              find "${{ github.workspace }}" -maxdepth 6 -name CMakeError.log -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f ==============="; tail -40 "$f"
+                done
+              echo "::endgroup::"
+            fi
+            exit $rc
+          }
+          trap on_exit EXIT
+
           cat > /tmp/lib_build.sh <<'__LIB_EOF__'
           ${{ matrix.build }}
           __LIB_EOF__
           sed -n '1,5p' /tmp/lib_build.sh
           bash -n /tmp/lib_build.sh || { echo "::error::拼装后的构建脚本有语法错误"; exit 1; }
 
-          # ★ 动静态分离：用 find 决定每个前缀里留什么
+          # 动静态分离
           separate() {
             local link="$1" prefix="$2"
             [ -d "$prefix" ] || return 0
             if [ "$link" = "static" ]; then
-              # static：清运行时模块目录，只留 .a
               find "$prefix" -type d \( -name 'ossl-modules' -o -name 'engines-*' \) \
                 -exec rm -rf {} + 2>/dev/null || true
               find "$prefix/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) \
                 -print -delete 2>/dev/null || true
             else
-              # shared：只留 .so*
               find "$prefix/lib" -maxdepth 1 -name '*.a' -print -delete 2>/dev/null || true
             fi
           }
@@ -659,14 +666,13 @@ jobs:
           run_variant shared "$PREFIX_SHARED"
 
           echo "--- ${{ matrix.name }} static ---"
-          find "$PREFIX_STATIC/lib" -maxdepth 1 -type f \
-            -o -maxdepth 1 -type l 2>/dev/null | grep -Ei "$(echo $LIBS | tr ' ' '|')" || true
+          find "$PREFIX_STATIC/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
+            | grep -Ei "$(echo $LIBS | tr ' ' '|')" || true
           echo "--- ${{ matrix.name }} shared ---"
           find "$PREFIX_SHARED/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
             | grep -Ei "$(echo $LIBS | tr ' ' '|')" || true
 
       - name: Upload prefix
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: lib-${{ matrix.name }}
@@ -676,21 +682,13 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 2：合并 + 用 find 二次分离 + 打包 prefix/{shared,static}
+  # Job 2：合并 + find 二次分离 + 打包 prefix/{static,shared}
   # =====================================================================
   package:
     needs: build-libs
     runs-on: ubuntu-latest
     steps:
-      - name: Restore prefix cache
-        id: cache-prefix
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/prefix
-          key: ${{ runner.os }}-libs-prefix-${{ env.LIBS_CACHE_VERSION }}
-
       - name: Download per-lib prefixes
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: lib-*
@@ -705,7 +703,6 @@ jobs:
           mkdir -p "$P/static/lib/pkgconfig" "$P/static/include" \
                    "$P/shared/lib/pkgconfig" "$P/shared/include" "$P/_stray"
 
-          # ---------- static：只留 .a / include / pkgconfig ----------
           find "$P/static" -type d \( -name 'ossl-modules' -o -name 'engines-*' \) \
             -exec rm -rf {} + 2>/dev/null || true
           find "$P/static/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null |
@@ -714,14 +711,12 @@ jobs:
               mv -f "$f" "$P/_stray/" 2>/dev/null || true
             done
 
-          # ---------- shared：只留 .so* ----------
           find "$P/shared/lib" -maxdepth 1 -name '*.a' -print0 2>/dev/null |
             while IFS= read -r -d '' f; do
               echo "::warning::shared 里移出 .a：$(basename "$f")"
               mv -f "$f" "$P/_stray/" 2>/dev/null || true
             done
 
-          # ---------- 把 .pc 里的绝对路径改成可移植的 ${pcfiledir}/../.. ----------
           rel='${pcfiledir}/../..'
           for d in static shared; do
             find "$P/$d/lib/pkgconfig" -name '*.pc' -print0 2>/dev/null |
@@ -762,24 +757,12 @@ jobs:
           rm -rf "$P/_stray"
           exit 0
 
-      - name: Save prefix cache
-        if: steps.cache-prefix.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/prefix
-          key: ${{ runner.os }}-libs-prefix-${{ env.LIBS_CACHE_VERSION }}
-
       - name: Pack prefix (single tarball)
         run: |
           set -euo pipefail
           cd "${{ github.workspace }}"
           tar -I 'xz -9e -T0' -cf "prefix-arm64-v8a-api${API_LEVEL}.tar.xz" prefix
           ls -lh prefix-arm64-v8a-api${API_LEVEL}.tar.xz
-          echo "===== 内容概览 ====="
-          tar -tf "prefix-arm64-v8a-api${API_LEVEL}.tar.xz" | awk -F/ '
-            NF<=3 {print}
-            NF>3 && $2!="" {k=$1"/"$2"/"$3; if(!(k in s)){s[k]=1; print k "/..."}}
-          ' | head -40
 
       - name: Upload merged prefix
         uses: actions/upload-artifact@v4
@@ -842,8 +825,6 @@ jobs:
             export PKG_CONFIG_PATH=$PWD/prefix/shared/lib/pkgconfig
             pkg-config --libs --cflags libass freetype2 harfbuzz fribidi
             ```
-
-            > `.pc` 内的路径已改为 `${pcfiledir}/../..`，解压到任意目录都可用。
           files: |
             artifacts/*.tar.xz
             artifacts/SHA256SUMS.txt
