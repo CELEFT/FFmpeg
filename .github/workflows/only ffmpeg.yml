@@ -126,7 +126,8 @@ jobs:
             echo "PREFIX_LAYOUT=$LAYOUT"
           } >> "$GITHUB_ENV"
 
-      # ★ 补齐缺失的 pkg-config 模块（x264 无 .pc / OpenSSL 无 openssl.pc / webp 缺 sharpyuv）
+      # 补齐缺失的 pkg-config 模块
+      # 注意：libass 安装的是 libass.pc，模块名是 libass（不是 ass）
       - name: Preflight pkg-config & shim missing modules
         shell: bash
         run: |
@@ -139,7 +140,7 @@ jobs:
             echo "===== [$PREFIX] pkg-config 清点 ====="
             for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
                      libwebp fdk-aac lame opus vorbis lc3 \
-                     ass freetype2 fribidi harfbuzz openssl; do
+                     libass freetype2 fribidi harfbuzz openssl; do
               if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null; then
                 printf '  %-12s ok  %s\n' "$m" "$(PKG_CONFIG_LIBDIR="$PC" pkg-config --modversion "$m" 2>/dev/null)"
               else
@@ -198,7 +199,7 @@ jobs:
             echo "===== [$PREFIX] 断言 ====="
             bad=0
             for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
-                     libwebp openssl ass freetype2 fribidi harfbuzz \
+                     libwebp openssl libass freetype2 fribidi harfbuzz \
                      fdk-aac lame opus vorbis lc3; do
               PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null || {
                 echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
@@ -234,8 +235,8 @@ jobs:
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
-          # ★ $ORIGIN/lib + --enable-new-dtags（→ DT_RUNPATH）
-          #   链接期先写一遍；最终由 patchelf 强制收口（configure 会 eval 展开 $ORIGIN）
+          # $ORIGIN/lib + --enable-new-dtags（→ DT_RUNPATH）
+          # 链接期先写一遍；最终由 patchelf 强制收口（configure 会 eval 展开 $ORIGIN）
           LD_SHARED="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
           LD_SHARED="$LD_SHARED -Wl,--enable-new-dtags,-rpath,\$ORIGIN/lib"
 
@@ -367,7 +368,7 @@ jobs:
 
           echo "✅ shared 构建完成"
 
-      # ★ 全量 RUNPATH 收口：不依赖 configure 是否把 $ORIGIN 展开坏
+      # 全量 RUNPATH 收口：不依赖 configure 是否把 $ORIGIN 展开坏
       - name: Rewrite RUNPATH (patchelf)
         run: |
           set -euo pipefail
@@ -388,7 +389,7 @@ jobs:
             printf '  %-42s %s\n' "$b" "$(patchelf --print-rpath "output/$b")"
           done
 
-          echo "===== 3. 复核：任何 '.' / './lib' / 空 rpath 都算失败 ====="
+          echo "===== 3. 复核：必须含 \$ORIGIN ====="
           bad=0
           while IFS= read -r f; do
             rp="$(patchelf --print-rpath "$f" 2>/dev/null || true)"
@@ -453,19 +454,27 @@ jobs:
           [ $fail -eq 0 ] && echo "✅ shared 依赖自洽"
           exit $fail
 
+      # 判据：每个 LOAD 段的 p_align 数值必须 >= 0x4000（16384）
+      # 不能用字符串包含 0x1000，因为 0x10000（64KB）也含该子串
       - name: Report 16KB page alignment (shared)
         run: |
           set -uo pipefail
           bad=0
           for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
             [ -f "$f" ] || continue
-            al="$(readelf -lW "$f" 2>/dev/null | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')"
-            case "$al" in
-              *0x1000*) echo "::warning::$(basename "$f") 含 4KB 段: $al"; bad=1 ;;
-            esac
-            echo "$(printf '%-46s' "$(basename "$f")") -> ${al:-unknown}"
+            aligns="$(readelf -lW "$f" 2>/dev/null | awk '$1=="LOAD"{print $NF}' | sort -u)"
+            [ -n "$aligns" ] || { echo "::warning::$(basename "$f") 无 LOAD 段"; continue; }
+            ok=1
+            for a in $aligns; do
+              v=$((a))
+              [ "$v" -ge 16384 ] || { ok=0; echo "::error::$(basename "$f") 存在 $a (< 0x4000) 的 LOAD 段"; bad=1; }
+            done
+            if [ "$ok" -eq 1 ]; then
+              printf '%-46s -> %s ✅\n' "$(basename "$f")" "$(echo $aligns | tr '\n' ' ')"
+            fi
           done
-          [ "$bad" -eq 0 ] && echo "✅ 全部 16KB 合规"
+          [ "$bad" -eq 0 ] && echo "✅ 全部 LOAD 段 p_align ≥ 0x4000，16KB 合规"
+          exit $bad
 
       - name: Package (shared)
         run: |
@@ -481,7 +490,7 @@ jobs:
           retention-days: 7
 
   # =====================================================================
-  # STATIC：全静态，libc++_static，无 RUNPATH
+  # STATIC：全静态，libc++_static + libc++abi，无 RUNPATH
   # =====================================================================
   build-static:
     name: build-ffmpeg (static)
@@ -525,7 +534,11 @@ jobs:
           printf 'int main(void){return 0;}\n' > /tmp/smoke.c
           "$CC" /tmp/smoke.c -o /tmp/smoke.out
           file /tmp/smoke.out
-          echo "✅ NDK 可用"
+          # 静态链接需要 libc++_static.a + libc++abi.a 两个归档
+          SYS_LIB="$TC/sysroot/usr/lib/${ANDROID_TRIPLE}"
+          for a in libc++_static.a libc++abi.a; do
+            [ -f "$SYS_LIB/$a" ] && echo "✅ $a" || echo "::warning::缺少 $SYS_LIB/$a"
+          done
 
       - name: Download and extract prefix
         run: |
@@ -593,7 +606,7 @@ jobs:
             echo "===== [$PREFIX] pkg-config 清点 ====="
             for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
                      libwebp fdk-aac lame opus vorbis lc3 \
-                     ass freetype2 fribidi harfbuzz openssl; do
+                     libass freetype2 fribidi harfbuzz openssl; do
               if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null; then
                 printf '  %-12s ok\n' "$m"
               else
@@ -649,7 +662,7 @@ jobs:
             echo "===== [$PREFIX] 断言 ====="
             bad=0
             for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
-                     libwebp openssl ass freetype2 fribidi harfbuzz \
+                     libwebp openssl libass freetype2 fribidi harfbuzz \
                      fdk-aac lame opus vorbis lc3; do
               PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null || {
                 echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
@@ -702,7 +715,19 @@ jobs:
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
+          # 静态：只保留 -L 与 rpath-link，刻意不加 -rpath
           LD_STATIC="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
+
+          # NDK 的 C++ 运行时拆成两个归档，缺一不可：
+          #   libc++_static.a → std::__ndk1::*、operator new/delete、std::terminate
+          #   libc++abi.a     → __cxa_throw / __cxa_begin_catch / typeinfo for __class_type_info
+          # 且两者互相引用（异常对象 typeinfo 需要 std::terminate，反之需要 __cxa_*）
+          # → 必须用 --start-group/--end-group 让链接器回扫一轮
+          CXX_STATIC="-Wl,--start-group -lc++_static -lc++abi -Wl,--end-group"
+
+          for a in libc++_static.a libc++abi.a; do
+            [ -f "$SYS_LIB/$a" ] || echo "::warning::缺少 $SYS_LIB/$a"
+          done
 
           echo "🔧 修正 pkg-config 与头文件路径 (PREFIX=$PREFIX)..."
           PC="$PREFIX/lib/pkgconfig"; mkdir -p "$PC"
@@ -723,6 +748,16 @@ jobs:
               sed -i "s|^Cflags:.*|& $SUBDIRS|" "$f"
             fi
           done
+
+          # mkpc 生成的 .pc 的 Libs.private 只有 -lc++_static，静态链接还需要 libc++abi
+          echo "🔧 .pc 私有依赖补 -lc++abi"
+          while IFS= read -r pc; do
+            grep -q -- '-lc++abi' "$pc" && continue
+            if grep -q -- '-lc++_static' "$pc"; then
+              sed -i 's|-lc++_static|-lc++_static -lc++abi|g' "$pc"
+              echo "   patched $(basename "$pc")"
+            fi
+          done < <(find "$PC" -maxdepth 1 -name '*.pc')
 
           if [ -d "$PREFIX/include" ]; then
             find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 |
@@ -780,7 +815,7 @@ jobs:
               --disable-doc --disable-debug \
               --extra-cflags="-I$PREFIX/include -fPIC" \
               --extra-ldflags="$LD_STATIC" \
-              --extra-libs="-lc++_static -lm -lz -ldl" ; then
+              --extra-libs="$CXX_STATIC -lm -lz -ldl" ; then
             echo "::group::configure failed"
             tail -n 160 ffbuild/config.log || true
             echo "::endgroup::"
@@ -801,7 +836,8 @@ jobs:
             echo "FFmpeg Version: $FFMPEG_VERSION"
             echo "NDK Version   : ${{ env.NDK_VERSION }} (API $API_LEVEL)"
             echo "Prefix Used   : $PREFIX"
-            echo "C++ Runtime   : libc++_static (linked in)"
+            echo "C++ Runtime   : libc++_static + libc++abi (linked in)"
+            echo "RPath         : (none, by design)"
             echo "======================================"
             file "$OUTPUT/ffmpeg" || true
             readelf -d "$OUTPUT/ffmpeg" 2>/dev/null | grep NEEDED || echo "No dynamic dependencies"
@@ -842,8 +878,38 @@ jobs:
             echo "✅ 无 RUNPATH/RPATH"
           fi
 
-          [ $fail -eq 0 ] && echo "✅ static 验收通过"
+          echo "===== 4. 不应残留未解析的 C++ 符号 ====="
+          if nm -u output/ffmpeg 2>/dev/null | grep -qE '_Z|__cxa_|__gxx_'; then
+            echo "::error::存在未解析的 C++ 符号，libc++abi 可能仍缺失"
+            nm -u output/ffmpeg 2>/dev/null | grep -E '_Z|__cxa_|__gxx_' | head -20
+            fail=1
+          else
+            echo "✅ 无未定义 C++ 符号"
+          fi
+
+          [ $fail -eq 0 ] && echo "✅ static 验收通过：仅依赖 Android 系统库"
           exit $fail
+
+      # 判据：每个 LOAD 段的 p_align 数值必须 >= 0x4000（16384）
+      - name: Report 16KB page alignment (static)
+        run: |
+          set -uo pipefail
+          bad=0
+          for f in output/ffmpeg output/ffprobe; do
+            [ -f "$f" ] || continue
+            aligns="$(readelf -lW "$f" 2>/dev/null | awk '$1=="LOAD"{print $NF}' | sort -u)"
+            [ -n "$aligns" ] || { echo "::warning::$(basename "$f") 无 LOAD 段"; continue; }
+            ok=1
+            for a in $aligns; do
+              v=$((a))
+              [ "$v" -ge 16384 ] || { ok=0; echo "::error::$(basename "$f") 存在 $a (< 0x4000) 的 LOAD 段"; bad=1; }
+            done
+            if [ "$ok" -eq 1 ]; then
+              printf '%-30s -> %s ✅\n' "$(basename "$f")" "$(echo $aligns | tr '\n' ' ')"
+            fi
+          done
+          [ "$bad" -eq 0 ] && echo "✅ 全部 LOAD 段 p_align ≥ 0x4000，16KB 合规"
+          exit $bad
 
       - name: Package (static)
         run: |
@@ -901,13 +967,13 @@ jobs:
 
             - **RUNPATH**：`ffmpeg` / `ffprobe` 为 `$ORIGIN/lib`，每个 `.so` 为 `$ORIGIN`
               → 与工作目录完全无关，`cd /anywhere && /path/to/output/ffmpeg -version` 均可运行
-            - C++ 运行时：第三方库的 libc++ 已静态链入并隐藏符号，通常无需 `libc++_shared.so`
+            - C++ 运行时：第三方库的 libc++ 已静态链入并隐藏符号，无需 `libc++_shared.so`
 
             ```
             output/
             ├── ffmpeg          <-- RUNPATH=$ORIGIN/lib
             ├── ffprobe
-            ├── ffmpeg.sh       <-- 可选 wrapper
+            ├── ffmpeg.sh       <-- 可选 wrapper（LD_LIBRARY_PATH 兜底）
             ├── ffprobe.sh
             ├── lib/            <-- libav*.so + 第三方 .so（各自 RUNPATH=$ORIGIN）
             └── BUILD_INFO.txt
@@ -915,14 +981,21 @@ jobs:
 
             ### 2. `ffmpeg-static-arm64-v8a.tar.xz`（静态）
 
-            - C++ 运行时：`libc++_static`（已链入）
+            - C++ 运行时：`libc++_static.a` + `libc++abi.a`（`--start-group` 解互相引用）
             - 无 `lib/`、无 RUNPATH，仅依赖 Android 系统库
+
+            ```
+            output/
+            ├── ffmpeg
+            ├── ffprobe
+            └── BUILD_INFO.txt
+            ```
 
             ### 质量校验
 
-            - 16 KB 页对齐：`LOAD` 段 `p_align = 0x4000`
+            - 16 KB 页对齐：所有 `LOAD` 段 `p_align ≥ 0x4000`
             - shared：全部 RUNPATH 为 `$ORIGIN` 系；非系统 `NEEDED` 均可由 `output/lib` 解析
-            - static：`NEEDED` 仅含 Android 系统库
+            - static：`NEEDED` 仅含 Android 系统库，且无未定义 C++ 符号
           files: |
             artifacts/*.tar.xz
             artifacts/SHA256SUMS.txt
