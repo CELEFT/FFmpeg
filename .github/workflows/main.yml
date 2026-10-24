@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
   schedule:
     # 每周三 12:00 (UTC+3) = 周三 09:00 UTC
-    # 若要「周三 UTC+3 的 00:00」，改成 '0 21 * * 2'
     - cron: '0 9 * * 3'
 
 env:
@@ -21,9 +20,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # =====================================================================
-  # Job 1：外部库。每库两遍：static → prefix/static，shared → prefix/shared
-  # =====================================================================
   build-libs:
     runs-on: ubuntu-latest
     strategy:
@@ -41,6 +37,8 @@ jobs:
                 $LTOPT --enable-pic --disable-cli
               make -j"$(nproc)"
               make install
+              # x264 从不安装 .pc，FFmpeg 的 require_pkg_config 会直接失败 → 必须补
+              mkpc x264 "H.264/AVC encoder" "164" x264 "-lm -ldl -lpthread"
 
           - name: x265
             libs: "x265"
@@ -63,7 +61,9 @@ jobs:
                 find build -name 'libx265*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
                 if [ ! -e "$PREFIX/lib/libx265.so" ] && [ -f "$PREFIX/lib/libx265.a" ]; then
                   echo "x265: 由 libx265.a 合成 libx265.so"
-                  $CXX -shared -Wl,-soname,libx265.so -o "$PREFIX/lib/libx265.so" \
+                  $CXX -shared -Wl,-soname,libx265.so \
+                    -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                    -o "$PREFIX/lib/libx265.so" \
                     -Wl,--whole-archive "$PREFIX/lib/libx265.a" -Wl,--no-whole-archive \
                     -lc++_static -lm || echo "::warning::x265: .so 合成失败"
                 fi
@@ -190,7 +190,9 @@ jobs:
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxeve.so" ] \
                  && [ -f "$PREFIX/lib/libxeve.a" ]; then
                 echo "xeve: 由 libxeve.a 合成 libxeve.so"
-                $CC -shared -Wl,-soname,libxeve.so -o "$PREFIX/lib/libxeve.so" \
+                $CC -shared -Wl,-soname,libxeve.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                  -o "$PREFIX/lib/libxeve.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxeve.a" -Wl,--no-whole-archive -lm \
                   || echo "::warning::xeve: .so 合成失败"
               fi
@@ -222,7 +224,9 @@ jobs:
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxevd.so" ] \
                  && [ -f "$PREFIX/lib/libxevd.a" ]; then
                 echo "xevd: 由 libxevd.a 合成 libxevd.so"
-                $CC -shared -Wl,-soname,libxevd.so -o "$PREFIX/lib/libxevd.so" \
+                $CC -shared -Wl,-soname,libxevd.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                  -o "$PREFIX/lib/libxevd.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxevd.a" -Wl,--no-whole-archive -lm \
                   || echo "::warning::xevd: .so 合成失败"
               fi
@@ -249,7 +253,9 @@ jobs:
                 if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/lib${l}.so" ] \
                    && [ -f "$PREFIX/lib/lib${l}.a" ]; then
                   echo "openssl: 由 lib${l}.a 合成 lib${l}.so"
-                  $CC -shared -Wl,-soname,"lib${l}.so" -o "$PREFIX/lib/lib${l}.so" \
+                  $CC -shared -Wl,-soname,"lib${l}.so" \
+                    -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                    -o "$PREFIX/lib/lib${l}.so" \
                     -Wl,--whole-archive "$PREFIX/lib/lib${l}.a" -Wl,--no-whole-archive \
                     -ldl -pthread || echo "::warning::openssl: lib${l}.so 合成失败"
                 fi
@@ -339,7 +345,9 @@ jobs:
               if [ "$LINK" = "static" ]; then
                 $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
               else
-                $CC -shared -Wl,-soname,liblc3.so -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
+                $CC -shared -Wl,-soname,liblc3.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                  -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
               fi
               find include -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
               mkpc liblc3 "Low Complexity Communication Codec" "1.1.0" lc3 "-lm"
@@ -358,6 +366,7 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
+          # 文本链：RUNPATH 用 $ORIGIN（不是 .），并对产物做 patchelf 归一化
           - name: text-stack
             libs: "freetype fribidi harfbuzz ass"
             build: |
@@ -373,7 +382,9 @@ jobs:
 
               BASE_LDFLAGS="-L$PREFIX/lib"
               if [ "$LINK" = "shared" ]; then
-                BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
+                # ★ 根治点：$ORIGIN = 库自身所在目录；. = 进程当前目录（错）
+                #   \$ 转义，避免被 shell 提前展开；--enable-new-dtags → DT_RUNPATH
+                BASE_LDFLAGS="$BASE_LDFLAGS -Wl,--enable-new-dtags,-rpath,\$ORIGIN"
               fi
 
               echo "### FreeType ($LINK)"
@@ -474,13 +485,26 @@ jobs:
                 make install
               )
 
+              # ★ 归一化：autoconf 可能把 $ORIGIN 展开坏，用 patchelf 兜死
               if [ "$LINK" = "shared" ]; then
-                echo "--- libass.so RUNPATH ---"
-                readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -E 'RUNPATH|RPATH' || echo "  (none)"
-                if readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -qE '\[\.\]'; then
-                  echo "✅ libass.so RUNPATH 含 [.]"
+                echo "### RUNPATH 归一化"
+                while IFS= read -r so; do
+                  [ -e "$so" ] || continue
+                  if command -v patchelf >/dev/null 2>&1; then
+                    patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+                    printf '  %-30s %s\n' "$(basename "$so")" "$(patchelf --print-rpath "$so" 2>/dev/null)"
+                  else
+                    printf '  %-30s %s\n' "$(basename "$so")" \
+                      "$(readelf -d "$so" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+                  fi
+                done < <(find "$PREFIX/lib" -maxdepth 1 -name '*.so*' -type f)
+
+                echo "--- libass.so RUNPATH 断言 ---"
+                if readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -q '\$ORIGIN'; then
+                  echo "✅ libass.so RUNPATH 含 \$ORIGIN"
                 else
-                  echo "::warning::libass.so RUNPATH 未含 [.]"
+                  echo "::error::libass.so RUNPATH 不含 \$ORIGIN（会导致换目录后找不到依赖）"
+                  exit 1
                 fi
               fi
               echo "✅ text-stack [$LINK] ok"
@@ -494,7 +518,7 @@ jobs:
           sudo apt-get install -y \
             build-essential autoconf automake libtool pkg-config \
             nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext libexpat1-dev python3-pip xz-utils
+            gperf gettext libexpat1-dev python3-pip xz-utils patchelf
 
       - name: Upgrade meson
         run: |
@@ -580,12 +604,9 @@ jobs:
       - name: Build ${{ matrix.name }} (static + shared)
         shell: bash
         env:
-          # 不能叫 LIBS：autoconf 会把环境里的 LIBS 拼进试链接命令
           CHECK_LIBS: ${{ matrix.libs }}
         run: |
           set -euo pipefail
-
-          # 双保险：即使外部还有同名变量，也不许污染 configure
           unset LIBS LIBS_PRIVATE LDFLAGS CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
 
           on_exit() {
@@ -671,9 +692,6 @@ jobs:
             ${{ github.workspace }}/prefix/shared
           retention-days: 1
 
-  # =====================================================================
-  # Job 2：合并 + find 二次分离 + 三道校验 + 打三个包
-  # =====================================================================
   package:
     needs: build-libs
     runs-on: ubuntu-latest
@@ -684,6 +702,9 @@ jobs:
           pattern: lib-*
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
+
+      - name: Install patchelf
+        run: sudo apt-get update && sudo apt-get install -y patchelf
 
       - name: Normalize prefix with find
         shell: bash
@@ -716,6 +737,14 @@ jobs:
               done
           done
 
+          # ★ 全量 RUNPATH 归一化：shared 侧每个 .so 统一 $ORIGIN
+          echo "===== RUNPATH 归一化（shared）====="
+          while IFS= read -r f; do
+            cur="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+            patchelf --set-rpath '$ORIGIN' "$f"
+            printf '  %-34s %-12s -> %s\n' "$(basename "$f")" "${cur:-(none)}" "$(patchelf --print-rpath "$f")"
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+
           echo "===== 统计 ====="
           for d in static shared; do
             echo "[$d] a=$(find "$P/$d/lib" -maxdepth 1 -name '*.a' | wc -l)" \
@@ -737,7 +766,18 @@ jobs:
           done
           [ -z "$miss" ] && echo "✅ 全部库动静态都齐全" || echo "⚠️ 缺：$miss"
 
-          echo "===== 16KB 对齐检查（全部应为 0x4000）====="
+          echo "===== x264.pc 检查（FFmpeg 静态必需）====="
+          for d in static shared; do
+            if [ -e "$P/$d/lib/libx264.a" ] || [ -e "$P/$d/lib/libx264.so" ]; then
+              if [ -e "$P/$d/lib/pkgconfig/x264.pc" ]; then
+                echo "✅ [$d] x264.pc 存在"
+              else
+                echo "::error::[$d] 缺 x264.pc，FFmpeg 的 require_pkg_config 会失败"
+              fi
+            fi
+          done
+
+          echo "===== 16KB 对齐检查 ====="
           bad=0
           while IFS= read -r f; do
             al=$(readelf -lW "$f" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
@@ -756,7 +796,7 @@ jobs:
               leak=1
             fi
           done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
-          [ "$leak" -eq 0 ] && echo "✅ 无 libc++ 符号泄漏（无需分发 libc++_shared.so）"
+          [ "$leak" -eq 0 ] && echo "✅ 无 libc++ 符号泄漏"
 
           rm -rf "$P/_stray"
           exit 0
@@ -781,9 +821,6 @@ jobs:
             ${{ github.workspace }}/prefix
           retention-days: 2
 
-  # =====================================================================
-  # Job 3：发布到本仓库 Release（固定 tag ffmpeg-lib，资产每次覆盖）
-  # =====================================================================
   release:
     needs: package
     runs-on: ubuntu-latest
@@ -845,13 +882,13 @@ jobs:
             echo "| API Level | ${API_LEVEL} |"
             echo "| ABI | arm64-v8a |"
             echo "| 提交 | [\`${SHORT_SHA}\`](/${{ github.repository }}/commit/${{ github.sha }}) |"
-            echo "| 触发方式 | ${{ github.event_name }} |"
             echo
             echo "### 质量校验"
             echo
             echo "- 16 KB 页对齐：全部 \`.so\` 的 LOAD 段 \`p_align = 0x4000\` ✅"
-            echo "- libc++：静态链接且符号已隐藏，**无需分发 \`libc++_shared.so\`** ✅"
-            echo "- libass：shared 侧 RUNPATH 含 \`\${ORIGIN}\`（\`-Wl,-rpath,.\`）✅"
+            echo "- RUNPATH：全部 \`.so\` 统一为 \`\$ORIGIN\`（与工作目录无关）✅"
+            echo "- x264.pc：已补齐（FFmpeg 静态链接必需）✅"
+            echo "- libc++：静态链接且符号已隐藏 ✅"
             echo
             echo "### 产物"
             echo
@@ -888,15 +925,11 @@ jobs:
             echo 'pkg-config --libs --cflags libass freetype2 harfbuzz fribidi'
             echo '```'
             echo
-            echo "> \`.pc\` 里 \`prefix=\${pcfiledir}/../..\`，解压到任意路径都能直接用。"
-            echo
-            echo "本 release 的三个资产每次构建整体覆盖更新。"
+            echo "> 所有 \`.so\` 的 RUNPATH 均为 \`\$ORIGIN\`，可放在任意目录下使用。"
           } >> release-body.md
 
-          echo "--------- release-body.md ---------"
           cat release-body.md
 
-      # 固定 tag 跟着最新构建走：删旧 ref（连带旧 release）再重建
       - name: Delete existing tag/release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
