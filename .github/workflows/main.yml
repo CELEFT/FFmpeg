@@ -498,7 +498,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 宿主依赖：与 test.yml 完全一致
       - name: Install host dependencies
         run: |
           sudo apt-get update
@@ -513,7 +512,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/meson" --version
 
-      # ★ 与 test.yml 一致：每次重新下载解压 NDK（不使用任何缓存）
+      # 与 test.yml 一致：每次重新下载解压 NDK（不使用任何缓存）
       - name: Download and Unpack NDK
         run: |
           set -euo pipefail
@@ -542,7 +541,7 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      # ★ 冒烟测试：先确认编译器能出可执行文件，再谈各库构建
+      # 冒烟测试：先确认编译器能出可执行文件，再谈各库构建
       - name: Verify toolchain
         run: |
           set -euxo pipefail
@@ -593,11 +592,16 @@ jobs:
       - name: Build ${{ matrix.name }} (static + shared)
         shell: bash
         env:
-          LIBS: ${{ matrix.libs }}
+          # ★ 不能叫 LIBS：autoconf 会把环境里的 LIBS 直接拼进试链接命令，
+          #   导致 "C compiler cannot create executables"。改名为 CHECK_LIBS。
+          CHECK_LIBS: ${{ matrix.libs }}
         run: |
           set -euo pipefail
 
-          # 失败时自动 dump config.log / CMakeError.log，别再靠猜
+          # ★ 双保险：即使外部还有同名变量，也不许污染 configure
+          unset LIBS LIBS_PRIVATE LDFLAGS CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
+
+          # 失败时打印 config.log 的「Core tests」段（真正的报错在这里，不在文件末尾）
           on_exit() {
             local rc=$?
             trap - EXIT
@@ -606,7 +610,8 @@ jobs:
               find "${{ github.workspace }}" -maxdepth 5 -name config.log \
                    -not -path "*/ndk/*" -print0 2>/dev/null |
                 while IFS= read -r -d '' f; do
-                  echo "=============== $f ==============="; tail -60 "$f"
+                  echo "=============== $f : Core tests（末 40 行）==============="
+                  awk '/^## Core tests/,/^## (Cache variables|Output variables)/' "$f" 2>/dev/null | tail -40 || true
                 done
               find "${{ github.workspace }}" -maxdepth 6 -name CMakeError.log -print0 2>/dev/null |
                 while IFS= read -r -d '' f; do
@@ -667,10 +672,10 @@ jobs:
 
           echo "--- ${{ matrix.name }} static ---"
           find "$PREFIX_STATIC/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
-            | grep -Ei "$(echo $LIBS | tr ' ' '|')" || true
+            | grep -Ei "$(echo $CHECK_LIBS | tr ' ' '|')" || true
           echo "--- ${{ matrix.name }} shared ---"
           find "$PREFIX_SHARED/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
-            | grep -Ei "$(echo $LIBS | tr ' ' '|')" || true
+            | grep -Ei "$(echo $CHECK_LIBS | tr ' ' '|')" || true
 
       - name: Upload prefix
         uses: actions/upload-artifact@v4
