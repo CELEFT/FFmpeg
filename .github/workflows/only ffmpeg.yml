@@ -27,10 +27,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# =====================================================================
-# SHARED：动态链接，库检索路径 ./lib
-# =====================================================================
 jobs:
+  # =====================================================================
+  # SHARED：动态链接，RUNPATH = $ORIGIN/lib（ffmpeg）/ $ORIGIN（各 .so）
+  # =====================================================================
   build-shared:
     name: build-ffmpeg (shared)
     runs-on: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils
+            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils patchelf
 
       - name: Cache NDK
         id: cache-ndk
@@ -80,7 +80,6 @@ jobs:
           set -euo pipefail
           W="${{ github.workspace }}"
 
-          # 默认用 release 上的 full 包（两级布局）
           FINAL_URL="${{ inputs.prefix_url }}"
           if [ -z "$FINAL_URL" ]; then
             FINAL_URL="https://github.com/CELEFT/FFmpeg/releases/download/ffmpeg-lib/ffmpeg-libs-arm64-v8a-api${API_LEVEL}-full.tar.xz"
@@ -101,10 +100,8 @@ jobs:
             exit 1
           fi
 
-          echo "----- 解压结果 -----"
           find extract_dir -maxdepth 3 -type d | sort | head -30
 
-          # ---- 归一化到 $W/prefix ----
           if [ -d "extract_dir/prefix" ]; then
             mv extract_dir/prefix "$W/prefix"
           elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
@@ -114,17 +111,12 @@ jobs:
             exit 1
           fi
 
-          # ---- 判定布局 ----
           if [ -d "$W/prefix/static" ] && [ -d "$W/prefix/shared" ]; then
-            LAYOUT="two"
-            PST="$W/prefix/static"
-            PSH="$W/prefix/shared"
+            LAYOUT="two"; PST="$W/prefix/static"; PSH="$W/prefix/shared"
             echo "✅ 检测到两级布局: prefix/{static,shared}"
           else
-            LAYOUT="flat"
-            PST="$W/prefix"
-            PSH="$W/prefix"
-            echo "::warning::检测到扁平布局，static/shared 共用同一 prefix"
+            LAYOUT="flat"; PST="$W/prefix"; PSH="$W/prefix"
+            echo "::warning::检测到扁平布局"
           fi
 
           {
@@ -134,18 +126,91 @@ jobs:
             echo "PREFIX_LAYOUT=$LAYOUT"
           } >> "$GITHUB_ENV"
 
-          echo "--- static ---"
-          find "$PST" -maxdepth 2 \( -name '*.a' -o -name '*.pc' \) | head -10 || true
-          echo "--- shared ---"
-          find "$PSH" -maxdepth 2 \( -name '*.so' -o -name '*.pc' \) | head -10 || true
+      # ★ 补齐缺失的 pkg-config 模块（x264 无 .pc / OpenSSL 无 openssl.pc / webp 缺 sharpyuv）
+      - name: Preflight pkg-config & shim missing modules
+        shell: bash
+        run: |
+          set -uo pipefail
+          for PREFIX in "${PREFIX_SHARED}" "${PREFIX_STATIC}"; do
+            [ -d "$PREFIX" ] || continue
+            PC="$PREFIX/lib/pkgconfig"
+            mkdir -p "$PC"
+
+            echo "===== [$PREFIX] pkg-config 清点 ====="
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp fdk-aac lame opus vorbis lc3 \
+                     ass freetype2 fribidi harfbuzz openssl; do
+              if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null; then
+                printf '  %-12s ok  %s\n' "$m" "$(PKG_CONFIG_LIBDIR="$PC" pkg-config --modversion "$m" 2>/dev/null)"
+              else
+                printf '  %-12s MISSING\n' "$m"
+              fi
+            done
+
+            # x264 从不安装 .pc
+            if [ ! -e "$PC/x264.pc" ] && { [ -e "$PREFIX/lib/libx264.a" ] || [ -e "$PREFIX/lib/libx264.so" ]; }; then
+              echo "🔧 生成 x264.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: x264'
+                echo 'Description: H.264/MPEG-4 AVC codec'
+                echo 'Version: 164'
+                echo 'Libs: -L${libdir} -lx264'
+                echo 'Libs.private: -lm -ldl -lpthread'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/x264.pc"
+            fi
+
+            # OpenSSL 只装 libssl.pc / libcrypto.pc
+            if [ ! -e "$PC/openssl.pc" ] && [ -e "$PC/libssl.pc" ]; then
+              echo "🔧 生成 openssl.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: openssl'
+                echo 'Description: OpenSSL shim for FFmpeg'
+                echo 'Version: 3.0.0'
+                echo 'Libs: -L${libdir} -lssl -lcrypto'
+                echo 'Libs.private: -ldl -lpthread'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/openssl.pc"
+            fi
+
+            # webp 静态需要 sharpyuv
+            if [ -e "$PC/libwebp.pc" ] && [ -e "$PREFIX/lib/libsharpyuv.a" ]; then
+              grep -q 'sharpyuv' "$PC/libwebp.pc" || {
+                echo "🔧 libwebp.pc 补 -lsharpyuv"
+                if grep -q '^Libs.private:' "$PC/libwebp.pc"; then
+                  sed -i 's|^Libs.private:.*|& -lsharpyuv|' "$PC/libwebp.pc"
+                else
+                  echo 'Libs.private: -lsharpyuv' >> "$PC/libwebp.pc"
+                fi
+              }
+            fi
+
+            echo "===== [$PREFIX] 断言 ====="
+            bad=0
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp openssl ass freetype2 fribidi harfbuzz \
+                     fdk-aac lame opus vorbis lc3; do
+              PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null || {
+                echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
+            done
+            [ "$bad" -eq 0 ] && echo "✅ 全部模块就绪 ($PREFIX)"
+          done
+          exit 0
 
       - name: Build FFmpeg (shared)
         run: |
           #!/bin/bash
           set -euo pipefail
-
-          BUILD_TYPE="shared"
-          RPATH_DIR="./lib"
 
           WORKSPACE="$(pwd)"
           NDK_DIR="$WORKSPACE/ndk"
@@ -169,14 +234,14 @@ jobs:
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
-          # 动态链接：链接期需要 rpath-link 解析依赖链
-          LD_SHARED="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB -Wl,-rpath,$RPATH_DIR"
+          # ★ $ORIGIN/lib + --enable-new-dtags（→ DT_RUNPATH）
+          #   链接期先写一遍；最终由 patchelf 强制收口（configure 会 eval 展开 $ORIGIN）
+          LD_SHARED="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
+          LD_SHARED="$LD_SHARED -Wl,--enable-new-dtags,-rpath,\$ORIGIN/lib"
 
           echo "🔧 修正 pkg-config 与头文件路径 (PREFIX=$PREFIX)..."
-          PC="$PREFIX/lib/pkgconfig"
-          mkdir -p "$PC"
+          PC="$PREFIX/lib/pkgconfig"; mkdir -p "$PC"
 
-          # 收集 include 子目录，补到 Cflags
           SUBDIRS=""
           if [ -d "$PREFIX/include" ]; then
             while IFS= read -r d; do
@@ -186,7 +251,6 @@ jobs:
 
           for f in "$PC"/*.pc; do
             [ -e "$f" ] || continue
-            # main.yml 里写的是 ${pcfiledir}/../..，这里统一换成绝对路径
             sed -i "s|\${pcfiledir}/\.\./\.\.|$PREFIX|g" "$f"
             sed -i "s|\${pcfiledir}/\.\.|$PREFIX|g" "$f"
             sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
@@ -195,25 +259,6 @@ jobs:
             fi
           done
 
-          # OpenSSL 只装 libssl.pc / libcrypto.pc，FFmpeg 找 openssl.pc
-          if [ ! -e "$PC/openssl.pc" ] && [ -e "$PC/libssl.pc" ] && [ -e "$PC/libcrypto.pc" ]; then
-            echo "🔧 生成 openssl.pc 兼容层"
-            {
-              echo "prefix=$PREFIX"
-              echo 'exec_prefix=${prefix}'
-              echo 'libdir=${exec_prefix}/lib'
-              echo 'includedir=${prefix}/include'
-              echo
-              echo "Name: openssl"
-              echo "Description: OpenSSL shim for FFmpeg"
-              echo "Version: 3.0.0"
-              echo 'Libs: -L${libdir} -lssl -lcrypto'
-              echo "Libs.private: -ldl -pthread"
-              echo 'Cflags: -I${includedir}'
-            } > "$PC/openssl.pc"
-          fi
-
-          # 头文件平铺（freetype/ft2build.h 之类）
           if [ -d "$PREFIX/include" ]; then
             find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 |
               while IFS= read -r -d '' h; do
@@ -235,7 +280,7 @@ jobs:
           cd ffmpeg
           [ -f Makefile ] && { make distclean >/dev/null 2>&1 || true; }
 
-          echo "🚀 开始构建 (shared)  rpath=$RPATH_DIR"
+          echo "🚀 开始构建 (shared)"
           if ! ./configure \
               --prefix="$OUTPUT" \
               --enable-cross-compile --target-os=android \
@@ -273,7 +318,6 @@ jobs:
           make -j"$(nproc)"
           make install
 
-          # ---- 组装 shared 产物 ----
           if [ -d "$OUTPUT/bin" ]; then
             cp -a "$OUTPUT/bin/." "$OUTPUT/"
             rm -rf "$OUTPUT/bin"
@@ -283,7 +327,6 @@ jobs:
           echo "📦 收集第三方动态库..."
           cp -a "$PREFIX/lib"/*.so* "$OUTPUT/lib/" 2>/dev/null || true
 
-          # C++ 运行时：按需补齐（实测第三方库多为静态链 libc++ 且已隐藏符号）
           need_cxx=0
           for f in "$OUTPUT"/lib/*.so* "$OUTPUT"/libav*.so*; do
             [ -f "$f" ] || continue
@@ -294,12 +337,11 @@ jobs:
           done
           if [ "$need_cxx" -eq 1 ]; then
             cp -a "$SYS_LIB/libc++_shared.so" "$OUTPUT/lib/" 2>/dev/null || true
-            echo "::warning::有库依赖 libc++_shared.so，已打包进 lib/"
+            echo "::warning::有库依赖 libc++_shared.so，已打包"
           else
-            echo "✅ 无 libc++_shared 依赖，跳过打包"
+            echo "✅ 无 libc++_shared 依赖"
           fi
 
-          # wrapper：bionic 对 RUNPATH 支持不稳定，用脚本兜底
           for bin in ffmpeg ffprobe; do
             {
               printf '%s\n' '#!/system/bin/sh'
@@ -316,26 +358,47 @@ jobs:
             echo "FFmpeg Android Build Info (SHARED)"
             echo "======================================"
             echo "Build Date    : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            echo "Build Type    : shared"
             echo "FFmpeg Version: $FFMPEG_VERSION"
             echo "NDK Version   : ${{ env.NDK_VERSION }} (API $API_LEVEL)"
-            echo "Target ABI    : arm64-v8a"
-            echo "Prefix Layout : ${PREFIX_LAYOUT:-unknown}"
             echo "Prefix Used   : $PREFIX"
-            if [ "$need_cxx" -eq 1 ]; then
-              echo "C++ Runtime   : libc++_shared.so (bundled in lib/)"
-            else
-              echo "C++ Runtime   : (none required, libc++ statically linked & hidden)"
-            fi
-            echo "RPath         : $RPATH_DIR"
+            echo "RUNPATH       : \$ORIGIN/lib (ffmpeg) / \$ORIGIN (.so)"
             echo "======================================"
-            echo "============ Dynamic Links ============"
-            readelf -d "$OUTPUT/ffmpeg" | grep -E 'NEEDED|RUNPATH|RPATH' || true
           } > "$OUTPUT/BUILD_INFO.txt"
 
           echo "✅ shared 构建完成"
-          ls -la "$OUTPUT"
-          ls -la "$OUTPUT/lib" | head -50
+
+      # ★ 全量 RUNPATH 收口：不依赖 configure 是否把 $ORIGIN 展开坏
+      - name: Rewrite RUNPATH (patchelf)
+        run: |
+          set -euo pipefail
+
+          echo "===== 1. 第三方 / libav .so → \$ORIGIN ====="
+          n=0
+          while IFS= read -r f; do
+            patchelf --set-rpath '$ORIGIN' "$f"
+            printf '  %-42s %s\n' "$(basename "$f")" "$(patchelf --print-rpath "$f")"
+            n=$((n+1))
+          done < <(find output/lib -maxdepth 1 -name '*.so*' -type f)
+          echo "  共处理 $n 个 .so"
+
+          echo "===== 2. ffmpeg / ffprobe → \$ORIGIN/lib ====="
+          for b in ffmpeg ffprobe; do
+            [ -f "output/$b" ] || continue
+            patchelf --set-rpath '$ORIGIN/lib' "output/$b"
+            printf '  %-42s %s\n' "$b" "$(patchelf --print-rpath "output/$b")"
+          done
+
+          echo "===== 3. 复核：任何 '.' / './lib' / 空 rpath 都算失败 ====="
+          bad=0
+          while IFS= read -r f; do
+            rp="$(patchelf --print-rpath "$f" 2>/dev/null || true)"
+            case "$rp" in
+              *'$ORIGIN'*) : ;;
+              *) echo "::error::$(basename "$f") RUNPATH 不合规: '${rp}'"; bad=1 ;;
+            esac
+          done < <(find output -maxdepth 2 \( -name '*.so*' -o -name ffmpeg -o -name ffprobe \) -type f)
+          [ "$bad" -eq 0 ] && echo "✅ 全部 RUNPATH 均为 \$ORIGIN 系，与工作目录无关"
+          exit $bad
 
       - name: Verify shared linkage
         run: |
@@ -347,43 +410,44 @@ jobs:
           is_sys() { for a in $SYS_ALLOW; do [ "$1" = "$a" ] && return 0; done; return 1; }
           needed_of() { readelf -d "$1" 2>/dev/null | awk '/NEEDED/{gsub(/[][\[\] ]/,"",$NF); print $NF}'; }
 
-          echo "===== 1. ffmpeg 必须存在且 RUNPATH 含 ./lib ====="
-          if [ ! -f output/ffmpeg ]; then
-            echo "::error::output/ffmpeg 不存在"
-            exit 1
-          fi
-          dyn="$(readelf -d output/ffmpeg 2>/dev/null | grep -E 'RUNPATH|RPATH' || true)"
-          echo "$dyn"
-          case "$dyn" in
-            *"./lib"*) echo "✅ RUNPATH 含 ./lib" ;;
-            *) echo "::error::ELF 中未找到 ./lib 检索路径"; fail=1 ;;
+          echo "===== 1. ffmpeg RUNPATH 必须是 \$ORIGIN/lib ====="
+          rp="$(patchelf --print-rpath output/ffmpeg 2>/dev/null || true)"
+          echo "ffmpeg RUNPATH = $rp"
+          case "$rp" in
+            *'$ORIGIN'*) echo "✅ 使用 \$ORIGIN，可从任意目录运行" ;;
+            *)           echo "::error::RUNPATH 异常: $rp"; fail=1 ;;
           esac
 
-          echo "===== 2. libc++ 运行时一致性 ====="
+          echo "===== 2. 关键 .so 的 RUNPATH 必须是 \$ORIGIN ====="
+          for l in libass.so libharfbuzz.so libfreetype.so; do
+            [ -f "output/lib/$l" ] || continue
+            r="$(patchelf --print-rpath "output/lib/$l" 2>/dev/null || true)"
+            printf '  %-22s %s\n' "$l" "$r"
+            case "$r" in
+              *'$ORIGIN'*) : ;;
+              *) echo "::error::$l RUNPATH 不是 \$ORIGIN（换了目录会找不到依赖）"; fail=1 ;;
+            esac
+          done
+
+          echo "===== 3. libc++ 运行时一致性 ====="
           if [ -e output/lib/libc++_shared.so ]; then
-            echo "✅ 打包了 libc++_shared.so（有库需要它）"
+            echo "✅ 已打包 libc++_shared.so"
           else
             n=0
             for f in output/ffmpeg output/lib/*.so*; do
               [ -f "$f" ] || continue
               needed_of "$f" | grep -qx 'libc++_shared.so' && { echo "::error::$f 需要 libc++_shared.so 但未打包"; n=$((n+1)); }
             done
-            if [ "$n" -eq 0 ]; then
-              echo "✅ 无库需要 libc++_shared.so（libc++ 已静态链入）"
-            else
-              fail=1
-            fi
+            [ "$n" -eq 0 ] && echo "✅ 无库需要 libc++_shared.so"
+            [ "$n" -ne 0 ] && fail=1
           fi
 
-          echo "===== 3. 所有非系统 NEEDED 必须能在 output/lib 内解析 ====="
+          echo "===== 4. 非系统 NEEDED 必须可由 output/lib 解析 ====="
           for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
             [ -f "$f" ] || continue
             for n in $(needed_of "$f"); do
               is_sys "$n" && continue
-              if [ ! -e "output/lib/$n" ]; then
-                echo "::error::$(basename "$f") 缺少依赖 $n"
-                fail=1
-              fi
+              [ -e "output/lib/$n" ] || { echo "::error::$(basename "$f") 缺依赖 $n"; fail=1; }
             done
           done
           [ $fail -eq 0 ] && echo "✅ shared 依赖自洽"
@@ -392,7 +456,6 @@ jobs:
       - name: Report 16KB page alignment (shared)
         run: |
           set -uo pipefail
-          echo "===== LOAD 对齐（应为 0x4000）====="
           bad=0
           for f in output/ffmpeg output/ffprobe output/lib/*.so*; do
             [ -f "$f" ] || continue
@@ -400,7 +463,7 @@ jobs:
             case "$al" in
               *0x1000*) echo "::warning::$(basename "$f") 含 4KB 段: $al"; bad=1 ;;
             esac
-            echo "$(printf '%-46s' "$f") -> ${al:-unknown}"
+            echo "$(printf '%-46s' "$(basename "$f")") -> ${al:-unknown}"
           done
           [ "$bad" -eq 0 ] && echo "✅ 全部 16KB 合规"
 
@@ -418,7 +481,7 @@ jobs:
           retention-days: 7
 
   # =====================================================================
-  # STATIC：全静态，用 libc++_static，无检索路径
+  # STATIC：全静态，libc++_static，无 RUNPATH
   # =====================================================================
   build-static:
     name: build-ffmpeg (static)
@@ -431,7 +494,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils
+            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils patchelf
 
       - name: Cache NDK
         id: cache-ndk
@@ -489,7 +552,6 @@ jobs:
             exit 1
           fi
 
-          echo "----- 解压结果 -----"
           find extract_dir -maxdepth 3 -type d | sort | head -30
 
           if [ -d "extract_dir/prefix" ]; then
@@ -502,15 +564,11 @@ jobs:
           fi
 
           if [ -d "$W/prefix/static" ] && [ -d "$W/prefix/shared" ]; then
-            LAYOUT="two"
-            PST="$W/prefix/static"
-            PSH="$W/prefix/shared"
-            echo "✅ 检测到两级布局: prefix/{static,shared}"
+            LAYOUT="two"; PST="$W/prefix/static"; PSH="$W/prefix/shared"
+            echo "✅ 检测到两级布局"
           else
-            LAYOUT="flat"
-            PST="$W/prefix"
-            PSH="$W/prefix"
-            echo "::warning::检测到扁平布局，static/shared 共用同一 prefix"
+            LAYOUT="flat"; PST="$W/prefix"; PSH="$W/prefix"
+            echo "::warning::检测到扁平布局"
           fi
 
           {
@@ -523,22 +581,96 @@ jobs:
           echo "--- static libs ---"
           ls -1 "$PST"/lib/*.a 2>/dev/null | head -40 || echo "(none)"
 
+      - name: Preflight pkg-config & shim missing modules
+        shell: bash
+        run: |
+          set -uo pipefail
+          for PREFIX in "${PREFIX_STATIC}" "${PREFIX_SHARED}"; do
+            [ -d "$PREFIX" ] || continue
+            PC="$PREFIX/lib/pkgconfig"
+            mkdir -p "$PC"
+
+            echo "===== [$PREFIX] pkg-config 清点 ====="
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp fdk-aac lame opus vorbis lc3 \
+                     ass freetype2 fribidi harfbuzz openssl; do
+              if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null; then
+                printf '  %-12s ok\n' "$m"
+              else
+                printf '  %-12s MISSING\n' "$m"
+              fi
+            done
+
+            if [ ! -e "$PC/x264.pc" ] && { [ -e "$PREFIX/lib/libx264.a" ] || [ -e "$PREFIX/lib/libx264.so" ]; }; then
+              echo "🔧 生成 x264.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: x264'
+                echo 'Description: H.264/MPEG-4 AVC codec'
+                echo 'Version: 164'
+                echo 'Libs: -L${libdir} -lx264'
+                echo 'Libs.private: -lm -ldl -lpthread'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/x264.pc"
+            fi
+
+            if [ ! -e "$PC/openssl.pc" ] && [ -e "$PC/libssl.pc" ]; then
+              echo "🔧 生成 openssl.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: openssl'
+                echo 'Description: OpenSSL shim for FFmpeg'
+                echo 'Version: 3.0.0'
+                echo 'Libs: -L${libdir} -lssl -lcrypto'
+                echo 'Libs.private: -ldl -lpthread'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/openssl.pc"
+            fi
+
+            if [ -e "$PC/libwebp.pc" ] && [ -e "$PREFIX/lib/libsharpyuv.a" ]; then
+              grep -q 'sharpyuv' "$PC/libwebp.pc" || {
+                echo "🔧 libwebp.pc 补 -lsharpyuv"
+                if grep -q '^Libs.private:' "$PC/libwebp.pc"; then
+                  sed -i 's|^Libs.private:.*|& -lsharpyuv|' "$PC/libwebp.pc"
+                else
+                  echo 'Libs.private: -lsharpyuv' >> "$PC/libwebp.pc"
+                fi
+              }
+            fi
+
+            echo "===== [$PREFIX] 断言 ====="
+            bad=0
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp openssl ass freetype2 fribidi harfbuzz \
+                     fdk-aac lame opus vorbis lc3; do
+              PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null || {
+                echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
+            done
+            [ "$bad" -eq 0 ] && echo "✅ 全部模块就绪 ($PREFIX)"
+          done
+          exit 0
+
       - name: Preflight - static archives availability
         run: |
           set -uo pipefail
-          PREFIX="${PREFIX_STATIC:?PREFIX_STATIC 未设置}"
+          PREFIX="${PREFIX_STATIC:?}"
           echo "===== 静态库清单 ====="
           ls -1 "$PREFIX"/lib/*.a 2>/dev/null || echo "(none)"
           echo
-          echo "===== 只有 .so 没有 .a 的库（无法静态链接）====="
+          echo "===== 只有 .so 没有 .a 的库 ====="
           miss=0
           for so in "$PREFIX"/lib/*.so; do
             [ -e "$so" ] || continue
-            base="$(basename "$so")"; base="${base%%.so*}"
-            if [ ! -e "$PREFIX/lib/${base}.a" ]; then
-              echo "::warning::${base}: 只有 .so，没有 .a"
-              miss=1
-            fi
+            b="$(basename "$so")"; b="${b%%.so*}"
+            [ -e "$PREFIX/lib/${b}.a" ] || { echo "::warning::${b}: 只有 .so"; miss=1; }
           done
           [ "$miss" -eq 0 ] && echo "✅ 全部 .so 都有对应 .a"
           exit 0
@@ -548,11 +680,9 @@ jobs:
           #!/bin/bash
           set -euo pipefail
 
-          BUILD_TYPE="static"
-
           WORKSPACE="$(pwd)"
           NDK_DIR="$WORKSPACE/ndk"
-          PREFIX="${PREFIX_STATIC:?PREFIX_STATIC 未设置}"
+          PREFIX="${PREFIX_STATIC:?}"
           OUTPUT="$WORKSPACE/output"
           FFMPEG_VERSION="${{ inputs.ffmpeg_version || env.FFMPEG_VERSION_DEFAULT }}"
           API_LEVEL="${{ env.API_LEVEL }}"
@@ -572,12 +702,10 @@ jobs:
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           export PKG_CONFIG_ALLOW_CROSS=1
 
-          # 静态：只保留 -L 与 rpath-link，刻意不加 -rpath
           LD_STATIC="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
 
           echo "🔧 修正 pkg-config 与头文件路径 (PREFIX=$PREFIX)..."
-          PC="$PREFIX/lib/pkgconfig"
-          mkdir -p "$PC"
+          PC="$PREFIX/lib/pkgconfig"; mkdir -p "$PC"
 
           SUBDIRS=""
           if [ -d "$PREFIX/include" ]; then
@@ -596,23 +724,6 @@ jobs:
             fi
           done
 
-          if [ ! -e "$PC/openssl.pc" ] && [ -e "$PC/libssl.pc" ] && [ -e "$PC/libcrypto.pc" ]; then
-            echo "🔧 生成 openssl.pc 兼容层"
-            {
-              echo "prefix=$PREFIX"
-              echo 'exec_prefix=${prefix}'
-              echo 'libdir=${exec_prefix}/lib'
-              echo 'includedir=${prefix}/include'
-              echo
-              echo "Name: openssl"
-              echo "Description: OpenSSL shim for FFmpeg"
-              echo "Version: 3.0.0"
-              echo 'Libs: -L${libdir} -lssl -lcrypto'
-              echo "Libs.private: -ldl -pthread"
-              echo 'Cflags: -I${includedir}'
-            } > "$PC/openssl.pc"
-          fi
-
           if [ -d "$PREFIX/include" ]; then
             find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 |
               while IFS= read -r -d '' h; do
@@ -621,13 +732,11 @@ jobs:
               done
           fi
 
-          echo "🔧 静态模式：隐藏有对应 .a 的 .so，逼迫链接器取静态库..."
+          echo "🔧 静态模式：隐藏有对应 .a 的 .so..."
           for f in "$PREFIX/lib"/*.so*; do
             [ -e "$f" ] || continue
-            base="$(basename "$f")"; base="${base%%.so*}"
-            if [ -e "$PREFIX/lib/${base}.a" ]; then
-              mv "$f" "${f}.bak"
-            fi
+            b="$(basename "$f")"; b="${b%%.so*}"
+            [ -e "$PREFIX/lib/${b}.a" ] && mv "$f" "${f}.bak"
           done
 
           if [ ! -d "ffmpeg" ]; then
@@ -689,23 +798,16 @@ jobs:
             echo "FFmpeg Android Build Info (STATIC)"
             echo "======================================"
             echo "Build Date    : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            echo "Build Type    : static"
             echo "FFmpeg Version: $FFMPEG_VERSION"
             echo "NDK Version   : ${{ env.NDK_VERSION }} (API $API_LEVEL)"
-            echo "Target ABI    : arm64-v8a"
-            echo "Prefix Layout : ${PREFIX_LAYOUT:-unknown}"
             echo "Prefix Used   : $PREFIX"
             echo "C++ Runtime   : libc++_static (linked in)"
-            echo "RPath         : (none, by design)"
             echo "======================================"
-            echo "============ Static Check ============="
             file "$OUTPUT/ffmpeg" || true
-            echo "--- NEEDED ---"
             readelf -d "$OUTPUT/ffmpeg" 2>/dev/null | grep NEEDED || echo "No dynamic dependencies"
           } > "$OUTPUT/BUILD_INFO.txt"
 
           echo "✅ static 构建完成"
-          ls -la "$OUTPUT"
 
       - name: Verify static linkage
         run: |
@@ -719,8 +821,7 @@ jobs:
 
           echo "===== 1. 不应有 output/lib ====="
           if [ -d output/lib ]; then
-            echo "::error::静态产物不应包含 lib/ 目录"
-            fail=1
+            echo "::error::静态产物不应包含 lib/ 目录"; fail=1
           else
             echo "✅ 无 lib/ 目录"
           fi
@@ -729,34 +830,20 @@ jobs:
           for f in output/ffmpeg output/ffprobe; do
             [ -f "$f" ] || { echo "::error::$f 不存在"; fail=1; continue; }
             for n in $(needed_of "$f"); do
-              if is_sys "$n"; then
-                echo "  ok  $(basename "$f") -> $n"
-              else
-                echo "::error::$(basename "$f") 依赖了非系统库: $n"
-                fail=1
-              fi
+              if is_sys "$n"; then echo "  ok  $(basename "$f") -> $n"
+              else echo "::error::$(basename "$f") 依赖非系统库: $n"; fail=1; fi
             done
           done
 
           echo "===== 3. 不应残留 RUNPATH/RPATH ====="
           if readelf -d output/ffmpeg 2>/dev/null | grep -qE 'RUNPATH|RPATH'; then
             echo "::warning::静态二进制带有 RUNPATH（不影响运行）"
-            readelf -d output/ffmpeg | grep -E 'RUNPATH|RPATH'
           else
             echo "✅ 无 RUNPATH/RPATH"
           fi
 
-          [ $fail -eq 0 ] && echo "✅ static 验收通过：仅依赖 Android 系统库"
+          [ $fail -eq 0 ] && echo "✅ static 验收通过"
           exit $fail
-
-      - name: Report 16KB page alignment (static)
-        run: |
-          set -uo pipefail
-          for f in output/ffmpeg output/ffprobe; do
-            [ -f "$f" ] || continue
-            al="$(readelf -lW "$f" 2>/dev/null | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')"
-            echo "$(printf '%-30s' "$(basename "$f")") -> ${al:-unknown}"
-          done
 
       - name: Package (static)
         run: |
@@ -771,9 +858,6 @@ jobs:
           path: ${{ github.workspace }}/ffmpeg-static-arm64-v8a.tar.xz
           retention-days: 7
 
-  # =====================================================================
-  # RELEASE
-  # =====================================================================
   release:
     needs: [build-shared, build-static]
     runs-on: ubuntu-latest
@@ -812,21 +896,20 @@ jobs:
             - **Build Date (UTC+3)**: ${{ env.BUILD_DATE_UTC3 }}
             - **NDK**: r30 / API ${{ env.API_LEVEL }}
             - **FFmpeg**: ${{ env.FFMPEG_VERSION_DEFAULT }}
-            - **外部库来源**: `ffmpeg-libs-arm64-v8a-api${{ env.API_LEVEL }}-full.tar.xz`
 
             ### 1. `ffmpeg-shared-arm64-v8a.tar.xz`（动态）
 
-            - 库检索：ELF `RUNPATH = ./lib`，`cd output && ./ffmpeg -version` 可直接运行
-            - 从其它目录调用请用 wrapper：`./ffmpeg.sh` / `./ffprobe.sh`
-            - C++ 运行时：第三方库的 libc++ 已静态链入并隐藏符号，**通常无需 `libc++_shared.so`**；若确有库需要，构建时会自动打包并告警
+            - **RUNPATH**：`ffmpeg` / `ffprobe` 为 `$ORIGIN/lib`，每个 `.so` 为 `$ORIGIN`
+              → 与工作目录完全无关，`cd /anywhere && /path/to/output/ffmpeg -version` 均可运行
+            - C++ 运行时：第三方库的 libc++ 已静态链入并隐藏符号，通常无需 `libc++_shared.so`
 
             ```
             output/
-            ├── ffmpeg          <-- RUNPATH=./lib
+            ├── ffmpeg          <-- RUNPATH=$ORIGIN/lib
             ├── ffprobe
-            ├── ffmpeg.sh       <-- 自动设置 LD_LIBRARY_PATH=$DIR/lib
+            ├── ffmpeg.sh       <-- 可选 wrapper
             ├── ffprobe.sh
-            ├── lib/            <-- libav*.so + 第三方 .so
+            ├── lib/            <-- libav*.so + 第三方 .so（各自 RUNPATH=$ORIGIN）
             └── BUILD_INFO.txt
             ```
 
@@ -835,17 +918,10 @@ jobs:
             - C++ 运行时：`libc++_static`（已链入）
             - 无 `lib/`、无 RUNPATH，仅依赖 Android 系统库
 
-            ```
-            output/
-            ├── ffmpeg
-            ├── ffprobe
-            └── BUILD_INFO.txt
-            ```
-
             ### 质量校验
 
             - 16 KB 页对齐：`LOAD` 段 `p_align = 0x4000`
-            - shared：所有非系统 `NEEDED` 均可由 `output/lib` 解析
+            - shared：全部 RUNPATH 为 `$ORIGIN` 系；非系统 `NEEDED` 均可由 `output/lib` 解析
             - static：`NEEDED` 仅含 Android 系统库
           files: |
             artifacts/*.tar.xz
