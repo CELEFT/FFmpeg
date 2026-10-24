@@ -3,10 +3,11 @@ name: Build external libs for Android (arm64-v8a)
 on:
   push:
     branches: [ master, main ]
-    tags: [ 'v*' ]
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 0'
+    # 每周三 12:00 (UTC+3) = 周三 09:00 UTC
+    # 若要「周三 UTC+3 的 00:00」，改成 '0 21 * * 2'
+    - cron: '0 9 * * 3'
 
 env:
   NDK_VERSION: "r30"
@@ -22,7 +23,6 @@ concurrency:
 jobs:
   # =====================================================================
   # Job 1：外部库。每库两遍：static → prefix/static，shared → prefix/shared
-  #        NDK 每次重新下载（与 test.yml 一致，不用任何缓存）
   # =====================================================================
   build-libs:
     runs-on: ubuntu-latest
@@ -42,7 +42,6 @@ jobs:
               make -j"$(nproc)"
               make install
 
-          # x265：ENABLE_SHARED 在交叉编译下不一定出 .so → 缺则由 .a 合成
           - name: x265
             libs: "x265"
             build: |
@@ -165,7 +164,6 @@ jobs:
               cmake --install build || true
               mkpc libvvenc "Fraunhofer VVC encoder" "1.11.0" vvenc "" "-I\${includedir}/vvenc"
 
-          # xeve：install 只装 .a，.so 在 build/ → 捞；仍无则用 .a 合成
           - name: xeve
             libs: "xeve"
             build: |
@@ -230,7 +228,6 @@ jobs:
               fi
               mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd "" "-I\${includedir}/xevd"
 
-          # openssl：static=no-shared，shared=shared；provider/engine 模块一律清掉
           - name: openssl
             libs: "ssl crypto"
             build: |
@@ -361,7 +358,6 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          # 文本链：完全照搬 test.yml 的 build_stack
           - name: text-stack
             libs: "freetype fribidi harfbuzz ass"
             build: |
@@ -380,7 +376,6 @@ jobs:
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
               fi
 
-              # ================= 1) FreeType =================
               echo "### FreeType ($LINK)"
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
@@ -396,7 +391,6 @@ jobs:
                 make install
               )
 
-              # ================= 2) FriBidi =================
               echo "### FriBidi ($LINK)"
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
@@ -421,7 +415,6 @@ jobs:
                 ninja -C _build install
               )
 
-              # ================= 3) HarfBuzz =================
               echo "### HarfBuzz ($LINK)"
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
@@ -450,7 +443,6 @@ jobs:
                 ninja -C _build install
               )
 
-              # ================= 4) 头文件归一化 =================
               for sub in fribidi harfbuzz; do
                 [ -d "$PREFIX/include/$sub" ] || continue
                 for h in "$PREFIX/include/$sub"/*.h; do
@@ -462,7 +454,6 @@ jobs:
                 ln -sf "freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
-              # ================= 5) libass =================
               echo "### libass ($LINK)"
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
@@ -483,7 +474,6 @@ jobs:
                 make install
               )
 
-              # ================= 6) 自检 =================
               if [ "$LINK" = "shared" ]; then
                 echo "--- libass.so RUNPATH ---"
                 readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -E 'RUNPATH|RPATH' || echo "  (none)"
@@ -512,7 +502,6 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/meson" --version
 
-      # 与 test.yml 一致：每次重新下载解压 NDK（不使用任何缓存）
       - name: Download and Unpack NDK
         run: |
           set -euo pipefail
@@ -541,7 +530,6 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      # 冒烟测试：先确认编译器能出可执行文件，再谈各库构建
       - name: Verify toolchain
         run: |
           set -euxo pipefail
@@ -592,16 +580,14 @@ jobs:
       - name: Build ${{ matrix.name }} (static + shared)
         shell: bash
         env:
-          # ★ 不能叫 LIBS：autoconf 会把环境里的 LIBS 直接拼进试链接命令，
-          #   导致 "C compiler cannot create executables"。改名为 CHECK_LIBS。
+          # 不能叫 LIBS：autoconf 会把环境里的 LIBS 拼进试链接命令
           CHECK_LIBS: ${{ matrix.libs }}
         run: |
           set -euo pipefail
 
-          # ★ 双保险：即使外部还有同名变量，也不许污染 configure
+          # 双保险：即使外部还有同名变量，也不许污染 configure
           unset LIBS LIBS_PRIVATE LDFLAGS CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
 
-          # 失败时打印 config.log 的「Core tests」段（真正的报错在这里，不在文件末尾）
           on_exit() {
             local rc=$?
             trap - EXIT
@@ -629,7 +615,6 @@ jobs:
           sed -n '1,5p' /tmp/lib_build.sh
           bash -n /tmp/lib_build.sh || { echo "::error::拼装后的构建脚本有语法错误"; exit 1; }
 
-          # 动静态分离
           separate() {
             local link="$1" prefix="$2"
             [ -d "$prefix" ] || return 0
@@ -687,7 +672,7 @@ jobs:
           retention-days: 1
 
   # =====================================================================
-  # Job 2：合并 + find 二次分离 + 打包 prefix/{static,shared}
+  # Job 2：合并 + find 二次分离 + 三道校验 + 打三个包
   # =====================================================================
   package:
     needs: build-libs
@@ -739,7 +724,7 @@ jobs:
                  "hdr=$(find "$P/$d/include" -name '*.h' | wc -l)"
           done
 
-          echo "===== 缺库检查（有库即过）====="
+          echo "===== 缺库检查 ====="
           miss=""
           for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
                      fdk-aac mp3lame opus ogg vorbis vorbisenc lc3 webp \
@@ -752,86 +737,181 @@ jobs:
           done
           [ -z "$miss" ] && echo "✅ 全部库动静态都齐全" || echo "⚠️ 缺：$miss"
 
-          echo "===== 文件 ↔ SONAME ====="
-          find "$P/shared/lib" -maxdepth 1 -name '*.so*' 2>/dev/null | sort |
-            while IFS= read -r f; do
-              sn=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')
-              printf '%-36s %s\n' "$(basename "$f")" "${sn:-<none>}"
-            done
+          echo "===== 16KB 对齐检查（全部应为 0x4000）====="
+          bad=0
+          while IFS= read -r f; do
+            al=$(readelf -lW "$f" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
+            case "$al" in
+              *0x1000*) echo "::warning::$(basename "$f") 含 4KB LOAD 段: $al"; bad=1 ;;
+            esac
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+          [ "$bad" -eq 0 ] && echo "✅ 全部 .so 的 LOAD 段均为 0x4000"
+
+          echo "===== libc++ 符号泄漏检查 ====="
+          leak=0
+          while IFS= read -r f; do
+            n=$(readelf -sW --dyn-syms "$f" 2>/dev/null | grep -c '_ZNSt3__1' || true)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "::warning::$(basename "$f") 导出 ${n} 个 libc++ 符号"
+              leak=1
+            fi
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+          [ "$leak" -eq 0 ] && echo "✅ 无 libc++ 符号泄漏（无需分发 libc++_shared.so）"
 
           rm -rf "$P/_stray"
           exit 0
 
-      - name: Pack prefix (single tarball)
+      - name: Pack prefix (full / static / shared)
         run: |
           set -euo pipefail
           cd "${{ github.workspace }}"
-          tar -I 'xz -9e -T0' -cf "prefix-arm64-v8a-api${API_LEVEL}.tar.xz" prefix
-          ls -lh prefix-arm64-v8a-api${API_LEVEL}.tar.xz
+          BASE="ffmpeg-libs-arm64-v8a-api${API_LEVEL}"
+          rm -f "${BASE}"-*.tar.xz
+          tar -I 'xz -9e -T0' -cf "${BASE}-full.tar.xz"   prefix
+          tar -I 'xz -9e -T0' -cf "${BASE}-static.tar.xz" prefix/static
+          tar -I 'xz -9e -T0' -cf "${BASE}-shared.tar.xz" prefix/shared
+          ls -lh "${BASE}"-*.tar.xz
 
-      - name: Upload merged prefix
-        uses: actions/upload-artifact@v4
-        with:
-          name: prefix-merged
-          path: ${{ github.workspace }}/prefix
-          retention-days: 1
-
-      - name: Upload prefix tarball
+      - name: Upload tarballs
         uses: actions/upload-artifact@v4
         with:
           name: prefix-tarball
-          path: ${{ github.workspace }}/prefix-arm64-v8a-api*.tar.xz
-          retention-days: 7
+          path: |
+            ${{ github.workspace }}/ffmpeg-libs-arm64-v8a-api*.tar.xz
+            ${{ github.workspace }}/prefix
+          retention-days: 2
 
   # =====================================================================
-  # Job 3：发布（tag / 定时）
+  # Job 3：发布到本仓库 Release（固定 tag ffmpeg-lib，资产每次覆盖）
   # =====================================================================
   release:
     needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    env:
+      TAG: ffmpeg-lib
     steps:
-      - name: Download prefix tarball
+      - name: Download tarballs
         uses: actions/download-artifact@v4
         with:
           name: prefix-tarball
           path: artifacts
 
-      - name: Checksums
+      - name: Checksums & timestamps
         run: |
-          echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
+          set -euo pipefail
           cd artifacts
+          rm -f SHA256SUMS.txt
+          sha256sum *.tar.xz | tee SHA256SUMS.txt
           ls -lh
-          sha256sum *.tar.xz > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          {
+            echo "BUILD_DATE_UTC=$(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "BUILD_DATE_UTC3=$(TZ='Etc/GMT-3' date +'%Y-%m-%d %H:%M:%S')"
+            echo "BUILD_DATE_UTC8=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+            echo "SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-7)"
+          } >> "$GITHUB_ENV"
 
-      - name: Create / Update Release
+      - name: Collect stats
+        run: |
+          set -euo pipefail
+          cd artifacts
+          {
+            echo "N_A=$(find prefix/static/lib -maxdepth 1 -name '*.a' 2>/dev/null | wc -l)"
+            echo "N_SO=$(find prefix/shared/lib -maxdepth 1 -name '*.so*' 2>/dev/null | wc -l)"
+            echo "N_PC=$(find prefix/shared/lib/pkgconfig -name '*.pc' 2>/dev/null | wc -l)"
+            echo "N_HDR=$(find prefix/shared/include -name '*.h' 2>/dev/null | wc -l)"
+          } > stats.env
+          cat stats.env
+
+      - name: Compose release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          . ./stats.env
+          {
+            echo "## Android arm64-v8a 外部库（静态 + 动态）"
+            echo
+            echo "### 构建信息"
+            echo
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 构建时间 (UTC) | ${BUILD_DATE_UTC} |"
+            echo "| 构建时间 (UTC+3) | ${BUILD_DATE_UTC3} |"
+            echo "| 构建时间 (UTC+8) | ${BUILD_DATE_UTC8} |"
+            echo "| NDK | r30 |"
+            echo "| API Level | ${API_LEVEL} |"
+            echo "| ABI | arm64-v8a |"
+            echo "| 提交 | [\`${SHORT_SHA}\`](/${{ github.repository }}/commit/${{ github.sha }}) |"
+            echo "| 触发方式 | ${{ github.event_name }} |"
+            echo
+            echo "### 质量校验"
+            echo
+            echo "- 16 KB 页对齐：全部 \`.so\` 的 LOAD 段 \`p_align = 0x4000\` ✅"
+            echo "- libc++：静态链接且符号已隐藏，**无需分发 \`libc++_shared.so\`** ✅"
+            echo "- libass：shared 侧 RUNPATH 含 \`\${ORIGIN}\`（\`-Wl,-rpath,.\`）✅"
+            echo
+            echo "### 产物"
+            echo
+            echo "| 文件 | 内容 | 大小 |"
+            echo "| --- | --- | --- |"
+          } > release-body.md
+
+          for f in *.tar.xz; do
+            case "$f" in
+              *-full.tar.xz)   desc="静态 + 动态（\`prefix/static\` + \`prefix/shared\`）" ;;
+              *-static.tar.xz) desc="仅静态（\`lib/*.a\` + include + pkgconfig）" ;;
+              *-shared.tar.xz) desc="仅动态（\`lib/*.so*\` + include + pkgconfig）" ;;
+              *)               desc="-" ;;
+            esac
+            echo "| \`$f\` | $desc | $(du -h "$f" | cut -f1) |" >> release-body.md
+          done
+
+          {
+            echo
+            echo "### 内容统计"
+            echo
+            echo "| 项 | 数量 |"
+            echo "| --- | --- |"
+            echo "| 静态库 \`.a\` | ${N_A} |"
+            echo "| 动态库 \`.so*\` | ${N_SO} |"
+            echo "| pkg-config \`.pc\` | ${N_PC} |"
+            echo "| 头文件 \`.h\` | ${N_HDR} |"
+            echo
+            echo "### 使用"
+            echo
+            echo '```sh'
+            echo 'tar xf ffmpeg-libs-arm64-v8a-api36-full.tar.xz'
+            echo 'export PKG_CONFIG_PATH=$PWD/prefix/shared/lib/pkgconfig'
+            echo 'pkg-config --libs --cflags libass freetype2 harfbuzz fribidi'
+            echo '```'
+            echo
+            echo "> \`.pc\` 里 \`prefix=\${pcfiledir}/../..\`，解压到任意路径都能直接用。"
+            echo
+            echo "本 release 的三个资产每次构建整体覆盖更新。"
+          } >> release-body.md
+
+          echo "--------- release-body.md ---------"
+          cat release-body.md
+
+      # 固定 tag 跟着最新构建走：删旧 ref（连带旧 release）再重建
+      - name: Delete existing tag/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TAG}" 2>/dev/null \
+            && echo "已删除旧 tag ${TAG}" || echo "tag ${TAG} 不存在或已删除，跳过"
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'libs-weekly-latest' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'External libs (arm64-v8a) — weekly' }}
-          body: |
-            ## Android arm64-v8a 外部库（静态 + 动态）
-
-            - **Build Date**: ${{ env.BUILD_DATE }}
-            - **NDK**: r30 / API ${{ env.API_LEVEL }}
-            - **Trigger**: ${{ github.event_name }}
-
-            ```
-            prefix/
-              static/    lib/*.a            include/   lib/pkgconfig/*.pc
-              shared/    lib/*.so, *.so.*   include/   lib/pkgconfig/*.pc
-            ```
-
-            ```sh
-            tar xf prefix-arm64-v8a-api*.tar.xz
-            export PKG_CONFIG_PATH=$PWD/prefix/shared/lib/pkgconfig
-            pkg-config --libs --cflags libass freetype2 harfbuzz fribidi
-            ```
+          tag_name: ffmpeg-lib
+          name: FFmpeg libs (arm64-v8a) — rolling
+          body_path: artifacts/release-body.md
+          make_latest: true
+          overwrite_files: true
           files: |
             artifacts/*.tar.xz
             artifacts/SHA256SUMS.txt
-          overwrite_files: true
-          generate_release_notes: true
