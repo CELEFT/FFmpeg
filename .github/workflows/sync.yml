@@ -1,0 +1,184 @@
+name: Sync upstream FFmpeg
+
+on:
+  schedule:
+    # 每月 15 日 03:23 UTC（GitHub Actions 低负载时段）
+    # = 06:23 (UTC+3) = 11:23 (UTC+8 北京时间)
+    - cron: '23 3 15 * *'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要同步的分支'
+        required: false
+        default: 'master'
+      dry_run:
+        description: '仅试运行，不推送'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "FFmpeg/FFmpeg"
+  BRANCH: "master"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: cfg
+        run: |
+          set -euo pipefail
+          BR="${{ inputs.branch || 'master' }}"
+          echo "branch=$BR" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${{ inputs.dry_run && 'true' || 'false' }}" >> "$GITHUB_OUTPUT"
+          echo "同步目标：${{ github.repository }}:${BR}  ←  ${UPSTREAM}:${BR}"
+          echo "dry_run=${{ inputs.dry_run && 'true' || 'false' }}"
+
+      # =================================================================
+      # 首选：GitHub 服务端 merge-upstream（不下载历史，秒级完成）
+      # 前提：本仓库必须是真 fork，且无冲突
+      # =================================================================
+      - name: Server-side merge-upstream
+        id: mu
+        if: steps.cfg.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BR="${{ steps.cfg.outputs.branch }}"
+
+          code=$(curl -sS -o /tmp/mu.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/merge-upstream" \
+            -d "{\"branch\":\"${BR}\"}")
+
+          echo "HTTP ${code}"
+          cat /tmp/mu.json || true
+          echo
+
+          if [ "$code" = "200" ]; then
+            mt=$(sed -n 's/.*"merge_type" *: *"\([^"]*\)".*/\1/p' /tmp/mu.json)
+            echo "✅ 服务端同步成功，merge_type=${mt:-unknown}"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "merge_type=${mt:-unknown}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$code" in
+            409) echo "::warning::上游有冲突，转 git 兜底" ;;
+            422) echo "::warning::本仓库不是 fork / 分支不存在，转 git 兜底" ;;
+            *)   echo "::warning::API 不可用（${code}），转 git 兜底" ;;
+          esac
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      # =================================================================
+      # 兜底：git fetch + merge
+      #   --filter=blob:none：只拉 commit/tree，blob 按需取，比全量 clone 小很多
+      #   这里必须保留历史，否则找不到 merge base
+      # =================================================================
+      - name: Git merge fallback
+        if: steps.cfg.outputs.dry_run != 'true' && steps.mu.outputs.ok != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          BR="${{ steps.cfg.outputs.branch }}"
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+
+          echo "== 克隆本仓库（无 blob）=="
+          git clone --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" repo
+
+          cd repo
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "== 拉取上游 =="
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch --filter=blob:none upstream "${BR}" || {
+            echo "::error::拉取上游 ${UPSTREAM}:${BR} 失败"
+            exit 1
+          }
+
+          git checkout -q "${BR}"
+          BEFORE=$(git rev-parse HEAD)
+
+          echo "== 合并 upstream/${BR} =="
+          if git merge --no-edit "upstream/${BR}"; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" = "$AFTER" ]; then
+              echo "已是最新，无需推送"
+              echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "本地新增 $(git rev-list --count "${BEFORE}..${AFTER}") 个提交"
+            if git push origin "${BR}"; then
+              echo "✅ 已推送到 ${{ github.repository }}:${BR}"
+              echo "result=pushed" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::推送失败（可能被分支保护拦截）"
+              exit 1
+            fi
+          else
+            git merge --abort || true
+            echo "::warning::上游合并有冲突，已跳过（工作区未改动）"
+            echo "冲突文件列表："
+            git diff --name-only --diff-filter=U || true
+            {
+              echo "### ⚠️ 上游合并冲突"
+              echo
+              echo "本仓库的 master 与 \`${UPSTREAM}:${BR}\` 存在冲突，需手动处理："
+              echo
+              echo '```sh'
+              echo 'git remote add upstream https://github.com/FFmpeg/FFmpeg.git'
+              echo 'git fetch upstream master'
+              echo 'git merge upstream/master   # 解决冲突后'
+              echo 'git push origin master'
+              echo '```'
+              echo
+              echo "常见原因是本仓库自有的 \`.github/workflows/\` 与上游新增文件重名。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+      # =================================================================
+      # dry run：只报告差多少
+      # =================================================================
+      - name: Dry run report
+        if: steps.cfg.outputs.dry_run == 'true'
+        run: |
+          set -uo pipefail
+          BR="${{ steps.cfg.outputs.branch }}"
+          git ls-remote --heads "https://github.com/${UPSTREAM}.git" "${BR}" || true
+          git ls-remote --heads "https://github.com/${{ github.repository }}.git" "${BR}" || true
+          echo "::notice::dry_run 模式，未做任何修改"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 | \`${UPSTREAM}:${{ steps.cfg.outputs.branch }}\` |"
+            echo "| 目标 | \`${{ github.repository }}:${{ steps.cfg.outputs.branch }}\` |"
+            echo "| 服务端 merge-upstream | ${{ steps.mu.outputs.ok == 'true' && '✅ 成功' || '未使用 / 失败' }} |"
+            echo "| merge_type | \`${{ steps.mu.outputs.merge_type || '-' }}\` |"
+            echo "| 触发 | \`${{ github.event_name }}\` |"
+            echo "| 时间 (UTC) | $(date -u +'%Y-%m-%d %H:%M:%S') |"
+          } >> "$GITHUB_STEP_SUMMARY"
