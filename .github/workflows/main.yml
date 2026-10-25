@@ -97,10 +97,14 @@ jobs:
             build: |
               set -euo pipefail
 
-              # libvpx configure 不认 CC/CXX/AR，需要单独设 AS/LD
+              export CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+              export CXX="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+              export AR="$TOOLCHAIN/bin/llvm-ar"
+              export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+              export STRIP="$TOOLCHAIN/bin/llvm-strip"
               export AS="$CC"
               export LD="$CC"
-              # Android 16 KB page-size 所需的链接器参数
+
               export LDFLAGS="-Wl,-z,max-page-size=16384"
 
               if [ ! -d libvpx ]; then
@@ -111,7 +115,7 @@ jobs:
 
               ./configure \
                 --prefix="$PREFIX" \
-                --target=arm64-android-gcc \
+                --force-target=arm64-v8a-android-gcc \
                 --enable-vp8 \
                 --enable-vp9 \
                 $LTOPT \
@@ -121,7 +125,7 @@ jobs:
                 --disable-unit-tests \
                 --extra-cflags="-fPIC -mno-outline-atomics"
 
-              make -j"${BUILD_JOBS:-2}"
+              make -j2
               make install
 
           - name: libaom
