@@ -128,6 +128,8 @@ jobs:
 
       # 补齐缺失的 pkg-config 模块
       # 注意：libass 安装的是 libass.pc，模块名是 libass（不是 ass）
+      # 注意：bionic 没有独立的 libpthread.so（pthread 符号在 libc.so 里），
+      #       所以 shim 里绝不能写 -lpthread（静态模式 --static 会把它展开到链接行）
       - name: Preflight pkg-config & shim missing modules
         shell: bash
         run: |
@@ -161,7 +163,7 @@ jobs:
                 echo 'Description: H.264/MPEG-4 AVC codec'
                 echo 'Version: 164'
                 echo 'Libs: -L${libdir} -lx264'
-                echo 'Libs.private: -lm -ldl -lpthread'
+                echo 'Libs.private: -lm -ldl'
                 echo 'Cflags: -I${includedir}'
               } > "$PC/x264.pc"
             fi
@@ -179,7 +181,7 @@ jobs:
                 echo 'Description: OpenSSL shim for FFmpeg'
                 echo 'Version: 3.0.0'
                 echo 'Libs: -L${libdir} -lssl -lcrypto'
-                echo 'Libs.private: -ldl -lpthread'
+                echo 'Libs.private: -ldl'
                 echo 'Cflags: -I${includedir}'
               } > "$PC/openssl.pc"
             fi
@@ -205,6 +207,12 @@ jobs:
                 echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
             done
             [ "$bad" -eq 0 ] && echo "✅ 全部模块就绪 ($PREFIX)"
+
+            # 预检提示：静态模式下这些 .pc 会在后续步骤被自动清洗
+            if grep -rIl -- '-lpthread' "$PC" >/dev/null 2>&1; then
+              echo "::warning::[$PREFIX] 以下 .pc 含 -lpthread（bionic 无此库，静态构建前会被清洗）:"
+              grep -rIl -- '-lpthread' "$PC" || true
+            fi
           done
           exit 0
 
@@ -626,7 +634,7 @@ jobs:
                 echo 'Description: H.264/MPEG-4 AVC codec'
                 echo 'Version: 164'
                 echo 'Libs: -L${libdir} -lx264'
-                echo 'Libs.private: -lm -ldl -lpthread'
+                echo 'Libs.private: -lm -ldl'
                 echo 'Cflags: -I${includedir}'
               } > "$PC/x264.pc"
             fi
@@ -643,7 +651,7 @@ jobs:
                 echo 'Description: OpenSSL shim for FFmpeg'
                 echo 'Version: 3.0.0'
                 echo 'Libs: -L${libdir} -lssl -lcrypto'
-                echo 'Libs.private: -ldl -lpthread'
+                echo 'Libs.private: -ldl'
                 echo 'Cflags: -I${includedir}'
               } > "$PC/openssl.pc"
             fi
@@ -748,6 +756,85 @@ jobs:
               sed -i "s|^Cflags:.*|& $SUBDIRS|" "$f"
             fi
           done
+
+          # ------------------------------------------------------------------
+          # 【关键修复 1】剥离 bionic 里不存在的系统库
+          #
+          # bionic 没有独立的 libpthread.so / librt.so / libresolv.so / libutil.so
+          # （pthread_*、clock_*、mq_* 等符号都在 libc.so 内）。
+          # 而 --pkg-config-flags="--static" 会把 .pc 的 Libs.private 原样展开，
+          # 于是 -lpthread 进了链接行：
+          #   ld.lld: error: unable to find library -lpthread
+          #   ERROR: x264 not found using pkg-config
+          # 前缀里的 x264/x265/vpx/aom/SvtAv1Enc/dav1d/openssl .pc 都带 -lpthread，
+          # 必须逐个清洗，只改 x264 会在下一个库继续失败。
+          # 注意：-ldl / -lm / -lz 不用删，NDK sysroot 里有对应 stub。
+          # ------------------------------------------------------------------
+          echo "🔧 静态：剥离 bionic 不存在的系统库 (-lpthread/-lrt/-lresolv/-lutil)"
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            before="$(md5sum "$pc" | awk '{print $1}')"
+            for lib in pthread rt resolv util; do
+              sed -i -E "s/(^|[[:space:]])-l${lib}([[:space:]]|\$)//g" "$pc"
+            done
+            after="$(md5sum "$pc" | awk '{print $1}')"
+            [ "$before" = "$after" ] || echo "   ↳ $(basename "$pc"): 已剥离 -lpthread/-lrt/-lresolv/-lutil"
+          done
+
+          # ------------------------------------------------------------------
+          # 【关键修复 2】C++ 运行时归一
+          # 静态前缀里既没有 libc++_shared.so 也没有 GNU libstdc++，
+          # 若某 .pc 写了 -lc++_shared / -lstdc++，静态链接会直接 not found。
+          # ------------------------------------------------------------------
+          echo "🔧 静态：C++ 运行时归一 (-lc++_shared/-lstdc++ → -lc++_static -lc++abi)"
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            if grep -q -e '-lc++_shared' -e '-lstdc++' "$pc"; then
+              echo "   ↳ $(basename "$pc"): 已归一 C++ 运行时"
+              sed -i -E 's/-lc\+\+_shared/-lc++_static -lc++abi/g; s/-lstdc\+\+/-lc++_static -lc++abi/g' "$pc"
+            fi
+          done
+
+          # ------------------------------------------------------------------
+          # 【关键修复 3】剔除悬空的 Requires.private
+          # 例如 freetype2.pc 的 Requires.private 里有 libpng/brotli/bzip2/harfbuzz，
+          # 本前缀并未安装这些 .pc；--static 探测时 pkg-config 会整条判失败，
+          # 于是 configure 报 "freetype2/libass not found"。
+          # 只保留本前缀里真实存在的模块。
+          # ------------------------------------------------------------------
+          echo "🔧 静态：剔除悬空的 Requires.private 模块"
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            mod="$(basename "$pc" .pc)"
+            line="$(grep -m1 '^Requires\.private:' "$pc" || true)"
+            [ -n "$line" ] || continue
+            rest="${line#Requires.private:}"
+            # 比较符前后空格压掉、逗号折成空格，便于按 token 处理
+            rest="$(printf '%s' "$rest" | sed -E 's/[[:space:]]*([<>=]+)[[:space:]]*/\1/g' | tr ',' ' ')"
+            keep=""
+            for tok in $rest; do
+              [ -n "$tok" ] || continue
+              name="${tok%%[<>=]*}"
+              if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$name" 2>/dev/null; then
+                keep="${keep:+$keep, }$tok"
+              else
+                echo "   ↳ ${mod}: 移除不存在的私有依赖 ${name}"
+              fi
+            done
+            if [ -n "$keep" ]; then
+              sed -i "s|^Requires\.private:.*|Requires.private: $keep|" "$pc"
+            else
+              sed -i '/^Requires\.private:/d' "$pc"
+            fi
+          done
+
+          # 断言：任何 .pc 都不允许再引用 bionic 不存在的库
+          if grep -rIq -- '-lpthread' "$PC" 2>/dev/null; then
+            echo "::error::.pc 仍引用 -lpthread（bionic 不存在该库，链接必然失败）:"
+            grep -rIn -- '-lpthread' "$PC" || true
+            exit 1
+          fi
+          echo "✅ .pc 已适配 bionic"
 
           # mkpc 生成的 .pc 的 Libs.private 只有 -lc++_static，静态链接还需要 libc++abi
           echo "🔧 .pc 私有依赖补 -lc++abi"
@@ -982,6 +1069,7 @@ jobs:
             ### 2. `ffmpeg-static-arm64-v8a.tar.xz`（静态）
 
             - C++ 运行时：`libc++_static.a` + `libc++abi.a`（`--start-group` 解互相引用）
+            - `.pc` 已适配 bionic：剥离 `-lpthread/-lrt/-lresolv/-lutil`，剔除悬空 `Requires.private`
             - 无 `lib/`、无 RUNPATH，仅依赖 Android 系统库
 
             ```
