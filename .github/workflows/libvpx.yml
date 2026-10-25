@@ -277,8 +277,7 @@ jobs:
           path: ${{ github.workspace }}/prefix/${{ matrix.link }}
           if-no-files-found: warn
           retention-days: 3
-
-  verify:
+verify:
     needs: build-libvpx
     if: always()
     runs-on: ubuntu-latest
@@ -290,21 +289,66 @@ jobs:
           path: ${{ github.workspace }}/prefix
 
       - name: Verify artifacts
+        shell: bash
         run: |
           set -uo pipefail
           P="${{ github.workspace }}/prefix"
-          echo "===== 产物列表 ====="
-          find "$P" -maxdepth 3 \( -name '*.a' -o -name 'libvpx.so*' -o -name '*.pc' \) 2>/dev/null | sort || true
+          # pattern 下载时，每个 artifact 落在同名子目录：prefix/vpx-<link>/
+          DS="$P/vpx-static"
+          DH="$P/vpx-shared"
+
+          echo "===== 顶层布局 ====="
+          find "$P" -maxdepth 2 | sort || true
+
+          echo "===== static ====="
+          if [ -d "$DS" ]; then
+            find "$DS" -maxdepth 2 \( -name '*.a' -o -name '*.pc' \) 2>/dev/null | sort || true
+            if [ -f "$DS/lib/libvpx.a" ]; then
+              echo "  ✅ libvpx.a $(du -h "$DS/lib/libvpx.a" | cut -f1)"
+            else
+              echo "::error::static 变体缺 libvpx.a"
+            fi
+          else
+            echo "::error::缺少 $DS（static job 未上传产物）"
+          fi
+
+          echo "===== shared ====="
+          if [ -d "$DH" ]; then
+            find "$DH/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | sort | while IFS= read -r f; do
+              if [ -L "$f" ]; then
+                printf '  %-24s -> %s\n' "$(basename "$f")" "$(readlink "$f")"
+              else
+                printf '  %-24s (regular, %s)\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+              fi
+            done || true
+
+            real="$DH/lib/libvpx.so.12.1.0"
+            [ -e "$real" ] || real="$(find "$DH/lib" -maxdepth 1 -name 'libvpx.so.*.*.*' -type f 2>/dev/null | head -1 || true)"
+
+            if [ -n "${real:-}" ] && [ -e "$real" ]; then
+              echo "--- 实体文件：$(basename "$real") ---"
+              echo -n "  SONAME   = "; readelf -d "$real" 2>/dev/null | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p' || true
+              echo -n "  RUNPATH  = "; readelf -d "$real" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p' || true
+              echo -n "  Machine  = "; readelf -h "$real" 2>/dev/null | awk -F: '/Machine/{gsub(/^ +/,"",$2); print $2}' || true
+              echo -n "  p_align  = "; readelf -lW "$real" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ' || true
+              echo
+
+              echo "--- DT_NEEDED ---"
+              readelf -d "$real" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p' || true
+
+              echo "--- 断言 ---"
+              rp=$(readelf -d "$real" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p' || true)
+              [ "${rp:-}" = '$ORIGIN' ] || { echo "::error::RUNPATH=$rp，应为 \$ORIGIN"; exit 1; }
+              readelf -lW "$real" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | grep -qx '0x4000' \
+                || echo "::warning::LOAD p_align 不是纯 0x4000"
+              echo "✅ RUNPATH / 对齐 复核通过"
+            else
+              echo "::error::shared 变体找不到实体 .so"
+            fi
+          else
+            echo "::error::缺少 $DH（shared job 未上传产物）"
+          fi
+
           echo "===== 汇总 ====="
-          for d in static shared; do
-            [ -d "$P/$d" ] || { echo "[$d] 不存在"; continue; }
-            echo "[$d] a=$(find "$P/$d/lib" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l)" \
-                 "so=$(find "$P/$d/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l)" \
-                 "pc=$(find "$P/$d/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l)"
-          done
-          echo "===== shared RUNPATH 复核（未经 patchelf）====="
-          for so in "$P"/shared/lib/libvpx.so*; do
-            [ -e "$so" ] || continue
-            printf '  %-22s %s\n' "$(basename "$so")" \
-              "$(readelf -d "$so" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
-          done || true
+          echo "static: $(find "$DS/lib" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l) 个 .a, $(find "$DS/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc"
+          echo "shared: $(find "$DH/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l) 个 .so*, $(find "$DH/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc" 
