@@ -92,36 +92,189 @@ jobs:
               ninja -C _build
               ninja -C _build install
 
-          - name: libvpx
-            libs: "vpx"
-            build: |
-              [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
-              cd libvpx
+          - name: Build libvpx (static + shared)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-              make distclean >/dev/null 2>&1 || true
+          unset LIBS LIBS_PRIVATE CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
 
-              export CC="$CC"
-              export CXX="$CXX"
-              export AR="$AR"
-              export AS="$CC"
-              export LD="$CC"
-              export STRIP="$STRIP"
-              export LDFLAGS="-Wl,-z,max-page-size=16384"
+          on_exit() {
+            local rc=$?
+            trap - EXIT
 
-              ./configure \
-                --prefix="$PREFIX" \
-                --target=arm64-android-gcc \
-                --enable-vp8 --enable-vp9 $LTOPT \
-                --disable-examples \
-                --disable-tools \
-                --disable-docs \
-                --disable-unit-tests \
-                --extra-cflags="-fPIC -mno-outline-atomics" \
-                --extra-ldflags="-Wl,-z,max-page-size=16384 -lc"
+            if [ "$rc" -ne 0 ]; then
+              echo "::group::失败诊断 — libvpx [${LINK:-unknown}]"
 
-              make -j"$(nproc)"
-              make install
-              
+              find "$GITHUB_WORKSPACE" -maxdepth 5 -name config.log \
+                -not -path "*/ndk/*" -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f : Core tests（末 40 行）==============="
+                  awk '/^## Core tests/,/^## (Cache variables|Output variables)/' \
+                    "$f" 2>/dev/null | tail -40 || true
+                done
+
+              find "$GITHUB_WORKSPACE" -maxdepth 6 -name CMakeError.log \
+                -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f ==============="
+                  tail -40 "$f" || true
+                done
+
+              if [ -d "$GITHUB_WORKSPACE/libvpx" ]; then
+                echo "--- libvpx config.log ---"
+                tail -100 "$GITHUB_WORKSPACE/libvpx/config.log" 2>/dev/null || true
+
+                echo "--- libvpx config.mk ---"
+                grep -E '^(CC|CXX|AR|LD|CFLAGS|LDFLAGS|CONFIG_SHARED|CONFIG_STATIC)' \
+                  "$GITHUB_WORKSPACE/libvpx/config.mk" 2>/dev/null || true
+              fi
+
+              echo "::endgroup::"
+            fi
+
+            exit "$rc"
+          }
+          trap on_exit EXIT
+
+          # 基本环境检查
+          : "${TOOLCHAIN:?TOOLCHAIN 未设置}"
+          : "${CC:?CC 未设置}"
+          : "${CXX:?CXX 未设置}"
+          : "${AR:?AR 未设置}"
+          : "${RANLIB:?RANLIB 未设置}"
+          : "${STRIP:?STRIP 未设置}"
+          : "${PREFIX_STATIC:?PREFIX_STATIC 未设置}"
+          : "${PREFIX_SHARED:?PREFIX_SHARED 未设置}"
+
+          test -x "$CC"
+          test -x "$CXX"
+          test -x "$AR"
+          test -x "$RANLIB"
+          test -x "$STRIP"
+
+          export AS="$CC"
+          export LD="$CC"
+
+          # 只保留 Android 16 KB page-size 所需的链接器参数。
+          # 不要将 -Wl 参数塞进 --extra-cflags。
+          export LDFLAGS="-Wl,-z,max-page-size=16384"
+
+          cat > /tmp/lib_build.sh <<'__LIB_EOF__'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          if [ ! -d libvpx ]; then
+            git clone --depth 1 https://chromium.googlesource.com/webm/libvpx.git libvpx
+          fi
+
+          cd libvpx
+
+          # 每个 variant 都从干净配置开始
+          make distclean >/dev/null 2>&1 || true
+
+          export CC
+          export CXX
+          export AR
+          export AS
+          export LD
+          export RANLIB
+          export STRIP
+
+          # 避免继承其他库的编译/链接参数
+          unset LIBS LIBS_PRIVATE CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
+          export LDFLAGS="-Wl,-z,max-page-size=16384"
+
+          ./configure \
+            --prefix="$PREFIX" \
+            --target=arm64-android-gcc \
+            --enable-vp8 \
+            --enable-vp9 \
+            $LTOPT \
+            --disable-examples \
+            --disable-tools \
+            --disable-docs \
+            --disable-unit-tests \
+            --extra-cflags="-fPIC -mno-outline-atomics"
+
+          make -j"${BUILD_JOBS:-2}"
+          make install
+          __LIB_EOF__
+
+          chmod +x /tmp/lib_build.sh
+          bash -n /tmp/lib_build.sh
+
+          separate() {
+            local link="$1"
+            local prefix="$2"
+
+            [ -d "$prefix" ] || return 0
+
+            if [ "$link" = "static" ]; then
+              find "$prefix" -type d \
+                \( -name 'ossl-modules' -o -name 'engines-*' \) \
+                -exec rm -rf {} + 2>/dev/null || true
+
+              find "$prefix/lib" -maxdepth 1 \
+                \( -name '*.so' -o -name '*.so.*' \) \
+                -print -delete 2>/dev/null || true
+            else
+              find "$prefix/lib" -maxdepth 1 \
+                -name '*.a' -print -delete 2>/dev/null || true
+            fi
+          }
+
+          run_variant() {
+            local link="$1"
+            local prefix="$2"
+
+            echo "::group::=== libvpx [$link] ==="
+
+            export LINK="$link"
+            export PREFIX="$prefix"
+
+            mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
+
+            if [ "$link" = "static" ]; then
+              export LTOPT="--enable-static --disable-shared"
+            else
+              export LTOPT="--disable-static --enable-shared"
+            fi
+
+            export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+            export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+            export PKG_CONFIG_ALLOW_CROSS=1
+
+            bash /tmp/lib_build.sh
+
+            separate "$link" "$prefix"
+
+            echo "--- installed libvpx files [$link] ---"
+            find "$prefix/lib" -maxdepth 1 \
+              \( -type f -o -type l \) -print 2>/dev/null || true
+
+            echo "::endgroup::"
+          }
+
+          export BUILD_JOBS="${BUILD_JOBS:-2}"
+
+          run_variant static "$PREFIX_STATIC"
+          run_variant shared "$PREFIX_SHARED"
+
+          echo "--- libvpx static ---"
+          find "$PREFIX_STATIC/lib" -maxdepth 1 \
+            \( -type f -o -type l \) 2>/dev/null |
+            grep -Ei 'libvpx|vpx\.pc' || true
+
+          echo "--- libvpx shared ---"
+          find "$PREFIX_SHARED/lib" -maxdepth 1 \
+            \( -type f -o -type l \) 2>/dev/null |
+            grep -Ei 'libvpx|vpx\.pc' || true
+
+          echo "--- shared library dynamic dependencies ---"
+          find "$PREFIX_SHARED/lib" -maxdepth 1 -name 'libvpx.so*' -type f \
+            -print -exec "$TOOLCHAIN/bin/llvm-readelf" -d {} \; 2>/dev/null || true
+            
           - name: libaom
             libs: "aom"
             build: |
