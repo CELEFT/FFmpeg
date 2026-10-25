@@ -311,7 +311,7 @@ jobs:
               --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
               --enable-libvvenc --enable-libxeve --enable-libxevd \
               --enable-libwebp \
-              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis --enable-libsoxr \
               --enable-liblc3 \
               --enable-libass --enable-libfreetype --enable-libfribidi \
               --disable-doc --disable-debug \
@@ -896,7 +896,7 @@ jobs:
               --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
               --enable-libvvenc --enable-libxeve --enable-libxevd \
               --enable-libwebp \
-              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis \
+              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis --enable-libsoxr \
               --enable-liblc3 \
               --enable-libass --enable-libfreetype --enable-libfribidi \
               --disable-doc --disable-debug \
