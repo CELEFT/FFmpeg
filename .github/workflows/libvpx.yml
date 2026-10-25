@@ -1,0 +1,285 @@
+name: Test libvpx (arm64-v8a)
+
+# 独立测试用：只编 libvpx，static + shared 双变体
+# 验证通过后再把 job 内容搬回 main.yml
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/libvpx.yml'
+
+env:
+  NDK_VERSION: "r30"
+  API_LEVEL: "36"
+  NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  TARGET_ABI: "arm64-v8a"
+  ANDROID_TRIPLE: "aarch64-linux-android"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-libvpx:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        link: [static, shared]
+    env:
+      LINK: ${{ matrix.link }}
+      PREFIX: ${{ github.workspace }}/prefix/${{ matrix.link }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential perl python3 diffutils
+
+      - name: Download and Unpack NDK
+        run: |
+          set -euo pipefail
+          wget -q "$NDK_URL" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Set toolchain env
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "NDK=${{ github.workspace }}/ndk"
+            echo "SYSROOT=$TOOLCHAIN/sysroot"
+            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+            echo "AR=$TOOLCHAIN/bin/llvm-ar"
+            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
+            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
+            echo "READELF=$TOOLCHAIN/bin/llvm-readelf"
+          } >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          set -euxo pipefail
+          printf 'int main(void){return 0;}\n' > /tmp/smoke.c
+          "$CC" /tmp/smoke.c -o /tmp/smoke.out
+          file /tmp/smoke.out
+          echo "✅ 编译器可创建可执行文件"
+
+      - name: Build libvpx [${{ matrix.link }}]
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ── 失败时自动导出诊断，不依赖 github 日志里翻 config.log ──
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            if [ "$rc" -ne 0 ]; then
+              echo "::group::❌ 失败诊断 — libvpx [$LINK]"
+              if [ -f libvpx/config.log ]; then
+                echo "===== config.log: error / die / unsupported 行 ====="
+                grep -nE 'error:|Unknown option|not supported|only supported on' libvpx/config.log | tail -30 || true
+                echo "===== config.log 末 50 行 ====="
+                tail -50 libvpx/config.log || true
+              fi
+              for f in libvpx/config.mk libvpx/libs-arm64-android-gcc.mk; do
+                [ -f "$f" ] || continue
+                echo "===== $f ====="
+                grep -nE 'LDFLAGS|CONFIG_(SHARED|STATIC|PIC|VP8|VP9)' "$f" || true
+              done
+              echo "::endgroup::"
+            fi
+            exit $rc
+          }
+          trap on_exit EXIT
+
+          [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
+          cd libvpx
+          make distclean >/dev/null 2>&1 || true
+          rm -f config.mk config.log vpx_config.h vpx_config.c libs-arm64-android-gcc.mk
+
+          # ═══ 补丁 A：--enable-shared 平台白名单加入 android ═══
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path("configure")
+          s = p.read_text()
+          want = "linux|android|os2|solaris|darwin*|iphonesimulator*)"
+          if want in s:
+              print("configure: 已含 android，跳过")
+          else:
+              pat = r'^(?P<ind>[ \t]*)linux\|os2\|solaris\|darwin\*\|iphonesimulator\*\)[ \t]*$'
+              m = re.search(pat, s, re.M)
+              if not m:
+                  raise SystemExit("::error::configure: 找不到白名单锚点，上游已改动")
+              new = m.group("ind") + want
+              p.write_text(s[:m.start()] + new + s[m.end():])
+              print("configure: " + new.strip())
+          PY
+
+          # ═══ 补丁 B：注释 -static（NDK 只有 libc.so，无 libc.a）═══
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("build/make/configure.sh")
+          lines = p.read_text().splitlines(keepends=True)
+          n = 0
+          for i, l in enumerate(lines):
+              if l.strip() == "check_add_ldflags -static":
+                  lines[i] = l[:len(l) - len(l.lstrip())] + "# check_add_ldflags -static\n"
+                  n += 1
+          if n:
+              p.write_text("".join(lines))
+              print("configure.sh: 已注释 %d 处 -static" % n)
+          elif any(l.strip() == "# check_add_ldflags -static" for l in lines):
+              print("configure.sh: 已注释，跳过")
+          else:
+              raise SystemExit("::error::configure.sh: 找不到 check_add_ldflags -static，上游已改动")
+          PY
+
+          echo "--- 补丁后的关键行 ---"
+          grep -n 'iphonesimulator\*)' configure | sed 's/^/  /'
+          grep -n 'check_add_ldflags -static' build/make/configure.sh | sed 's/^/  /'
+
+          # ═══ 工具链 ═══
+          export CC CXX AR RANLIB STRIP
+          export AS="$CC"
+          # 不设 LD：webm_io 启用时 configure 末尾 LD=${CXX} 会覆盖它
+
+          # ═══ 链接标志（转义链：Shell → Make → ld）═══
+          export LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,--enable-new-dtags -Wl,-rpath,'\$\$ORIGIN'"
+
+          if [ "$LINK" = "shared" ]; then
+            LTOPT="--enable-shared --disable-static"
+          else
+            LTOPT="--enable-static --disable-shared"
+          fi
+
+          # ═══ configure（与你本地命令逐字一致）═══
+          ./configure \
+            --prefix="$PREFIX" \
+            --force-target=arm64-android-gcc \
+            --enable-vp8 \
+            --enable-vp9 \
+            $LTOPT \
+            --enable-pic \
+            --disable-examples \
+            --disable-tools \
+            --disable-docs \
+            --disable-unit-tests \
+            --extra-cflags="-O2 -fPIC -mno-outline-atomics --sysroot=${SYSROOT}"
+
+          # ═══ 门禁 1：configure 产物 ═══
+          echo "--- config.mk 关键项 ---"
+          grep -E '^CONFIG_(SHARED|STATIC|PIC|VP8|VP9)=' config.mk | sed 's/^/  /'
+          echo "--- libs-*.mk 的 LDFLAGS ---"
+          grep -hE '^LDFLAGS' libs-*.mk 2>/dev/null | sort -u | sed 's/^/  /'
+
+          grep -qh 'ORIGIN' libs-*.mk || {
+            echo "::error::libs-*.mk 里没有 ORIGIN，\$ORIGIN 转义失效（会退化成 RIGIN）"; exit 1; }
+          grep -qE '(^|[[:space:]])-static([[:space:]]|$)' config.mk && {
+            echo "::error::config.mk 仍含 -static，补丁 B 未生效"; exit 1; }
+          grep -q '^CONFIG_PIC=yes' config.mk || { echo "::error::CONFIG_PIC != yes"; exit 1; }
+          if [ "$LINK" = "shared" ]; then
+            grep -q '^CONFIG_SHARED=yes' config.mk || { echo "::error::CONFIG_SHARED != yes"; exit 1; }
+            grep -q '^CONFIG_STATIC=no'  config.mk || { echo "::error::CONFIG_STATIC != no";  exit 1; }
+          else
+            grep -q '^CONFIG_STATIC=yes' config.mk || { echo "::error::CONFIG_STATIC != yes"; exit 1; }
+            grep -q '^CONFIG_SHARED=no'  config.mk || { echo "::error::CONFIG_SHARED != no";  exit 1; }
+          fi
+          echo "✅ 门禁 1 通过"
+
+          # ═══ 构建 + 安装 ═══
+          make -j"$(nproc)"
+          make install
+
+          # ═══ 门禁 2：产物 ═══
+          [ -f "$PREFIX/lib/pkgconfig/vpx.pc" ] && echo "✅ vpx.pc 已安装" \
+            || echo "::warning::未找到 vpx.pc"
+
+          if [ "$LINK" = "shared" ]; then
+            so="$PREFIX/lib/libvpx.so"
+            [ -e "$so" ] || { echo "::error::未生成 $so"; ls -l "$PREFIX/lib"; exit 1; }
+
+            echo "--- RUNPATH ---"
+            "$READELF" -d "$so" | grep -E 'RUNPATH|RPATH' | sed 's/^/  /'
+            "$READELF" -d "$so" | grep -q '\[\$ORIGIN\]' || {
+              echo "::error::RUNPATH 不是 \$ORIGIN"; exit 1; }
+
+            echo "--- DT_NEEDED ---"
+            "$READELF" -d "$so" | grep NEEDED | sed 's/^/  /'
+
+            echo "--- 架构 / 对齐 ---"
+            "$READELF" -h "$so" | awk -F: '/Machine|Class/{print "  "$2}'
+            align=$("$READELF" -lW "$so" | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
+            echo "  LOAD p_align = ${align:-<none>}"
+            case "$align" in
+              *0x1000*) echo "::error::含 4KB LOAD 段，max-page-size 未生效"; exit 1 ;;
+              *0x4000*) echo "  ✅ 16KB 对齐" ;;
+              *)        echo "::warning::p_align 异常：$align" ;;
+            esac
+
+            if "$READELF" -d "$so" | grep -q 'NEEDED.*libc++_shared.so'; then
+              echo "::notice::libvpx.so 依赖 libc++_shared.so（webm_io/libyuv 启用所致）→ 随包分发"
+              cp -f "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" "$PREFIX/lib/"
+              "$READELF" -h "$PREFIX/lib/libc++_shared.so" | grep -q 'AArch64' || {
+                echo "::error::libc++_shared.so 不是 AArch64"; exit 1; }
+              echo "✅ 已随包分发 aarch64 libc++_shared.so"
+            else
+              echo "✅ libvpx.so 不依赖 libc++_shared.so"
+            fi
+          else
+            [ -e "$PREFIX/lib/libvpx.a" ] || { echo "::error::未生成 libvpx.a"; exit 1; }
+            if "$READELF" -r "$PREFIX/lib/libvpx.a" 2>/dev/null | grep -q 'R_AARCH64_.*_ABS'; then
+              echo "::warning::libvpx.a 含绝对重定位，可能缺 -fPIC"
+            fi
+            echo "✅ libvpx.a $(du -h "$PREFIX/lib/libvpx.a" | cut -f1)"
+          fi
+          echo "✅ 门禁 2 通过 — libvpx [$LINK]"
+
+      - name: Upload prefix [${{ matrix.link }}]
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpx-${{ matrix.link }}
+          path: ${{ github.workspace }}/prefix/${{ matrix.link }}
+          if-no-files-found: warn
+          retention-days: 3
+
+  verify:
+    needs: build-libvpx
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download prefixes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vpx-*
+          path: ${{ github.workspace }}/prefix
+
+      - name: Verify artifacts
+        run: |
+          set -uo pipefail
+          P="${{ github.workspace }}/prefix"
+          echo "===== 目录结构 ====="
+          find "$P" -maxdepth 3 \( -name '*.a' -o -name '*.so' -o -name '*.so.*' -o -name '*.pc' \) | sort
+
+          echo "===== 汇总 ====="
+          for d in static shared; do
+            [ -d "$P/$d" ] || { echo "[$d] 不存在"; continue; }
+            echo "[$d] a=$(find "$P/$d/lib" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l)" \
+                 "so=$(find "$P/$d/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l)" \
+                 "pc=$(find "$P/$d/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l)"
+          done
+
+          echo "===== shared RUNPATH 复核（脱离构建环境）====="
+          for so in "$P"/shared/lib/libvpx.so*; do
+            [ -e "$so" ] || continue
+            printf '  %-24s %s\n' "$(basename "$so")" \
+              "$(readelf -d "$so" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+          done || true
