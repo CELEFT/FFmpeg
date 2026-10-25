@@ -1,16 +1,32 @@
-name: Build libass (static + shared)
+name: Test libsoxr (arm64-v8a)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/test-libsoxr.yml'
 
 env:
-  NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  NDK_VERSION: "r30"
   API_LEVEL: "36"
+  NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-libass:
+  build-soxr:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        link: [static, shared]
+    env:
+      LINK: ${{ matrix.link }}
+      PREFIX: ${{ github.workspace }}/prefix/${{ matrix.link }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,259 +34,291 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential autoconf automake libtool pkg-config \
-            nasm yasm cmake meson ninja-build git wget unzip \
-            gperf gettext libexpat1-dev
+            build-essential cmake ninja-build git wget unzip \
+            patchelf pkg-config
 
       - name: Download and Unpack NDK
         run: |
-          wget -q "${{ env.NDK_URL }}" -O ndk.zip
+          set -euo pipefail
+          wget -q "$NDK_URL" -O ndk.zip
           unzip -q ndk.zip
           mv android-ndk-r30* "${{ github.workspace }}/ndk"
-          rm ndk.zip
+          rm -f ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
 
       - name: Set toolchain env
         run: |
+          set -euo pipefail
           TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
           {
             echo "TOOLCHAIN=$TOOLCHAIN"
+            echo "NDK=${{ github.workspace }}/ndk"
+            echo "SYSROOT=$TOOLCHAIN/sysroot"
             echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
             echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
             echo "AR=$TOOLCHAIN/bin/llvm-ar"
             echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
             echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
-            echo "PREFIX_STATIC=${{ github.workspace }}/prefix-static"
-            echo "PREFIX_SHARED=${{ github.workspace }}/prefix-shared"
+            echo "READELF=$TOOLCHAIN/bin/llvm-readelf"
           } >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      - name: Clone sources
+      - name: Verify toolchain
         run: |
-          git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git
-          git clone --depth 1 https://github.com/fribidi/fribidi.git
-          git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git
-          git clone --depth 1 https://github.com/libass/libass.git
+          set -euxo pipefail
+          printf 'int main(void){return 0;}\n' > /tmp/smoke.c
+          "$CC" /tmp/smoke.c -o /tmp/smoke.out
+          file /tmp/smoke.out
+          echo "✅ 编译器可创建可执行文件"
 
-      - name: Build stack (static + shared)
+      - name: Build libsoxr [${{ matrix.link }}]
+        shell: bash
         run: |
           set -euo pipefail
+          D="$GITHUB_WORKSPACE/soxr"
 
-          build_stack() {
-            local LINK="$1"
-            local PREFIX="$2"
-
-            echo "::group::=== Building $LINK stack into $PREFIX ==="
-            mkdir -p "$PREFIX"
-
-            local MESON_LIB CFLAGS_EXTRA LTOPT
-            if [ "$LINK" = "static" ]; then
-              MESON_LIB="static"
-              CFLAGS_EXTRA="-O2 -fPIC"
-              LTOPT="--enable-static --disable-shared"
-            else
-              MESON_LIB="shared"
-              CFLAGS_EXTRA="-O2"
-              LTOPT="--disable-static --enable-shared"
+          on_exit() {
+            local rc=$?
+            trap - EXIT
+            if [ "$rc" -ne 0 ]; then
+              echo "::group::❌ 失败诊断 — libsoxr [$LINK]"
+              for f in "$D"/build/CMakeFiles/CMakeError.log \
+                       "$D"/build/CMakeFiles/CMakeOutput.log \
+                       "$D"/build/CMakeCache.txt; do
+                [ -f "$f" ] || continue
+                echo "===== $f (末 40 行) ====="
+                tail -40 "$f" || true
+              done
+              echo "::endgroup::"
             fi
-
-            local BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
-
-            # ★ 唯一修改点：shared 时硬编码 rpath "."，从进程当前目录查找依赖
-            # 注意：不能写成 -Wl,-rpath,'.'，单引号在变量展开后是字面字符，会污染 RUNPATH
-            local BASE_LDFLAGS="-L$PREFIX/lib"
-            if [ "$LINK" = "shared" ]; then
-              BASE_LDFLAGS="$BASE_LDFLAGS -Wl,-rpath,."
-            fi
-
-            # 1. FreeType (Autotools)
-            echo "### FreeType ($LINK)"
-            ( cd freetype
-              make distclean >/dev/null 2>&1 || true
-              ./autogen.sh
-              ./configure \
-                --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                $LTOPT --with-pic \
-                --without-zlib --without-png --without-bzip2 --without-harfbuzz \
-                CFLAGS="$CFLAGS_EXTRA"
-              make -j"$(nproc)"
-              make install
-            )
-
-            # 2. FriBidi (Meson)
-            echo "### FriBidi ($LINK)"
-            ( cd fribidi
-              rm -rf _build
-              cat > fribidi.cross <<EOF
-          [binaries]
-          c = '$CC'
-          cpp = '$CXX'
-          ar = '$AR'
-          strip = '$STRIP'
-          pkgconfig = 'pkg-config'
-
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-          EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file fribidi.cross \
-                --prefix="$PREFIX" \
-                --default-library="$MESON_LIB" \
-                --buildtype=release \
-                -Ddocs=false \
-                -Ddeprecated=false \
-                -Db_staticpic=true
-              ninja -C _build
-              ninja -C _build install
-            )
-
-            # 3. HarfBuzz (Meson)
-            echo "### HarfBuzz ($LINK)"
-            ( cd harfbuzz
-              rm -rf _build
-              cat > android.cross <<EOF
-          [binaries]
-          c = '$CC'
-          cpp = '$CXX'
-          ar = '$AR'
-          strip = '$STRIP'
-          pkgconfig = 'pkg-config'
-
-          [properties]
-          needs_exe_wrapper = true
-
-          [host_machine]
-          system = 'android'
-          cpu_family = 'aarch64'
-          cpu = 'aarch64'
-          endian = 'little'
-          EOF
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              meson setup _build --cross-file android.cross \
-                --prefix="$PREFIX" \
-                --default-library="$MESON_LIB" \
-                --buildtype=release \
-                -Db_staticpic=true \
-                -Dfreetype=enabled \
-                -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
-                -Dicu=disabled -Dgraphite2=disabled \
-                -Dtests=disabled -Ddocs=disabled -Dintrospection=disabled
-              ninja -C _build
-              ninja -C _build install
-            )
-
-            # 4. 头文件归一化
-            echo "### Normalizing headers"
-            for sub in fribidi harfbuzz; do
-              if [ -d "$PREFIX/include/$sub" ]; then
-                for h in "$PREFIX/include/$sub"/*.h; do
-                  [ -e "$h" ] || continue
-                  ln -sf "$h" "$PREFIX/include/$(basename "$h")"
-                done
-              fi
-            done
-            if [ -f "$PREFIX/include/freetype2/ft2build.h" ]; then
-              ln -sf "$PREFIX/include/freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
-            fi
-
-            # 5. libass (Autotools) — 用 BASE_LDFLAGS（shared 时已含 -Wl,-rpath,.）
-            echo "### libass ($LINK)"
-            ( cd libass
-              make distclean >/dev/null 2>&1 || true
-              ./autogen.sh
-              PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
-              PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-              ./configure \
-                --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                $LTOPT --with-pic \
-                --disable-fontconfig \
-                --disable-require-system-font-provider \
-                CFLAGS="$CFLAGS_EXTRA" \
-                CPPFLAGS="$BASE_CPPFLAGS" \
-                LDFLAGS="$BASE_LDFLAGS"
-              make -j"$(nproc)"
-              make install
-            )
-
-            echo "::endgroup::"
+            exit $rc
           }
+          trap on_exit EXIT
 
-          build_stack static  "$PREFIX_STATIC"
-          build_stack shared  "$PREFIX_SHARED"
+          [ -d soxr ] || git clone --depth 1 https://github.com/chirlu/soxr.git soxr
+          cd soxr
+          rm -rf build
 
-      - name: Verify static libass
-        run: |
-          set -euxo pipefail
-          echo "=== libass.a ==="
-          test -s "$PREFIX_STATIC/lib/libass.a"
-          ls -la "$PREFIX_STATIC/lib/libass.a"
-          echo "=== 成员列表（前几项）==="
-          ar t "$PREFIX_STATIC/lib/libass.a" | head -5
-          echo "=== 抽一个 .o 看架构 ==="
-          TMP=$(mktemp -d)
-          ( cd "$TMP" && ar x "$PREFIX_STATIC/lib/libass.a" )
-          file "$TMP"/*.o | head -3 | tee /tmp/arch.txt
-          grep -q "ARM aarch64" /tmp/arch.txt || (echo "❌ 架构不是 aarch64"; exit 1)
-          echo "✅ static libass OK"
-
-      - name: Verify shared libass
-        run: |
-          set -euxo pipefail
-          echo "=== libass.so* ==="
-          ls -la "$PREFIX_SHARED/lib/libass.so"*
-          REAL=$(readlink -f "$PREFIX_SHARED/lib/libass.so")
-          file "$REAL"
-
-          echo "=== NEEDED / SONAME ==="
-          readelf -d "$REAL" | grep -E 'NEEDED|SONAME' || true
-
-          echo "=== RUNPATH / RPATH（应包含 [.]）==="
-          RP=$(readelf -d "$REAL" | grep -E 'RUNPATH|RPATH' || true)
-          echo "$RP"
-          if [ -z "$RP" ]; then
-            echo "::error::libass.so 未写入 RUNPATH/RPATH"
-            exit 1
+          if [ "$LINK" = "shared" ]; then
+            SHARED=ON
+          else
+            SHARED=OFF
           fi
-          if ! echo "$RP" | grep -qE '\[\.\]'; then
-            echo "::error::RUNPATH 中找不到 [.]"
-            exit 1
+
+          # ★ 关键点：不设 CMAKE_SYSTEM_NAME，交给 Android toolchain 自行推断
+          #   WITH_OPENMP=OFF → NDK clang 默认不含 OpenMP 运行时
+          #   WITH_AVFFT=OFF   → 不让 soxr 反向依赖 libavcodec 做 FFT
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$TARGET_ABI" \
+            -DANDROID_PLATFORM="android-$API_LEVEL" \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS="$SHARED" \
+            -DWITH_OPENMP=OFF \
+            -DWITH_AVFFT=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_EXAMPLES=OFF
+
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+          # ═══ 门禁 1：产物存在 ═══
+          echo "--- 安装产物 ---"
+          find "$PREFIX" \( -type f -o -type l \) | sort | sed 's/^/  /'
+
+          if [ "$LINK" = "shared" ]; then
+            [ -e "$PREFIX/lib/libsoxr.so" ] \
+              || { echo "::error::未生成 libsoxr.so"; exit 1; }
+          else
+            [ -e "$PREFIX/lib/libsoxr.a" ] \
+              || { echo "::error::未生成 libsoxr.a"; exit 1; }
           fi
-          echo "✅ RUNPATH 已含 [.]"
+          [ -e "$PREFIX/lib/pkgconfig/soxr.pc" ] \
+            || { echo "::error::未生成 soxr.pc"; exit 1; }
+          echo "✅ 库文件 + soxr.pc 存在"
 
-          echo
-          echo "⚠️  当前 SONAME 通常是 libass.so.9，打包进 APK libs/ 时注意重命名"
-          echo "✅ shared libass OK"
+          # ═══ 门禁 2：pkg-config 自洽 ═══
+          echo "--- soxr.pc 内容 ---"
+          sed 's/^/  /' "$PREFIX/lib/pkgconfig/soxr.pc"
 
-      - name: Collect artifacts
+          echo "--- pkg-config 解析 ---"
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
+          PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+            pkg-config --modversion --cflags --libs soxr | sed 's/^/  /'
+
+          # ═══ 门禁 3：shared 专属校验 ═══
+          if [ "$LINK" = "shared" ]; then
+            so="$PREFIX/lib/libsoxr.so"
+
+            echo "--- 架构 ---"
+            "$READELF" -h "$so" | awk -F: '/Machine|Class/{print "  "$2}'
+
+            echo "--- RUNPATH ---"
+            rp=$("$READELF" -d "$so" | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p' || true)
+            echo "  RUNPATH = ${rp:-<none>}"
+            if [ -n "${rp:-}" ] && [ "$rp" != '$ORIGIN' ]; then
+              echo "::warning::libsoxr.so RUNPATH=$rp（应为 \$ORIGIN 或无）"
+            fi
+
+            echo "--- 16KB 对齐 ---"
+            align=$("$READELF" -lW "$so" | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
+            echo "  LOAD p_align = ${align:-<none>}"
+            case "${align:-}" in
+              *0x1000*)
+                echo "::error::含 4KB LOAD 段（NDK r30 默认应为 0x4000）"
+                exit 1 ;;
+              *0x4000*)
+                echo "  ✅ 16KB 对齐" ;;
+              *)
+                echo "::warning::p_align 异常：${align:-<none>}" ;;
+            esac
+
+            echo "--- DT_NEEDED ---"
+            "$READELF" -d "$so" | grep NEEDED | sed 's/^/  /' || echo "  (无 DT_NEEDED)"
+          fi
+
+          echo "✅ libsoxr [$LINK] 构建成功"
+
+      - name: Smoke test (compile + link)
+        shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p artifacts/static/lib/pkgconfig artifacts/static/include \
-                   artifacts/shared/lib/pkgconfig artifacts/shared/include
+          set -euo pipefail
+          cat > /tmp/soxr_smoke.c <<'EOF'
+          #include <soxr.h>
+          #include <stdio.h>
 
-          cp -a "$PREFIX_STATIC"/lib/*.a artifacts/static/lib/
-          cp -a "$PREFIX_STATIC"/lib/pkgconfig/*.pc artifacts/static/lib/pkgconfig/ 2>/dev/null || true
-          cp -a "$PREFIX_STATIC"/include/. artifacts/static/include/
+          int main(void) {
+              soxr_quality_spec_t q  = soxr_quality_spec(SOXR_HQ, 0);
+              soxr_io_spec_t      io = soxr_io_spec(SOXR_FLOAT32_I, SOXR_FLOAT32_I);
+              soxr_error_t        err = NULL;
 
-          cp -a "$PREFIX_SHARED"/lib/*.so* artifacts/shared/lib/
-          cp -a "$PREFIX_SHARED"/lib/pkgconfig/*.pc artifacts/shared/lib/pkgconfig/ 2>/dev/null || true
-          cp -a "$PREFIX_SHARED"/include/. artifacts/shared/include/
+              soxr_t s = soxr_create(48000, 44100, 2, &err, &io, &q, NULL);
+              if (!s) {
+                  fprintf(stderr, "soxr_create failed: %s\n",
+                          err ? soxr_strerror(err) : "unknown");
+                  return 1;
+              }
+              soxr_delete(s);
+              printf("soxr OK: version=%s\n", soxr_version());
+              return 0;
+          }
+          EOF
 
-          echo "=== static files ==="
-          find artifacts/static -type f | sort
-          echo "=== shared files ==="
-          find artifacts/shared -type f | sort
+          # 交叉编译：只能验证“编译 + 链接”阶段能通过，
+          # 无法在 x86_64 runner 上实际运行 ARM64 可执行文件。
+          "$CC" /tmp/soxr_smoke.c -o /tmp/soxr_smoke.out \
+            -I"$PREFIX/include" \
+            -L"$PREFIX/lib" \
+            -lsoxr -lm
 
-      - name: Upload libass static
+          echo "--- smoke 产物 ---"
+          file /tmp/soxr_smoke.out
+          "$READELF" -d /tmp/soxr_smoke.out | grep NEEDED | sed 's/^/  /' || true
+          echo "✅ 编译 + 链接通过（头文件与符号均可用）"
+
+      - name: Upload prefix [${{ matrix.link }}]
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: libass-static-aarch64-api${{ env.API_LEVEL }}
-          path: artifacts/static/
+          name: soxr-${{ matrix.link }}
+          path: ${{ github.workspace }}/prefix/${{ matrix.link }}
+          if-no-files-found: warn
+          retention-days: 3
 
-      - name: Upload libass shared
-        uses: actions/upload-artifact@v4
+  verify:
+    needs: build-soxr
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download prefixes
+        uses: actions/download-artifact@v4
         with:
-          name: libass-shared-aarch64-api${{ env.API_LEVEL }}
-          path: artifacts/shared/
+          pattern: soxr-*
+          path: ${{ github.workspace }}/prefix
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -uo pipefail
+          P="${{ github.workspace }}/prefix"
+          DS="$P/soxr-static"
+          DH="$P/soxr-shared"
+
+          echo "===== 顶层布局 ====="
+          find "$P" -maxdepth 2 | sort || true
+
+          echo "===== static ====="
+          if [ -d "$DS" ]; then
+            find "$DS" -maxdepth 2 \( -name '*.a' -o -name '*.pc' \) 2>/dev/null | sort || true
+            if [ -f "$DS/lib/libsoxr.a" ]; then
+              echo "  ✅ libsoxr.a $(du -h "$DS/lib/libsoxr.a" | cut -f1)"
+            else
+              echo "::error::static 变体缺 libsoxr.a"
+            fi
+            [ -f "$DS/lib/pkgconfig/soxr.pc" ] \
+              && echo "  ✅ soxr.pc" \
+              || echo "::error::static 变体缺 soxr.pc"
+          else
+            echo "::error::缺少 $DS（static job 未上传产物）"
+          fi
+
+          echo "===== shared ====="
+          if [ -d "$DH" ]; then
+            find "$DH/lib" -maxdepth 1 -name 'libsoxr.so*' 2>/dev/null | sort \
+              | while IFS= read -r f; do
+                  if [ -L "$f" ]; then
+                    printf '  %-24s -> %s\n' "$(basename "$f")" "$(readlink "$f")"
+                  else
+                    printf '  %-24s (regular, %s)\n' \
+                      "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+                  fi
+                done || true
+
+            real="$DH/lib/libsoxr.so"
+            [ -e "$real" ] \
+              || real="$(find "$DH/lib" -maxdepth 1 -name 'libsoxr.so.*' -type f 2>/dev/null | head -1 || true)"
+
+            if [ -n "${real:-}" ] && [ -e "$real" ]; then
+              echo "--- 实体文件：$(basename "$real") ---"
+              echo -n "  Machine  = "
+              readelf -h "$real" 2>/dev/null \
+                | awk -F: '/Machine/{gsub(/^ +/,"",$2); print $2}' || true
+              echo -n "  p_align  = "
+              readelf -lW "$real" 2>/dev/null \
+                | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ' || true
+              echo
+              echo -n "  RUNPATH  = "
+              readelf -d "$real" 2>/dev/null \
+                | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p' || echo "(none)"
+
+              echo "--- DT_NEEDED ---"
+              readelf -d "$real" 2>/dev/null \
+                | sed -n 's/.*NEEDED.*\[\(.*\)\].*/  \1/p' || true
+
+              echo "--- 断言 ---"
+              readelf -lW "$real" 2>/dev/null \
+                | awk '/ LOAD /{print $NF}' | sort -u | grep -qx '0x4000' \
+                && echo "  ✅ 16KB 对齐" \
+                || echo "::warning::LOAD p_align 不纯为 0x4000"
+
+              echo "--- .symtab 残留 ---"
+              if readelf -SW "$real" 2>/dev/null | grep -q '\.symtab'; then
+                echo "  ::warning::$(basename "$real") 仍含 .symtab（CMake 默认未 strip）"
+              else
+                echo "  ✅ 无 .symtab"
+              fi
+
+              [ -f "$DH/lib/pkgconfig/soxr.pc" ] \
+                && echo "  ✅ soxr.pc" \
+                || echo "::error::shared 变体缺 soxr.pc"
+            else
+              echo "::error::shared 变体找不到实体 .so"
+            fi
+          else
+            echo "::error::缺少 $DH（shared job 未上传产物）"
+          fi
+
+          echo "===== 汇总 ====="
+          echo "static: $(find "$DS/lib" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l) 个 .a, $(find "$DS/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc"
+          echo "shared: $(find "$DH/lib" -maxdepth 1 -name 'libsoxr.so*' 2>/dev/null | wc -l) 个 .so*, $(find "$DH/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc"
