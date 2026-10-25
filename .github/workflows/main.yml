@@ -500,6 +500,36 @@ jobs:
               mkpc liblc3 "Low Complexity Communication Codec" "1.1.0" lc3 "-lm"
               mkpc lc3    "Low Complexity Communication Codec" "1.1.0" lc3 "-lm"
 
+          - name: libsoxr
+            libs: "soxr"
+            build: |
+              [ -d soxr ] || git clone --depth 1 https://github.com/chirlu/soxr.git soxr
+              cd soxr
+              rm -rf build
+              # ★ 不设 CMAKE_SYSTEM_NAME：交给 Android toolchain 自行推断（SIMD 检测敏感）
+              #   WITH_OPENMP=OFF         → NDK clang 默认不含 OpenMP 运行时
+              #   WITH_AVFFT=OFF          → 不让 soxr 反向依赖 libavcodec 做 FFT（保持依赖树干净）
+              #   WITH_LSR_BINDINGS=OFF   → 不生成 libsamplerate 兼容层（libsoxr-lsr），减小体积
+              cmake -S . -B build -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+                -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+                -DBUILD_SHARED_LIBS="$CMAKE_SHARED_LIBS" \
+                -DWITH_OPENMP=OFF \
+                -DWITH_AVFFT=OFF \
+                -DWITH_LSR_BINDINGS=OFF \
+                -DBUILD_TESTS=OFF \
+                -DBUILD_EXAMPLES=OFF \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build build -j"$(nproc)"
+              cmake --install build
+              # soxr.pc 上游 CMake install 会自动生成；若上游结构变化则兜底补
+              if [ ! -f "$PREFIX/lib/pkgconfig/soxr.pc" ]; then
+                echo "::warning::libsoxr: 上游未生成 soxr.pc，使用 mkpc 兜底"
+                mkpc soxr "The SoX Resampler library" "0.1.3" soxr "-lm"
+              fi
+
           - name: webp
             libs: "webp sharpyuv"
             build: |
@@ -961,7 +991,7 @@ jobs:
           echo "===== 缺库检查 ====="
           miss=""
           for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
-                     fdk-aac mp3lame opus ogg vorbis vorbisenc lc3 webp \
+                     fdk-aac mp3lame opus ogg vorbis vorbisenc lc3 soxr webp \
                      freetype fribidi harfbuzz ass; do
             s="-"; h="-"
             find "$P/static/lib" -maxdepth 1 -name "lib${lib}.a" | grep -q . && s="ok"
@@ -978,6 +1008,17 @@ jobs:
                 echo "✅ [$d] x264.pc 存在"
               else
                 echo "::error::[$d] 缺 x264.pc，FFmpeg 的 require_pkg_config 会失败"
+              fi
+            fi
+          done
+
+          echo "===== soxr.pc 检查（FFmpeg --enable-libsoxr 必需）====="
+          for d in static shared; do
+            if [ -e "$P/$d/lib/libsoxr.a" ] || [ -e "$P/$d/lib/libsoxr.so" ]; then
+              if [ -e "$P/$d/lib/pkgconfig/soxr.pc" ]; then
+                echo "✅ [$d] soxr.pc 存在"
+              else
+                echo "::error::[$d] 缺 soxr.pc，FFmpeg 的 --enable-libsoxr 会失败"
               fi
             fi
           done
@@ -1103,7 +1144,7 @@ jobs:
             echo "- 16 KB 页对齐：全部 \`.so\` 的 LOAD 段 \`p_align = 0x4000\` ✅"
             echo "- RUNPATH：全部 \`.so\` 统一为 \`\$ORIGIN\`（与工作目录无关）✅"
             echo "- 符号表：全部 \`.so\` 已用 NDK \`llvm-strip\` 处理，无 \`.symtab\`，导出 ABI 符号完整 ✅"
-            echo "- x264.pc：已补齐（FFmpeg 静态链接必需）✅"
+            echo "- x264.pc / soxr.pc：已就位（FFmpeg 静态链接必需）✅"
             echo "- libc++：静态链接且符号已隐藏 ✅"
             echo
             echo "### 产物"
@@ -1138,7 +1179,7 @@ jobs:
             echo '```sh'
             echo 'tar xf ffmpeg-libs-arm64-v8a-api36-full.tar.xz'
             echo 'export PKG_CONFIG_PATH=$PWD/prefix/shared/lib/pkgconfig'
-            echo 'pkg-config --libs --cflags libass freetype2 harfbuzz fribidi'
+            echo 'pkg-config --libs --cflags libass freetype2 harfbuzz fribidi soxr'
             echo '```'
             echo
             echo "> 所有 \`.so\` 的 RUNPATH 均为 \`\$ORIGIN\`，可放在任意目录下使用。"
