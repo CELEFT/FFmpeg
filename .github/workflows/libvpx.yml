@@ -277,7 +277,8 @@ jobs:
           path: ${{ github.workspace }}/prefix/${{ matrix.link }}
           if-no-files-found: warn
           retention-days: 3
-   verify:
+
+  verify:
     needs: build-libvpx
     if: always()
     runs-on: ubuntu-latest
@@ -351,4 +352,4 @@ jobs:
 
           echo "===== 汇总 ====="
           echo "static: $(find "$DS/lib" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l) 个 .a, $(find "$DS/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc"
-          echo "shared: $(find "$DH/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l) 个 .so*, $(find "$DH/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc" 
+          echo "shared: $(find "$DH/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l) 个 .so*, $(find "$DH/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l) 个 .pc"
