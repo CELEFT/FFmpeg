@@ -97,19 +97,31 @@ jobs:
             build: |
               [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
               cd libvpx
+
               make distclean >/dev/null 2>&1 || true
-              find . -name "configure*" -type f -exec \
-                sed -i 's/die "--enable-shared only supported on ELF, OS\/2, and Darwin for now"/echo "Skipping ELF check for Android"/g' {} +
-              export CROSS="$TOOLCHAIN/bin/llvm-"
-              export ASFLAGS="-D__ANDROID__"
+
+              export CC="$CC"
+              export CXX="$CXX"
+              export AR="$AR"
+              export AS="$CC"
+              export LD="$CC"
+              export STRIP="$STRIP"
               export LDFLAGS="-Wl,-z,max-page-size=16384"
-              ./configure --prefix="$PREFIX" --target=arm64-android-gcc --libc="$SYSROOT" \
+
+              ./configure \
+                --prefix="$PREFIX" \
+                --target=arm64-android-gcc \
                 --enable-vp8 --enable-vp9 $LTOPT \
-                --disable-examples --disable-tools --disable-docs --disable-unit-tests \
-                --extra-cflags="-fPIC"
+                --disable-examples \
+                --disable-tools \
+                --disable-docs \
+                --disable-unit-tests \
+                --extra-cflags="-fPIC -mno-outline-atomics" \
+                --extra-ldflags="-Wl,-z,max-page-size=16384 -lc"
+
               make -j"$(nproc)"
               make install
-
+              
           - name: libaom
             libs: "aom"
             build: |
