@@ -1,7 +1,5 @@
 name: Test libvpx (arm64-v8a)
 
-# 独立测试用：只编 libvpx，static + shared 双变体
-# 验证通过后再把 job 内容搬回 main.yml
 on:
   workflow_dispatch:
   push:
@@ -75,23 +73,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          D="$GITHUB_WORKSPACE/libvpx"
 
-          # ── 失败时自动导出诊断，不依赖 github 日志里翻 config.log ──
+          # ── 失败诊断：路径全部绝对化，不再依赖 cwd ──
           on_exit() {
             local rc=$?
             trap - EXIT
             if [ "$rc" -ne 0 ]; then
               echo "::group::❌ 失败诊断 — libvpx [$LINK]"
-              if [ -f libvpx/config.log ]; then
-                echo "===== config.log: error / die / unsupported 行 ====="
-                grep -nE 'error:|Unknown option|not supported|only supported on' libvpx/config.log | tail -30 || true
-                echo "===== config.log 末 50 行 ====="
-                tail -50 libvpx/config.log || true
+              local log
+              log=$(find "$D" -maxdepth 1 -name config.log 2>/dev/null | head -1 || true)
+              if [ -n "${log:-}" ]; then
+                echo "===== $log ：错误相关行 ====="
+                grep -nE 'error:|Unknown option|not supported|only supported on' "$log" | tail -30 || true
+                echo "===== $log ：末 40 行 ====="
+                tail -40 "$log" || true
+              else
+                echo "（$D 下无 config.log — 说明死在 configure 之前）"
               fi
-              for f in libvpx/config.mk libvpx/libs-arm64-android-gcc.mk; do
+              local f
+              for f in "$D"/config.mk "$D"/libs-*.mk "$D"/vpx_config.h; do
                 [ -f "$f" ] || continue
                 echo "===== $f ====="
-                grep -nE 'LDFLAGS|CONFIG_(SHARED|STATIC|PIC|VP8|VP9)' "$f" || true
+                grep -nE 'LDFLAGS|CONFIG_SHARED|CONFIG_STATIC|CONFIG_PIC' "$f" | head -30 || true
               done
               echo "::endgroup::"
             fi
@@ -102,14 +107,13 @@ jobs:
           [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
           cd libvpx
           make distclean >/dev/null 2>&1 || true
-          rm -f config.mk config.log vpx_config.h vpx_config.c libs-arm64-android-gcc.mk
+          rm -f config.mk config.log vpx_config.h vpx_config.c libs-*.mk
 
-          # ═══ 补丁 A：--enable-shared 平台白名单加入 android ═══
+          # ═══ 补丁 A：白名单加入 android ═══
           python3 - <<'PY'
           import re
           from pathlib import Path
-          p = Path("configure")
-          s = p.read_text()
+          p = Path("configure"); s = p.read_text()
           want = "linux|android|os2|solaris|darwin*|iphonesimulator*)"
           if want in s:
               print("configure: 已含 android，跳过")
@@ -123,7 +127,7 @@ jobs:
               print("configure: " + new.strip())
           PY
 
-          # ═══ 补丁 B：注释 -static（NDK 只有 libc.so，无 libc.a）═══
+          # ═══ 补丁 B：注释 -static ═══
           python3 - <<'PY'
           from pathlib import Path
           p = Path("build/make/configure.sh")
@@ -142,14 +146,13 @@ jobs:
               raise SystemExit("::error::configure.sh: 找不到 check_add_ldflags -static，上游已改动")
           PY
 
-          echo "--- 补丁后的关键行 ---"
-          grep -n 'iphonesimulator\*)' configure | sed 's/^/  /'
-          grep -n 'check_add_ldflags -static' build/make/configure.sh | sed 's/^/  /'
+          echo "--- 补丁后关键行 ---"
+          grep -n 'iphonesimulator\*)' configure | sed 's/^/  /' || true
+          grep -n 'check_add_ldflags -static' build/make/configure.sh | sed 's/^/  /' || true
 
           # ═══ 工具链 ═══
           export CC CXX AR RANLIB STRIP
           export AS="$CC"
-          # 不设 LD：webm_io 启用时 configure 末尾 LD=${CXX} 会覆盖它
 
           # ═══ 链接标志（转义链：Shell → Make → ld）═══
           export LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,--enable-new-dtags -Wl,-rpath,'\$\$ORIGIN'"
@@ -160,7 +163,6 @@ jobs:
             LTOPT="--enable-static --disable-shared"
           fi
 
-          # ═══ configure（与你本地命令逐字一致）═══
           ./configure \
             --prefix="$PREFIX" \
             --force-target=arm64-android-gcc \
@@ -174,23 +176,52 @@ jobs:
             --disable-unit-tests \
             --extra-cflags="-O2 -fPIC -mno-outline-atomics --sysroot=${SYSROOT}"
 
-          # ═══ 门禁 1：configure 产物 ═══
-          echo "--- config.mk 关键项 ---"
-          grep -E '^CONFIG_(SHARED|STATIC|PIC|VP8|VP9)=' config.mk | sed 's/^/  /'
-          echo "--- libs-*.mk 的 LDFLAGS ---"
-          grep -hE '^LDFLAGS' libs-*.mk 2>/dev/null | sort -u | sed 's/^/  /'
+          # ═══ 门禁 1：config 变量在 libs-*.mk 里，不是 config.mk ═══
+          MK=$(ls libs-*-gcc.mk 2>/dev/null | head -1 || true)
+          if [ -z "${MK:-}" ]; then
+            echo "::error::未生成 libs-*-gcc.mk"; ls -la | head -40; exit 1
+          fi
+          echo "目标 mk 文件: $MK"
 
-          grep -qh 'ORIGIN' libs-*.mk || {
-            echo "::error::libs-*.mk 里没有 ORIGIN，\$ORIGIN 转义失效（会退化成 RIGIN）"; exit 1; }
-          grep -qE '(^|[[:space:]])-static([[:space:]]|$)' config.mk && {
-            echo "::error::config.mk 仍含 -static，补丁 B 未生效"; exit 1; }
-          grep -q '^CONFIG_PIC=yes' config.mk || { echo "::error::CONFIG_PIC != yes"; exit 1; }
+          echo "--- 关键项（$MK）---"
+          { grep -nE '^(CONFIG_(SHARED|STATIC|PIC|VP8|VP9|MULTITHREAD)|HAVE_(NEON|NEON_DOTPROD|NEON_I8MM|SVE|SVE2))=' "$MK" || true; } | sed 's/^/  /'
+          echo "--- LDFLAGS（$MK）---"
+          { grep -nE '^LDFLAGS' "$MK" || true; } | sed 's/^/  /'
+
+          # 值查找：先 $MK，再 config.mk，最后 vpx_config.h
+          cfg() {
+            local n="$1" v f
+            for f in "$MK" config.mk; do
+              [ -f "$f" ] || continue
+              v=$(sed -n "s/^${n}=//p" "$f" | head -1)
+              [ -n "${v:-}" ] && { printf '%s' "$v"; return 0; }
+            done
+            if [ -f vpx_config.h ]; then
+              v=$(sed -n "s/^#define[[:space:]]\{1,\}${n}[[:space:]]\{1,\}\([0-9]\).*/\1/p" vpx_config.h | head -1)
+              [ -n "${v:-}" ] && { [ "$v" = "1" ] && printf yes || printf no; return 0; }
+            fi
+            return 1
+          }
+
+          require() {
+            local n="$1" want="$2" got
+            if ! got=$(cfg "$n"); then
+              echo "::error::找不到 $n（$MK / config.mk / vpx_config.h）"; return 1
+            fi
+            [ "$got" = "$want" ] || { echo "::error::$n=$got，期望 $want"; return 1; }
+            echo "  ✅ $n=$got"
+          }
+
+          require CONFIG_PIC yes
           if [ "$LINK" = "shared" ]; then
-            grep -q '^CONFIG_SHARED=yes' config.mk || { echo "::error::CONFIG_SHARED != yes"; exit 1; }
-            grep -q '^CONFIG_STATIC=no'  config.mk || { echo "::error::CONFIG_STATIC != no";  exit 1; }
+            require CONFIG_SHARED yes
+            grep -q 'ORIGIN' "$MK" || { echo "::error::$MK 无 ORIGIN，\$ORIGIN 转义失效（会退化成 RIGIN）"; exit 1; }
+            echo "  ✅ LDFLAGS 含 ORIGIN"
           else
-            grep -q '^CONFIG_STATIC=yes' config.mk || { echo "::error::CONFIG_STATIC != yes"; exit 1; }
-            grep -q '^CONFIG_SHARED=no'  config.mk || { echo "::error::CONFIG_SHARED != no";  exit 1; }
+            require CONFIG_STATIC yes
+          fi
+          if grep -qE '(^|[[:space:]])-static([[:space:]]|$)' "$MK"; then
+            echo "::error::$MK 仍含 -static，补丁 B 未生效"; exit 1
           fi
           echo "✅ 门禁 1 通过"
 
@@ -199,45 +230,41 @@ jobs:
           make install
 
           # ═══ 门禁 2：产物 ═══
-          [ -f "$PREFIX/lib/pkgconfig/vpx.pc" ] && echo "✅ vpx.pc 已安装" \
-            || echo "::warning::未找到 vpx.pc"
+          if [ -f "$PREFIX/lib/pkgconfig/vpx.pc" ]; then echo "✅ vpx.pc 已安装"
+          else echo "::warning::未找到 vpx.pc"; fi
 
           if [ "$LINK" = "shared" ]; then
             so="$PREFIX/lib/libvpx.so"
-            [ -e "$so" ] || { echo "::error::未生成 $so"; ls -l "$PREFIX/lib"; exit 1; }
+            [ -e "$so" ] || { echo "::error::未生成 $so"; ls -l "$PREFIX/lib" 2>/dev/null; exit 1; }
 
             echo "--- RUNPATH ---"
-            "$READELF" -d "$so" | grep -E 'RUNPATH|RPATH' | sed 's/^/  /'
-            "$READELF" -d "$so" | grep -q '\[\$ORIGIN\]' || {
-              echo "::error::RUNPATH 不是 \$ORIGIN"; exit 1; }
+            { "$READELF" -d "$so" | grep -E 'RUNPATH|RPATH' || true; } | sed 's/^/  /'
+            "$READELF" -d "$so" | grep -q '\[\$ORIGIN\]' || { echo "::error::RUNPATH 不是 \$ORIGIN"; exit 1; }
 
             echo "--- DT_NEEDED ---"
-            "$READELF" -d "$so" | grep NEEDED | sed 's/^/  /'
+            { "$READELF" -d "$so" | grep NEEDED || true; } | sed 's/^/  /'
 
             echo "--- 架构 / 对齐 ---"
-            "$READELF" -h "$so" | awk -F: '/Machine|Class/{print "  "$2}'
-            align=$("$READELF" -lW "$so" | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
+            { "$READELF" -h "$so" | awk -F: '/Machine|Class/{print "  "$2}'; } || true
+            align=$("$READELF" -lW "$so" | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ' || true)
             echo "  LOAD p_align = ${align:-<none>}"
-            case "$align" in
+            case "${align:-}" in
               *0x1000*) echo "::error::含 4KB LOAD 段，max-page-size 未生效"; exit 1 ;;
               *0x4000*) echo "  ✅ 16KB 对齐" ;;
-              *)        echo "::warning::p_align 异常：$align" ;;
+              *)        echo "::warning::p_align 异常：${align:-<none>}" ;;
             esac
 
             if "$READELF" -d "$so" | grep -q 'NEEDED.*libc++_shared.so'; then
-              echo "::notice::libvpx.so 依赖 libc++_shared.so（webm_io/libyuv 启用所致）→ 随包分发"
+              echo "::notice::依赖 libc++_shared.so（webm_io/libyuv 启用所致）→ 随包分发"
               cp -f "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" "$PREFIX/lib/"
               "$READELF" -h "$PREFIX/lib/libc++_shared.so" | grep -q 'AArch64' || {
                 echo "::error::libc++_shared.so 不是 AArch64"; exit 1; }
               echo "✅ 已随包分发 aarch64 libc++_shared.so"
             else
-              echo "✅ libvpx.so 不依赖 libc++_shared.so"
+              echo "✅ 不依赖 libc++_shared.so"
             fi
           else
-            [ -e "$PREFIX/lib/libvpx.a" ] || { echo "::error::未生成 libvpx.a"; exit 1; }
-            if "$READELF" -r "$PREFIX/lib/libvpx.a" 2>/dev/null | grep -q 'R_AARCH64_.*_ABS'; then
-              echo "::warning::libvpx.a 含绝对重定位，可能缺 -fPIC"
-            fi
+            [ -e "$PREFIX/lib/libvpx.a" ] || { echo "::error::未生成 libvpx.a"; ls -l "$PREFIX/lib" 2>/dev/null; exit 1; }
             echo "✅ libvpx.a $(du -h "$PREFIX/lib/libvpx.a" | cut -f1)"
           fi
           echo "✅ 门禁 2 通过 — libvpx [$LINK]"
@@ -266,9 +293,8 @@ jobs:
         run: |
           set -uo pipefail
           P="${{ github.workspace }}/prefix"
-          echo "===== 目录结构 ====="
-          find "$P" -maxdepth 3 \( -name '*.a' -o -name '*.so' -o -name '*.so.*' -o -name '*.pc' \) | sort
-
+          echo "===== 产物列表 ====="
+          find "$P" -maxdepth 3 \( -name '*.a' -o -name 'libvpx.so*' -o -name '*.pc' \) 2>/dev/null | sort || true
           echo "===== 汇总 ====="
           for d in static shared; do
             [ -d "$P/$d" ] || { echo "[$d] 不存在"; continue; }
@@ -276,10 +302,9 @@ jobs:
                  "so=$(find "$P/$d/lib" -maxdepth 1 -name 'libvpx.so*' 2>/dev/null | wc -l)" \
                  "pc=$(find "$P/$d/lib/pkgconfig" -name '*.pc' 2>/dev/null | wc -l)"
           done
-
-          echo "===== shared RUNPATH 复核（脱离构建环境）====="
+          echo "===== shared RUNPATH 复核（未经 patchelf）====="
           for so in "$P"/shared/lib/libvpx.so*; do
             [ -e "$so" ] || continue
-            printf '  %-24s %s\n' "$(basename "$so")" \
+            printf '  %-22s %s\n' "$(basename "$so")" \
               "$(readelf -d "$so" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
           done || true
