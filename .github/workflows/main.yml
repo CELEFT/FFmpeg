@@ -860,8 +860,10 @@ jobs:
           path: ${{ github.workspace }}/prefix
           merge-multiple: true
 
-      - name: Install patchelf
-        run: sudo apt-get update && sudo apt-get install -y patchelf
+      - name: Install patchelf & aarch64 binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patchelf binutils-aarch64-linux-gnu
 
       - name: Normalize prefix with find
         shell: bash
@@ -901,6 +903,62 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$f"
             printf '  %-34s %-12s -> %s\n' "$(basename "$f")" "${cur:-(none)}" "$(patchelf --print-rpath "$f")"
           done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+
+          # ★ strip：动态库精简（在 patchelf 之后，是 ELF 的最后一次修改）
+          echo "===== strip shared .so ====="
+          STRIP_BIN="${STRIP_BIN:-aarch64-linux-gnu-strip}"
+          if ! command -v "$STRIP_BIN" >/dev/null 2>&1; then
+            echo "::error::$STRIP_BIN 不存在"; exit 1
+          fi
+
+          sb=0; sf=0
+          while IFS= read -r -d '' f; do
+            b="$(basename "$f")"
+            # 少数 lib 的 .so 是链接器脚本（纯文本），strip 会报错
+            if ! readelf -h "$f" >/dev/null 2>&1; then
+              echo "::warning::$b 不是 ELF，跳过"; continue
+            fi
+
+            sz0=$(( $(stat -c %s "$f") ))
+            # 导出符号快照：strip 前后必须一致
+            readelf -sW --dyn-syms "$f" 2>/dev/null \
+              | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print $8}' | sort -u > /tmp/sym.before
+            rp0="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+            ne0="$(readelf -d "$f" 2>/dev/null | awk '/\(NEEDED\)/{n++} END{print n+0}')"
+
+            if ! "$STRIP_BIN" --strip-unneeded "$f" 2>/tmp/strip.err; then
+              echo "::warning::$b strip 失败：$(tr '\n' ' ' < /tmp/strip.err)"
+              sf=$((sf+1)); continue
+            fi
+
+            # 断言 1：.symtab 必须消失
+            if readelf -SW "$f" 2>/dev/null | grep -q '\.symtab'; then
+              echo "::error::$b strip 后仍含 .symtab"; sf=$((sf+1)); continue
+            fi
+
+            # 断言 2：导出符号集合不得变化
+            readelf -sW --dyn-syms "$f" 2>/dev/null \
+              | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print $8}' | sort -u > /tmp/sym.after
+            if ! diff -q /tmp/sym.before /tmp/sym.after >/dev/null; then
+              echo "::error::$b 导出符号变化（strip 伤了 ABI）"
+              diff /tmp/sym.before /tmp/sym.after | head -10
+              sf=$((sf+1)); continue
+            fi
+
+            # 断言 3：RUNPATH 不被改动；DT_NEEDED 只告警
+            rp1="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+            ne1="$(readelf -d "$f" 2>/dev/null | awk '/\(NEEDED\)/{n++} END{print n+0}')"
+            [ "$rp0" = "$rp1" ] || { echo "::error::$b RUNPATH [$rp0] → [$rp1]"; sf=$((sf+1)); }
+            [ "$ne0" = "$ne1" ] || echo "::warning::$b DT_NEEDED 数 $ne0 → $ne1"
+
+            sz1=$(( $(stat -c %s "$f") ))
+            printf '  %-34s %8s → %-8s (%s%%)\n' "$b" "$(numfmt --to=iec "$sz0")" \
+              "$(numfmt --to=iec "$sz1")" "$(( sz1 * 100 / (sz0 ? sz0 : 1) ))"
+            sb=$((sb+1))
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f -print0 2>/dev/null)
+
+          echo "===== strip 完成：$sb 个，异常 $sf 个 ====="
+          [ "$sf" -eq 0 ] || { echo "::error::$sf 个 .so strip 异常"; exit 1; }
 
           echo "===== 统计 ====="
           for d in static shared; do
@@ -1045,6 +1103,7 @@ jobs:
             echo
             echo "- 16 KB 页对齐：全部 \`.so\` 的 LOAD 段 \`p_align = 0x4000\` ✅"
             echo "- RUNPATH：全部 \`.so\` 统一为 \`\$ORIGIN\`（与工作目录无关）✅"
+            echo "- 符号表：全部 \`.so\` 已 \`--strip-unneeded\`，无 \`.symtab\`，导出 ABI 符号完整 ✅"
             echo "- x264.pc：已补齐（FFmpeg 静态链接必需）✅"
             echo "- libc++：静态链接且符号已隐藏 ✅"
             echo
