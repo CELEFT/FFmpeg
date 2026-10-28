@@ -1,0 +1,690 @@
+name: Build libffmpeg (dev: single .so/.a + headers)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: 'FFmpeg Version'
+        required: true
+        default: '9.0.2'
+      prefix_url:
+        description: '外部库下载链接 (留空则使用默认 full.tar.xz)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 0 14 * *'   # 每月 14 号 00:00 UTC（北京时间 14 号 08:00）
+
+env:
+  NDK_VERSION: "r30"
+  API_LEVEL: "36"
+  NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
+  ANDROID_TRIPLE: "aarch64-linux-android"
+  FFMPEG_VERSION_DEFAULT: "9.0.2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =====================================================================
+  # 编译 FFmpeg 静态库 → 合并 libffmpeg.so / libffmpeg.a + include
+  # =====================================================================
+  build-libffmpeg-dev:
+    name: build-libffmpeg (dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config \
+            nasm yasm cmake meson ninja-build git wget unzip file binutils xz-utils patchelf
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/ndk
+          key: Linux-ndk-${{ env.NDK_VERSION }}
+
+      - name: Restore NDK permissions (cache hit)
+        if: steps.cache-ndk.outputs.cache-hit == 'true'
+        run: chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Download NDK (cache miss)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          wget -q --tries=3 --timeout=30 "${{ env.NDK_URL }}" -O ndk.zip
+          unzip -q ndk.zip
+          mv android-ndk-r30* "${{ github.workspace }}/ndk"
+          rm -f ndk.zip
+          chmod -R +x "${{ github.workspace }}/ndk"
+
+      - name: Verify NDK toolchain
+        run: |
+          set -euo pipefail
+          TC="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          CC="$TC/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+          printf 'int main(void){return 0;}\n' > /tmp/smoke.c
+          "$CC" /tmp/smoke.c -o /tmp/smoke.out
+          file /tmp/smoke.out
+          SYS_LIB="$TC/sysroot/usr/lib/${ANDROID_TRIPLE}"
+          for a in libc++_static.a libc++abi.a; do
+            [ -f "$SYS_LIB/$a" ] && echo "✅ $a" || echo "::warning::缺少 $SYS_LIB/$a"
+          done
+
+      - name: Download and extract prefix
+        run: |
+          set -euo pipefail
+          W="${{ github.workspace }}"
+          FINAL_URL="${{ inputs.prefix_url }}"
+          if [ -z "$FINAL_URL" ]; then
+            FINAL_URL="https://github.com/CELEFT/FFmpeg/releases/download/ffmpeg-lib/ffmpeg-libs-arm64-v8a-api${API_LEVEL}-full.tar.xz"
+          fi
+          echo "📥 下载外部库: $FINAL_URL"
+          wget -q --tries=3 --timeout=60 "$FINAL_URL" -O prefix_pkg
+          file prefix_pkg
+
+          rm -rf extract_dir && mkdir -p extract_dir
+          if file prefix_pkg | grep -qi "Zip archive"; then
+            unzip -q prefix_pkg -d extract_dir
+          elif file prefix_pkg | grep -qi "XZ compressed"; then
+            tar -xf prefix_pkg -C extract_dir
+          elif file prefix_pkg | grep -qi "gzip compressed"; then
+            tar -xzf prefix_pkg -C extract_dir
+          else
+            echo "::error::未知的压缩格式"; exit 1
+          fi
+
+          if [ -d "extract_dir/prefix" ]; then
+            mv extract_dir/prefix "$W/prefix"
+          elif [ -d "extract_dir/lib" ] && [ -d "extract_dir/include" ]; then
+            mv extract_dir "$W/prefix"
+          else
+            echo "::error::解压后找不到 prefix 目录"; exit 1
+          fi
+
+          if [ -d "$W/prefix/static" ] && [ -d "$W/prefix/shared" ]; then
+            LAYOUT="two"; PST="$W/prefix/static"; PSH="$W/prefix/shared"
+          else
+            LAYOUT="flat"; PST="$W/prefix"; PSH="$W/prefix"
+          fi
+
+          {
+            echo "PREFIX_ROOT=$W/prefix"
+            echo "PREFIX_STATIC=$PST"
+            echo "PREFIX_SHARED=$PSH"
+            echo "PREFIX_LAYOUT=$LAYOUT"
+          } >> "$GITHUB_ENV"
+
+          echo "--- static libs ---"
+          ls -1 "$PST"/lib/*.a 2>/dev/null | head -40 || echo "(none)"
+
+      - name: Preflight pkg-config & shim missing modules
+        shell: bash
+        run: |
+          set -uo pipefail
+          for PREFIX in "${PREFIX_STATIC}" "${PREFIX_SHARED}"; do
+            [ -d "$PREFIX" ] || continue
+            PC="$PREFIX/lib/pkgconfig"
+            mkdir -p "$PC"
+
+            echo "===== [$PREFIX] pkg-config 清点 ====="
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp fdk-aac lame opus vorbis lc3 \
+                     libass freetype2 fribidi harfbuzz openssl; do
+              if PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null; then
+                printf '  %-12s ok\n' "$m"
+              else
+                printf '  %-12s MISSING\n' "$m"
+              fi
+            done
+
+            if [ ! -e "$PC/x264.pc" ] && { [ -e "$PREFIX/lib/libx264.a" ] || [ -e "$PREFIX/lib/libx264.so" ]; }; then
+              echo "🔧 生成 x264.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: x264'
+                echo 'Description: H.264/MPEG-4 AVC codec'
+                echo 'Version: 164'
+                echo 'Libs: -L${libdir} -lx264'
+                echo 'Libs.private: -lm -ldl'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/x264.pc"
+            fi
+
+            if [ ! -e "$PC/openssl.pc" ] && [ -e "$PC/libssl.pc" ]; then
+              echo "🔧 生成 openssl.pc"
+              {
+                echo "prefix=$PREFIX"
+                echo 'exec_prefix=${prefix}'
+                echo 'libdir=${exec_prefix}/lib'
+                echo 'includedir=${prefix}/include'
+                echo
+                echo 'Name: openssl'
+                echo 'Description: OpenSSL shim for FFmpeg'
+                echo 'Version: 3.0.0'
+                echo 'Libs: -L${libdir} -lssl -lcrypto'
+                echo 'Libs.private: -ldl'
+                echo 'Cflags: -I${includedir}'
+              } > "$PC/openssl.pc"
+            fi
+
+            if [ -e "$PC/libwebp.pc" ] && [ -e "$PREFIX/lib/libsharpyuv.a" ]; then
+              grep -q 'sharpyuv' "$PC/libwebp.pc" || {
+                echo "🔧 libwebp.pc 补 -lsharpyuv"
+                if grep -q '^Libs.private:' "$PC/libwebp.pc"; then
+                  sed -i 's|^Libs.private:.*|& -lsharpyuv|' "$PC/libwebp.pc"
+                else
+                  echo 'Libs.private: -lsharpyuv' >> "$PC/libwebp.pc"
+                fi
+              }
+            fi
+
+            echo "===== [$PREFIX] 断言 ====="
+            bad=0
+            for m in x264 x265 dav1d vpx aom SvtAv1Enc libvvenc xeve xevd \
+                     libwebp openssl libass freetype2 fribidi harfbuzz \
+                     fdk-aac lame opus vorbis lc3; do
+              PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$m" 2>/dev/null || {
+                echo "::error::缺少 pkg-config 模块: $m ($PREFIX)"; bad=1; }
+            done
+            [ "$bad" -eq 0 ] && echo "✅ 全部模块就绪 ($PREFIX)"
+          done
+          exit 0
+
+      # -------------------------------------------------------------------
+      # 1) 编译 FFmpeg（静态）并 install 到 stage/
+      # -------------------------------------------------------------------
+      - name: Build FFmpeg & install .a + headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(pwd)"
+          NDK_DIR="$WORKSPACE/ndk"
+          PREFIX="${PREFIX_STATIC:?}"
+          STAGE="$WORKSPACE/stage"
+          FFMPEG_VERSION="${{ inputs.ffmpeg_version || env.FFMPEG_VERSION_DEFAULT }}"
+          API_LEVEL="${{ env.API_LEVEL }}"
+          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
+          TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+          SYSROOT="$TOOLCHAIN/sysroot"
+          SYS_LIB="$SYSROOT/usr/lib/${ANDROID_TRIPLE}"
+
+          export CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+          export CXX="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
+          export AR="$TOOLCHAIN/bin/llvm-ar"
+          export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+          export STRIP="$TOOLCHAIN/bin/llvm-strip"
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+          export PKG_CONFIG_ALLOW_CROSS=1
+
+          LD_STATIC="-L$PREFIX/lib -Wl,-rpath-link,$PREFIX/lib -Wl,-rpath-link,$SYS_LIB"
+          CXX_STATIC="-Wl,--start-group -lc++_static -lc++abi -Wl,--end-group"
+
+          # ---- .pc 路径修正 + 三段清洗 ----
+          PC="$PREFIX/lib/pkgconfig"; mkdir -p "$PC"
+          SUBDIRS=""
+          if [ -d "$PREFIX/include" ]; then
+            while IFS= read -r d; do
+              SUBDIRS="$SUBDIRS -I$PREFIX/include/${d#./}"
+            done < <(cd "$PREFIX/include" && find . -mindepth 1 -maxdepth 1 -type d ! -name 'include')
+          fi
+          for f in "$PC"/*.pc; do
+            [ -e "$f" ] || continue
+            sed -i "s|\${pcfiledir}/\.\./\.\.|$PREFIX|g" "$f"
+            sed -i "s|\${pcfiledir}/\.\.|$PREFIX|g" "$f"
+            sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+            if [ -n "$SUBDIRS" ] && grep -q '^Cflags:' "$f"; then
+              sed -i "s|^Cflags:.*|& $SUBDIRS|" "$f"
+            fi
+          done
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            for lib in pthread rt resolv util; do
+              sed -i -E "s/(^|[[:space:]])-l${lib}([[:space:]]|\$)//g" "$pc"
+            done
+          done
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            if grep -q -e '-lc++_shared' -e '-lstdc++' "$pc"; then
+              sed -i -E 's/-lc\+\+_shared/-lc++_static -lc++abi/g; s/-lstdc\+\+/-lc++_static -lc++abi/g' "$pc"
+            fi
+          done
+          for pc in "$PC"/*.pc; do
+            [ -e "$pc" ] || continue
+            line="$(grep -m1 '^Requires\.private:' "$pc" || true)"
+            [ -n "$line" ] || continue
+            rest="${line#Requires.private:}"
+            rest="$(printf '%s' "$rest" | sed -E 's/[[:space:]]*([<>=]+)[[:space:]]*/\1/g' | tr ',' ' ')"
+            keep=""
+            for tok in $rest; do
+              [ -n "$tok" ] || continue
+              name="${tok%%[<>=]*}"
+              PKG_CONFIG_LIBDIR="$PC" pkg-config --exists "$name" 2>/dev/null && keep="${keep:+$keep, }$tok"
+            done
+            if [ -n "$keep" ]; then
+              sed -i "s|^Requires\.private:.*|Requires.private: $keep|" "$pc"
+            else
+              sed -i '/^Requires\.private:/d' "$pc"
+            fi
+          done
+          if grep -rIq -- '-lpthread' "$PC" 2>/dev/null; then
+            echo "::error::.pc 仍引用 -lpthread"; exit 1
+          fi
+          while IFS= read -r pc; do
+            grep -q -- '-lc++abi' "$pc" && continue
+            grep -q -- '-lc++_static' "$pc" && sed -i 's|-lc++_static|-lc++_static -lc++abi|g' "$pc"
+          done < <(find "$PC" -maxdepth 1 -name '*.pc')
+
+          # 头文件提升
+          if [ -d "$PREFIX/include" ]; then
+            find "$PREFIX/include" -mindepth 2 -name "*.h" -print0 |
+              while IFS= read -r -d '' h; do
+                tgt="$PREFIX/include/$(basename "$h")"
+                [ -e "$tgt" ] || cp -n "$h" "$tgt"
+              done
+          fi
+
+          # 有 .a 的 .so 改名为 .bak，避免 -lxxx 选中动态
+          for f in "$PREFIX/lib"/*.so*; do
+            [ -e "$f" ] || continue
+            b="$(basename "$f")"; b="${b%%.so*}"
+            [ -e "$PREFIX/lib/${b}.a" ] && mv "$f" "${f}.bak"
+          done
+
+          # 下载 FFmpeg
+          if [ ! -d "ffmpeg" ]; then
+            echo "⬇️ 下载 FFmpeg ${FFMPEG_VERSION}..."
+            if ! wget -q --tries=3 --timeout=30 "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"; then
+              wget -q --tries=3 --timeout=30 "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FFMPEG_VERSION}.tar.gz" -O ffmpeg-mirror.tar.gz
+              tar xzf ffmpeg-mirror.tar.gz && mv "FFmpeg-n${FFMPEG_VERSION}" ffmpeg
+            else
+              tar xf "ffmpeg-${FFMPEG_VERSION}.tar.xz" && mv "ffmpeg-${FFMPEG_VERSION}" ffmpeg
+            fi
+          fi
+
+          cd ffmpeg
+          [ -f Makefile ] && { make distclean >/dev/null 2>&1 || true; }
+
+          echo "🚀 开始构建 (static → $STAGE)"
+          if ! ./configure \
+              --prefix="$STAGE" \
+              --enable-cross-compile --target-os=android \
+              --arch=aarch64 --cpu=armv8-a \
+              --cc="$CC" --cxx="$CXX" --ar="$AR" --ranlib="$RANLIB" --strip="$STRIP" \
+              --sysroot="$SYSROOT" \
+              --pkg-config=pkg-config --pkg-config-flags="--static" \
+              --disable-shared --enable-static --enable-pic \
+              --enable-gpl --enable-version3 --enable-nonfree \
+              --enable-jni --enable-mediacodec --enable-network --enable-openssl \
+              --enable-decoder=h264_mediacodec --enable-decoder=hevc_mediacodec \
+              --enable-decoder=mpeg2_mediacodec --enable-decoder=mpeg4_mediacodec \
+              --enable-decoder=vp8_mediacodec --enable-decoder=vp9_mediacodec \
+              --enable-decoder=av1_mediacodec \
+              --enable-encoder=h264_mediacodec --enable-encoder=hevc_mediacodec \
+              --enable-encoder=mpeg4_mediacodec --enable-encoder=vp8_mediacodec \
+              --enable-encoder=vp9_mediacodec --enable-encoder=av1_mediacodec \
+              --enable-libx264 --enable-libx265 \
+              --enable-libdav1d --enable-libvpx --enable-libaom --enable-libsvtav1 \
+              --enable-libvvenc --enable-libxeve --enable-libxevd \
+              --enable-libwebp \
+              --enable-libfdk-aac --enable-libmp3lame --enable-libopus --enable-libvorbis --enable-libsoxr \
+              --enable-liblc3 \
+              --enable-libass --enable-libfreetype --enable-libfribidi \
+              --disable-doc --disable-debug \
+              --extra-cflags="-I$PREFIX/include -fPIC" \
+              --extra-ldflags="$LD_STATIC" \
+              --extra-libs="$CXX_STATIC -lm -lz -ldl" ; then
+            echo "::group::configure failed"
+            tail -n 160 ffbuild/config.log || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          make -j"$(nproc)"
+          make install prefix="$STAGE"
+
+          echo "===== stage/lib (ffmpeg .a) ====="
+          ls -1 "$STAGE"/lib/*.a
+          echo "===== stage/include ====="
+          ls -1 "$STAGE"/include
+
+      # -------------------------------------------------------------------
+      # 2) 合并 libffmpeg.so
+      # -------------------------------------------------------------------
+      - name: Merge libffmpeg.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(pwd)"
+          PREFIX="${PREFIX_STATIC:?}"
+          STAGE="$WORKSPACE/stage"
+          PKG_ROOT="$WORKSPACE/pkg"
+          API_LEVEL="${{ env.API_LEVEL }}"
+          ANDROID_TRIPLE="${{ env.ANDROID_TRIPLE }}"
+          TOOLCHAIN="$WORKSPACE/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          SYS_LIB="$TOOLCHAIN/sysroot/usr/lib/${ANDROID_TRIPLE}"
+
+          CC="$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
+          STRIP="$TOOLCHAIN/bin/llvm-strip"
+
+          mkdir -p "$PKG_ROOT/lib" "$PKG_ROOT/include" "$PKG_ROOT/pkgconfig"
+
+          cat > "$PKG_ROOT/libffmpeg.map" <<'MAP'
+          LIBFFMPEG {
+            global:
+              av*;
+              sws_*;
+              swr_*;
+            local:
+              *;
+          };
+          MAP
+
+          echo "🔧 合并 libffmpeg.so"
+          "$CC" -shared -o "$PKG_ROOT/lib/libffmpeg.so" \
+            -L"$PREFIX/lib" -Wl,-rpath-link,"$PREFIX/lib" \
+            -Wl,-rpath-link,"$SYS_LIB" \
+            -Wl,--whole-archive \
+            -Wl,--start-group \
+              "$STAGE"/lib/libav*.a \
+              "$PREFIX"/lib/*.a \
+            -Wl,--end-group \
+            -Wl,--no-whole-archive \
+            -Wl,--start-group -lc++_static -lc++abi -Wl,--end-group \
+            -Wl,--allow-multiple-definition \
+            -Wl,-soname,libffmpeg.so \
+            -Wl,-z,max-page-size=16384 \
+            -Wl,--version-script="$PKG_ROOT/libffmpeg.map" \
+            -lm -lz -ldl -llog -landroid -lmediandk -lOpenSLES
+
+          "$STRIP" --strip-unneeded "$PKG_ROOT/lib/libffmpeg.so"
+          rm -f "$PKG_ROOT/libffmpeg.map"
+
+          aligns="$(readelf -lW "$PKG_ROOT/lib/libffmpeg.so" | awk '$1=="LOAD"{print $NF}' | sort -u)"
+          for a in $aligns; do
+            [ $((a)) -ge 16384 ] || { echo "::error::LOAD 段 $a < 0x4000"; exit 1; }
+          done
+          echo "  size: $(du -h "$PKG_ROOT/lib/libffmpeg.so" | cut -f1)"
+          echo "  aligns: $(echo $aligns | tr '\n' ' ')"
+
+      # -------------------------------------------------------------------
+      # 3) 合并 libffmpeg.a
+      # -------------------------------------------------------------------
+      - name: Merge libffmpeg.a
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(pwd)"
+          PREFIX="${PREFIX_STATIC:?}"
+          STAGE="$WORKSPACE/stage"
+          PKG_ROOT="$WORKSPACE/pkg"
+          TOOLCHAIN="$WORKSPACE/ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          AR="$TOOLCHAIN/bin/llvm-ar"
+          RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
+
+          echo "🔧 合并 libffmpeg.a"
+          MRI="$WORKSPACE/.ar_mri.txt"
+          {
+            echo "CREATE $PKG_ROOT/lib/libffmpeg.a"
+            for a in "$STAGE"/lib/libav*.a "$PREFIX"/lib/*.a; do
+              [ -e "$a" ] || continue
+              echo "ADDLIB $a"
+            done
+            echo "SAVE"
+            echo "END"
+          } > "$MRI"
+
+          if ! "$AR" -M < "$MRI"; then
+            echo "::warning::llvm-ar MRI 失败，退化解包重打包"
+            rm -f "$PKG_ROOT/lib/libffmpeg.a"
+            TMP="$WORKSPACE/.ar_tmp"; rm -rf "$TMP"; mkdir -p "$TMP"
+            i=0
+            for a in "$STAGE"/lib/libav*.a "$PREFIX"/lib/*.a; do
+              [ -e "$a" ] || continue
+              i=$((i+1))
+              sub="$TMP/lib$i"; mkdir -p "$sub"; (cd "$sub" && "$AR" x "$a")
+            done
+            find "$TMP" -name '*.o' -print0 | xargs -0 "$AR" qc "$PKG_ROOT/lib/libffmpeg.a"
+            rm -rf "$TMP"
+          fi
+          rm -f "$MRI"
+          "$RANLIB" "$PKG_ROOT/lib/libffmpeg.a"
+
+          echo "  size: $(du -h "$PKG_ROOT/lib/libffmpeg.a" | cut -f1)"
+          echo "  members: $("$AR" t "$PKG_ROOT/lib/libffmpeg.a" | wc -l)"
+
+      # -------------------------------------------------------------------
+      # 4) 收集 include / pkg-config / README / BUILD_INFO
+      # -------------------------------------------------------------------
+      - name: Collect headers & metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(pwd)"
+          STAGE="$WORKSPACE/stage"
+          PKG_ROOT="$WORKSPACE/pkg"
+          FFMPEG_VERSION="${{ inputs.ffmpeg_version || env.FFMPEG_VERSION_DEFAULT }}"
+          API_LEVEL="${{ env.API_LEVEL }}"
+          NDK_VERSION="${{ env.NDK_VERSION }}"
+
+          cp -a "$STAGE/include/." "$PKG_ROOT/include/"
+          ls -1 "$PKG_ROOT/include"
+
+          cat > "$PKG_ROOT/pkgconfig/libffmpeg.pc" <<PC
+          prefix=\${pcfiledir}/..
+          exec_prefix=\${prefix}
+          libdir=\${exec_prefix}/lib
+          includedir=\${prefix}/include
+
+          Name: libffmpeg
+          Description: FFmpeg (all components merged) for Android arm64-v8a
+          Version: ${FFMPEG_VERSION}
+          Libs: -L\${libdir} -lffmpeg
+          Libs.private: -Wl,--start-group -lc++_static -lc++abi -Wl,--end-group -lm -lz -ldl -llog -landroid -lmediandk -lOpenSLES
+          Cflags: -I\${includedir}
+          PC
+
+          cat > "$PKG_ROOT/README.md" <<'MD'
+          # libffmpeg-dev (Android arm64-v8a)
+
+          FFmpeg 以全量静态库合并为单一 `libffmpeg.so` / `libffmpeg.a`，并附带完整头文件。
+
+          ## 目录结构
+          ```
+          libffmpeg-dev/
+          ├── include/
+          ├── lib/
+          │   ├── libffmpeg.so
+          │   └── libffmpeg.a
+          ├── pkgconfig/libffmpeg.pc
+          ├── BUILD_INFO.txt
+          └── README.md
+          ```
+
+          ## 动态
+          ```cmake
+          add_library(ffmpeg SHARED IMPORTED)
+          set_target_properties(ffmpeg PROPERTIES
+            IMPORTED_LOCATION ${FFMPEG_ROOT}/lib/libffmpeg.so
+            INTERFACE_INCLUDE_DIRECTORIES ${FFMPEG_ROOT}/include)
+          target_link_libraries(app ffmpeg)
+          ```
+
+          ## 静态
+          ```cmake
+          add_library(ffmpeg STATIC IMPORTED)
+          set_target_properties(ffmpeg PROPERTIES
+            IMPORTED_LOCATION ${FFMPEG_ROOT}/lib/libffmpeg.a
+            INTERFACE_INCLUDE_DIRECTORIES ${FFMPEG_ROOT}/include)
+          target_link_libraries(app
+            -Wl,--whole-archive ffmpeg -Wl,--no-whole-archive
+            -Wl,--start-group c++_static c++abi -Wl,--end-group
+            m z dl log android mediandk OpenSLES)
+          ```
+
+          ## 注意
+          - `libffmpeg.so` 只导出 `av* / sws_* / swr_*`，第三方符号已 local
+          - `libffmpeg.a` 不含 C++ 运行时，链接方需自行补 `-lc++_static -lc++abi`
+          - 静态链接务必用 `-Wl,--whole-archive`，否则编解码器不会注册
+          - 构建已开启 `--enable-gpl --enable-version3 --enable-nonfree`，请遵守许可
+          MD
+
+          {
+            echo "=========================================="
+            echo " libffmpeg-dev (Android arm64-v8a)"
+            echo "=========================================="
+            echo "Build Date    : $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "FFmpeg Version: $FFMPEG_VERSION"
+            echo "NDK Version   : $NDK_VERSION (API $API_LEVEL)"
+            echo "ABI           : arm64-v8a"
+            echo "------------------------------------------"
+            echo "libffmpeg.so  : $(du -h "$PKG_ROOT/lib/libffmpeg.so" | cut -f1)"
+            echo "libffmpeg.a   : $(du -h "$PKG_ROOT/lib/libffmpeg.a"  | cut -f1)"
+            echo "Exported syms : $(nm -D --defined-only "$PKG_ROOT/lib/libffmpeg.so" 2>/dev/null | wc -l)"
+            echo "------------------------------------------"
+            echo "Top exports:"
+            nm -D --defined-only "$PKG_ROOT/lib/libffmpeg.so" 2>/dev/null | awk '{print $3}' | sort | head -30
+          } > "$PKG_ROOT/BUILD_INFO.txt"
+          cat "$PKG_ROOT/BUILD_INFO.txt"
+
+      # -------------------------------------------------------------------
+      # 5) 验收
+      # -------------------------------------------------------------------
+      - name: Verify libffmpeg.so
+        shell: bash
+        run: |
+          set -uo pipefail
+          SO="$(pwd)/pkg/lib/libffmpeg.so"
+          fail=0
+
+          SYS_ALLOW="libc.so libm.so libdl.so libz.so liblog.so libandroid.so \
+          libmediandk.so libOpenSLES.so libcamera2ndk.so"
+          for n in $(readelf -d "$SO" | awk '/NEEDED/{gsub(/[][\[\] ]/,"",$NF); print $NF}'); do
+            ok=0
+            for a in $SYS_ALLOW; do [ "$n" = "$a" ] && ok=1 && break; done
+            [ $ok -eq 1 ] && echo "  ok  $n" || { echo "::error::非系统依赖 $n"; fail=1; }
+          done
+
+          bad="$(nm -D --defined-only "$SO" | awk '{print $3}' | grep -vE '^(av|sws_|swr_|_init|_fini|__)' | head -20 || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::存在非 FFmpeg 前缀导出符号:"; echo "$bad"; fail=1
+          else
+            echo "✅ 导出符号均以 av / sws_ / swr_ 开头"
+          fi
+
+          [ $fail -eq 0 ] && echo "✅ libffmpeg.so 验收通过"
+          exit $fail
+
+      - name: Verify libffmpeg.a
+        shell: bash
+        run: |
+          set -uo pipefail
+          AR="$(pwd)/ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          A="$(pwd)/pkg/lib/libffmpeg.a"
+          n="$("$AR" t "$A" | wc -l)"
+          echo "成员数: $n"
+          [ "$n" -gt 100 ] && echo "✅ libffmpeg.a 已包含全部对象" || { echo "::error::libffmpeg.a 成员数异常"; exit 1; }
+
+      # -------------------------------------------------------------------
+      # 6) 打包
+      # -------------------------------------------------------------------
+      - name: Package (libffmpeg-dev-full)
+        run: |
+          set -euo pipefail
+          cd "${{ github.workspace }}"
+          mv pkg libffmpeg-dev
+          tar -I 'xz -9e -T0' -cf libffmpeg-dev-full.tar.xz libffmpeg-dev
+          ls -lh libffmpeg-dev-full.tar.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libffmpeg-dev
+          path: ${{ github.workspace }}/libffmpeg-dev-full.tar.xz
+          retention-days: 7
+
+  # =====================================================================
+  # 固定 Release：tag = build-libffmpeg，每次构建覆写同名 asset
+  # 与主工作流的 weekly-latest / v* 完全隔离
+  # =====================================================================
+  release:
+    needs: [build-libffmpeg-dev]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: libffmpeg-dev
+          merge-multiple: true
+
+      - name: Prepare checksums
+        run: |
+          set -euo pipefail
+          {
+            echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "BUILD_DATE_UTC3=$(TZ='Etc/GMT-3' date +'%Y-%m-%d %H:%M:%S')"
+          } >> "$GITHUB_ENV"
+          cd artifacts
+          ls -lh
+          sha256sum *.tar.xz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create / Update Release (overwrite)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-libffmpeg
+          name: 'build libffmpeg (Android arm64-v8a)'
+          body: |
+            ## libffmpeg-dev (Android arm64-v8a)
+
+            - **Build Date (UTC)**: ${{ env.BUILD_DATE }}
+            - **Build Date (UTC+3)**: ${{ env.BUILD_DATE_UTC3 }}
+            - **NDK**: r30 / API ${{ env.API_LEVEL }}
+            - **FFmpeg**: ${{ env.FFMPEG_VERSION_DEFAULT }}
+
+            ### `libffmpeg-dev-full.tar.xz`
+
+            单一合并库 + 头文件，开箱即用。
+
+            ```
+            libffmpeg-dev/
+            ├── include/              # libav* 公开头文件
+            ├── lib/
+            │   ├── libffmpeg.so     # 合并动态库（只导出 av*/sws_*/swr_*）
+            │   └── libffmpeg.a      # 合并静态库（不含 C++ 运行时）
+            ├── pkgconfig/libffmpeg.pc
+            ├── BUILD_INFO.txt
+            └── README.md
+            ```
+
+            ### 质量校验
+
+            - `libffmpeg.so` 仅依赖 Android 系统库，16KB 页对齐
+            - 导出符号只含 `av* / sws_* / swr_*`，第三方符号全部 `local`
+            - `libffmpeg.a` 通过 MRI 全量合并，包含所有编解码器/协议/滤镜
+
+            > 静态链接务必使用 `-Wl,--whole-archive`，否则编解码器不会注册。
+
+            ### 说明
+
+            - 本 release 由 `Build libffmpeg (dev)` 工作流维护
+            - 触发方式：每月 14 号 00:00 UTC 自动构建，或手动 `workflow_dispatch`
+            - 每次构建会**覆写**本 release 上的同名 asset，tag 始终为 `build-libffmpeg`
+          files: |
+            artifacts/*.tar.xz
+            artifacts/SHA256SUMS.txt
+          overwrite_files: true
+          generate_release_notes: false
