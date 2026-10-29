@@ -1,4 +1,4 @@
-name: Build libffmpeg (dev: single .so/.a + headers)
+name: 'build libffmpeg (Android arm64-v8a)'
 
 on:
   workflow_dispatch:
