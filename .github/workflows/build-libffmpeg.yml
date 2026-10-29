@@ -1,4 +1,4 @@
-name: 'build libffmpeg (Android arm64-v8a)'
+name: 'Build libffmpeg (dev: single .so/.a + headers)'
 
 on:
   workflow_dispatch:
@@ -121,7 +121,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
           echo "--- static libs ---"
-          ls -1 "$PST"/lib/*.a 2>/dev/null | head -40 || echo "(none)"
+          # 使用 awk 替代 head，避免 pipefail 报错
+          ls -1 "$PST"/lib/*.a 2>/dev/null | awk 'NR<=40' || echo "(none)"
 
       - name: Preflight pkg-config & shim missing modules
         shell: bash
@@ -554,7 +555,8 @@ jobs:
             echo "Exported syms : $(nm -D --defined-only "$PKG_ROOT/lib/libffmpeg.so" 2>/dev/null | wc -l)"
             echo "------------------------------------------"
             echo "Top exports:"
-            nm -D --defined-only "$PKG_ROOT/lib/libffmpeg.so" 2>/dev/null | awk '{print $3}' | sort | head -30
+            # 使用 awk 替代 head 避免 Broken pipe
+            nm -D --defined-only "$PKG_ROOT/lib/libffmpeg.so" 2>/dev/null | awk '{print $3}' | sort | awk 'NR<=30'
           } > "$PKG_ROOT/BUILD_INFO.txt"
           cat "$PKG_ROOT/BUILD_INFO.txt"
 
@@ -576,7 +578,8 @@ jobs:
             [ $ok -eq 1 ] && echo "  ok  $n" || { echo "::error::非系统依赖 $n"; fail=1; }
           done
 
-          bad="$(nm -D --defined-only "$SO" | awk '{print $3}' | grep -vE '^(av|sws_|swr_|_init|_fini|__)' | head -20 || true)"
+          # 使用 awk 替代 head 避免 Broken pipe
+          bad="$(nm -D --defined-only "$SO" | awk '{print $3}' | grep -vE '^(av|sws_|swr_|_init|_fini|__)' | awk 'NR<=20' || true)"
           if [ -n "$bad" ]; then
             echo "::error::存在非 FFmpeg 前缀导出符号:"; echo "$bad"; fail=1
           else
