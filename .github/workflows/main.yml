@@ -102,7 +102,6 @@ jobs:
                   echo "::error::dav1d 源码拉取失败：官方源与 GitHub 镜像均不可达，请检查网络或配置 PROXY_URL secret"
                   exit 1
                 fi
-                # 克隆成功后再校验一次，防止极少数情况下 git clone 返回 0 但仓库损坏
                 if ! git -C dav1d rev-parse --verify HEAD >/dev/null 2>&1; then
                   echo "::error::dav1d 克隆后仓库校验失败，请清理后重试"
                   exit 1
@@ -984,6 +983,9 @@ jobs:
           tar xf artifacts/ffmpeg-libs-arm64-v8a-api${API_LEVEL}-full.tar.xz
           ls -d prefix/static prefix/shared
 
+      # ★ 本步骤是本次修复的核心：
+      #   1) 去掉 --sysroot / --extra-ldflags / --extra-libs / --cpu=armv8-a
+      #   2) 失败时自动把 ffbuild/config.log 里的错误行直接打到 Actions 日志里
       - name: Build FFmpeg (static & shared)
         shell: bash
         env:
@@ -1001,12 +1003,8 @@ jobs:
 
             if [ "$LINK" = static ]; then
               LTOPT="--enable-static --disable-shared"
-              EXTRA_LIBS="-lc++_static -lm -ldl -lz -lpthread"
-              EXTRA_LDFLAGS="-L$PREFIX/lib"
             else
               LTOPT="--disable-static --enable-shared"
-              EXTRA_LIBS="-lm -ldl -lz -lpthread"
-              EXTRA_LDFLAGS="-L$PREFIX/lib -Wl,--enable-new-dtags,-rpath,\$ORIGIN"
             fi
 
             export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
@@ -1017,10 +1015,26 @@ jobs:
             rm -rf "$BUILD"; mkdir -p "$BUILD"
             cd "$BUILD"
 
+            # ★ 失败时把 config.log 关键错误直接打到日志，无需下载/上传
+            dump_cfg_log() {
+              local rc=$?
+              trap - ERR EXIT
+              if [ "$rc" -ne 0 ] && [ -f ffbuild/config.log ]; then
+                echo "::group::config.log 关键错误 — FFmpeg [$LINK]"
+                echo "===== 最后一个失败测试附近 ====="
+                tail -120 ffbuild/config.log || true
+                echo "===== 所有 error / unable / undefined / cannot find 行 ====="
+                grep -nE 'error:|unable to|undefined reference|cannot find|No such file|is unable' ffbuild/config.log 2>/dev/null | tail -60 || true
+                echo "::endgroup::"
+              fi
+              exit $rc
+            }
+            trap dump_cfg_log ERR EXIT
+
+            # ★ 精简版 configure：去掉 --sysroot / --extra-ldflags / --extra-libs / --cpu
             "${{ github.workspace }}/configure" \
               --target-os=android \
               --arch=aarch64 \
-              --cpu=armv8-a \
               --enable-cross-compile \
               --cc="$CC" \
               --cxx="$CXX" \
@@ -1028,7 +1042,6 @@ jobs:
               --nm="$NM" \
               --ranlib="$RANLIB" \
               --strip="$STRIP" \
-              --sysroot="$SYSROOT" \
               --enable-pic \
               --disable-autodetect \
               --disable-programs \
@@ -1062,13 +1075,12 @@ jobs:
               --enable-libfribidi \
               $LTOPT \
               --prefix="$DIST" \
-              --extra-cflags="-O2 -fPIC -I$PREFIX/include" \
-              --extra-ldflags="$EXTRA_LDFLAGS" \
-              --extra-libs="$EXTRA_LIBS"
+              --extra-cflags="-O2 -fPIC -I$PREFIX/include"
 
             make -j"$(nproc)"
             make install
             cd "${{ github.workspace }}"
+            trap - ERR EXIT
             echo "::endgroup::"
           done
 
