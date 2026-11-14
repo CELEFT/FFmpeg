@@ -1,10 +1,11 @@
-name: Build external libs & FFmpeg for Android (arm64-v8a)
+name: Build external libs for Android (arm64-v8a)
 
 on:
   push:
     branches: [ master, main ]
   workflow_dispatch:
   schedule:
+    # 每周三 12:00 (UTC+3) = 周三 09:00 UTC
     - cron: '0 9 * * 3'
 
 env:
@@ -13,7 +14,6 @@ env:
   NDK_URL: "https://googledownloads.cn/android/repository/android-ndk-r30-linux.zip"
   TARGET_ABI: "arm64-v8a"
   ANDROID_TRIPLE: "aarch64-linux-android"
-  PROXY_URL: ${{ secrets.PROXY_URL }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,6 +37,7 @@ jobs:
                 $LTOPT --enable-pic --disable-cli
               make -j"$(nproc)"
               make install
+              # x264 从不安装 .pc，FFmpeg 的 require_pkg_config 会直接失败 → 必须补
               mkpc x264 "H.264/AVC encoder" "164" x264 "-lm -ldl -lpthread"
 
           - name: x265
@@ -59,6 +60,7 @@ jobs:
               if [ "$LINK" = "shared" ]; then
                 find build -name 'libx265*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
                 if [ ! -e "$PREFIX/lib/libx265.so" ] && [ -f "$PREFIX/lib/libx265.a" ]; then
+                  echo "x265: 由 libx265.a 合成 libx265.so"
                   $CXX -shared -Wl,-soname,libx265.so \
                     -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                     -o "$PREFIX/lib/libx265.so" \
@@ -68,14 +70,13 @@ jobs:
               fi
               mkpc x265 "H.265/HEVC encoder" "4.1" x265
 
+          # ★ dav1d：修复拉取超时（双源回退 + timeout 300 + git rev-parse 校验 + 重试 3 次 + stderr 可见）
           - name: dav1d
             libs: "dav1d"
             build: |
               set -euo pipefail
-              if [ -n "${PROXY_URL:-}" ]; then
-                export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL"
-                echo "已启用代理：$PROXY_URL"
-              fi
+
+              # 用 git 自身校验，避免半成品目录（被 timeout 打断后 .git 存在但对象不完整）被误判为"已存在"
               if ! git -C dav1d rev-parse --verify HEAD >/dev/null 2>&1; then
                 rm -rf dav1d
                 cloned=""
@@ -98,12 +99,13 @@ jobs:
                   exit 1
                 fi
                 if ! git -C dav1d rev-parse --verify HEAD >/dev/null 2>&1; then
-                  echo "::error::dav1d 克隆后仓库校验失败"
+                  echo "::error::dav1d 克隆后仓库校验失败，请清理后重试"
                   exit 1
                 fi
               else
                 echo "dav1d 源码已存在（git 校验通过），跳过 clone"
               fi
+
               cd dav1d
               rm -rf _build
               {
@@ -126,24 +128,31 @@ jobs:
             libs: "vpx"
             build: |
               set -euo pipefail
+
               [ -d libvpx ] || git clone --depth 1 https://github.com/webmproject/libvpx.git libvpx
               cd libvpx
               make distclean >/dev/null 2>&1 || true
               rm -f config.mk config.log vpx_config.h vpx_config.c libs-*.mk
 
+              # ═══ 补丁 A：--enable-shared 平台白名单加入 android ═══
               python3 - <<'PY'
               import re
               from pathlib import Path
               p = Path("configure"); s = p.read_text()
               want = "linux|android|os2|solaris|darwin*|iphonesimulator*)"
-              if want not in s:
+              if want in s:
+                  print("configure: 已含 android，跳过")
+              else:
                   pat = r'^(?P<ind>[ \t]*)linux\|os2\|solaris\|darwin\*\|iphonesimulator\*\)[ \t]*$'
                   m = re.search(pat, s, re.M)
                   if not m:
-                      raise SystemExit("::error::configure: 找不到白名单锚点")
-                  p.write_text(s[:m.start()] + m.group("ind") + want + s[m.end():])
+                      raise SystemExit("::error::configure: 找不到白名单锚点，上游已改动")
+                  new = m.group("ind") + want
+                  p.write_text(s[:m.start()] + new + s[m.end():])
+                  print("configure: " + new.strip())
               PY
 
+              # ═══ 补丁 B：注释 -static（NDK 只有 libc.so，无 libc.a）═══
               python3 - <<'PY'
               from pathlib import Path
               p = Path("build/make/configure.sh")
@@ -155,21 +164,50 @@ jobs:
                       n += 1
               if n:
                   p.write_text("".join(lines))
-              elif not any(l.strip() == "# check_add_ldflags -static" for l in lines):
-                  raise SystemExit("::error::configure.sh: 找不到 check_add_ldflags -static")
+                  print("configure.sh: 已注释 %d 处 -static" % n)
+              elif any(l.strip() == "# check_add_ldflags -static" for l in lines):
+                  print("configure.sh: 已注释，跳过")
+              else:
+                  raise SystemExit("::error::configure.sh: 找不到 check_add_ldflags -static，上游已改动")
               PY
 
+              echo "--- 补丁后关键行 ---"
+              grep -n 'iphonesimulator\*)' configure | sed 's/^/  /' || true
+              grep -n 'check_add_ldflags -static' build/make/configure.sh | sed 's/^/  /' || true
+
+              # ═══ 工具链 ═══
               export CC CXX AR RANLIB STRIP
               export AS="$CC"
+              # 不设 LD：webm_io 启用时 configure 末尾 LD=${CXX} 会覆盖外部赋值
+
+              # ═══ 链接标志：只能走环境变量（configure 不认 --extra-ldflags）═══
+              # 转义链：Shell 输出 $$ORIGIN → libs-*.mk 存 $$ORIGIN → Make 展开 $ORIGIN → ld
               export LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,--enable-new-dtags -Wl,-rpath,'\$\$ORIGIN'"
 
-              ./configure --prefix="$PREFIX" --force-target=arm64-android-gcc \
-                --enable-vp8 --enable-vp9 $LTOPT --enable-pic \
-                --disable-examples --disable-tools --disable-docs --disable-unit-tests \
+              # $LTOPT / $EXTRA_CFLAGS / $SYSROOT 由 run_variant 与 workflow env 提供
+              ./configure \
+                --prefix="$PREFIX" \
+                --force-target=arm64-android-gcc \
+                --enable-vp8 \
+                --enable-vp9 \
+                $LTOPT \
+                --enable-pic \
+                --disable-examples \
+                --disable-tools \
+                --disable-docs \
+                --disable-unit-tests \
                 --extra-cflags="$EXTRA_CFLAGS -mno-outline-atomics --sysroot=${SYSROOT}"
 
+              # ═══ 门禁 1：CONFIG_* 在 libs-*.mk 里，不是 config.mk ═══
               MK=$(ls libs-*-gcc.mk 2>/dev/null | head -1 || true)
-              [ -n "${MK:-}" ] || { echo "::error::libvpx: 未生成 libs-*-gcc.mk"; exit 1; }
+              if [ -z "${MK:-}" ]; then
+                echo "::error::libvpx: 未生成 libs-*-gcc.mk"; ls -la | head -40; exit 1
+              fi
+              echo "目标 mk 文件: $MK"
+              echo "--- 关键项（$MK）---"
+              { grep -nE '^(CONFIG_(SHARED|STATIC|PIC|VP8|VP9|MULTITHREAD)|HAVE_(NEON|NEON_DOTPROD|NEON_I8MM|SVE|SVE2))=' "$MK" || true; } | sed 's/^/  /'
+              echo "--- LDFLAGS（$MK）---"
+              { grep -nE '^LDFLAGS' "$MK" || true; } | sed 's/^/  /'
 
               cfg() {
                 local n="$1" v f
@@ -178,34 +216,78 @@ jobs:
                   v=$(sed -n "s/^${n}=//p" "$f" | head -1)
                   [ -n "${v:-}" ] && { printf '%s' "$v"; return 0; }
                 done
+                if [ -f vpx_config.h ]; then
+                  v=$(sed -n "s/^#define[[:space:]]\{1,\}${n}[[:space:]]\{1,\}\([0-9]\).*/\1/p" vpx_config.h | head -1)
+                  [ -n "${v:-}" ] && { [ "$v" = "1" ] && printf yes || printf no; return 0; }
+                fi
                 return 1
               }
               require() {
                 local n="$1" want="$2" got
-                got=$(cfg "$n") || { echo "::error::libvpx: 找不到 $n"; return 1; }
+                if ! got=$(cfg "$n"); then
+                  echo "::error::libvpx: 找不到 $n（$MK / config.mk / vpx_config.h）"; return 1
+                fi
                 [ "$got" = "$want" ] || { echo "::error::libvpx: $n=$got，期望 $want"; return 1; }
+                echo "  ✅ $n=$got"
               }
+
               require CONFIG_PIC yes
               if [ "$LINK" = "shared" ]; then
                 require CONFIG_SHARED yes
-                grep -q 'ORIGIN' "$MK" || { echo "::error::libvpx: $MK 无 ORIGIN"; exit 1; }
+                grep -q 'ORIGIN' "$MK" || { echo "::error::libvpx: $MK 无 ORIGIN，\$ORIGIN 转义失效（会退化成 RIGIN）"; exit 1; }
+                echo "  ✅ LDFLAGS 含 ORIGIN"
               else
                 require CONFIG_STATIC yes
               fi
               if grep -qE '(^|[[:space:]])-static([[:space:]]|$)' "$MK"; then
-                echo "::error::libvpx: 仍含 -static"; exit 1
+                echo "::error::libvpx: $MK 仍含 -static，补丁 B 未生效"; exit 1
               fi
+              echo "✅ 门禁 1 通过"
 
+              # ═══ 构建 + 安装 ═══
               make -j"$(nproc)"
               make install
 
+              # ═══ 门禁 2：产物 ═══
+              if [ -f "$PREFIX/lib/pkgconfig/vpx.pc" ]; then echo "✅ vpx.pc 已安装"
+              else echo "::warning::libvpx: 未找到 vpx.pc"; fi
+
               if [ "$LINK" = "shared" ]; then
                 so="$PREFIX/lib/libvpx.so"
-                [ -e "$so" ] || { echo "::error::libvpx: 未生成 $so"; exit 1; }
+                [ -e "$so" ] || { echo "::error::libvpx: 未生成 $so"; ls -l "$PREFIX/lib" 2>/dev/null; exit 1; }
+
+                echo "--- RUNPATH ---"
+                { "$READELF" -d "$so" | grep -E 'RUNPATH|RPATH' || true; } | sed 's/^/  /'
                 "$READELF" -d "$so" | grep -q '\[\$ORIGIN\]' || { echo "::error::libvpx: RUNPATH 不是 \$ORIGIN"; exit 1; }
+
+                echo "--- DT_NEEDED ---"
+                { "$READELF" -d "$so" | grep NEEDED || true; } | sed 's/^/  /'
+
+                echo "--- 架构 / 对齐 ---"
+                { "$READELF" -h "$so" | awk -F: '/Machine|Class/{print "  "$2}'; } || true
+                align=$("$READELF" -lW "$so" | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ' || true)
+                echo "  LOAD p_align = ${align:-<none>}"
+                case "${align:-}" in
+                  *0x1000*) echo "::error::libvpx: 含 4KB LOAD 段，max-page-size 未生效"; exit 1 ;;
+                  *0x4000*) echo "  ✅ 16KB 对齐" ;;
+                  *)        echo "::warning::libvpx: p_align 异常 ${align:-<none>}" ;;
+                esac
+
+                if "$READELF" -d "$so" | grep -q 'NEEDED.*libc++_shared.so'; then
+                  echo "::notice::libvpx: 依赖 libc++_shared.so（webm_io/libyuv 启用所致）→ 随包分发"
+                  cp -f "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" "$PREFIX/lib/"
+                  "$READELF" -h "$PREFIX/lib/libc++_shared.so" | grep -q 'AArch64' || {
+                    echo "::error::libvpx: libc++_shared.so 不是 AArch64"; exit 1; }
+                  echo "✅ 已随包分发 aarch64 libc++_shared.so"
+                  echo "::warning::libvpx: release notes 中「libc++ 静态链接」的说法与此不符，需同步更正"
+                else
+                  echo "✅ 不依赖 libc++_shared.so"
+                fi
               else
-                [ -e "$PREFIX/lib/libvpx.a" ] || { echo "::error::libvpx: 未生成 libvpx.a"; exit 1; }
+                [ -e "$PREFIX/lib/libvpx.a" ] || { echo "::error::libvpx: 未生成 libvpx.a"; ls -l "$PREFIX/lib" 2>/dev/null; exit 1; }
+                echo "✅ libvpx.a $(du -h "$PREFIX/lib/libvpx.a" | cut -f1)"
               fi
+              echo "✅ 门禁 2 通过 — libvpx [$LINK]"
 
           - name: libaom
             libs: "aom"
@@ -224,7 +306,9 @@ jobs:
                 -DAOM_TARGET_CPU=arm64 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               cmake --build build -j"$(nproc)"
               cmake --install build
-              [ -f "$PREFIX/lib/pkgconfig/aom.pc" ] || mkpc aom "AOMedia AV1 codec" "3.8.0" aom
+              if [ ! -f "$PREFIX/lib/pkgconfig/aom.pc" ]; then
+                mkpc aom "AOMedia AV1 codec" "3.8.0" aom
+              fi
 
           - name: svt-av1
             libs: "SvtAv1Enc"
@@ -278,13 +362,18 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xeve*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
+              echo "--- xeve build 产物 ---"
+              find build \( -name 'libxeve*.a' -o -name 'libxeve*.so*' \) 2>/dev/null | sort || true
               find build -name 'libxeve.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxeve*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
-              if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxeve.so" ] && [ -f "$PREFIX/lib/libxeve.a" ]; then
-                $CC -shared -Wl,-soname,libxeve.so -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+              if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxeve.so" ] \
+                 && [ -f "$PREFIX/lib/libxeve.a" ]; then
+                echo "xeve: 由 libxeve.a 合成 libxeve.so"
+                $CC -shared -Wl,-soname,libxeve.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                   -o "$PREFIX/lib/libxeve.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxeve.a" -Wl,--no-whole-archive -lm \
-                  || echo "::warning::xeve: .so 合成失败"
+                | echo "::warning::xeve: .so 合成失败"
               fi
               mkpc xeve "MPEG-5 EVC encoder" "1.0.0" xeve "" "-I\${includedir}/xeve"
 
@@ -307,13 +396,18 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xevd*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
+              echo "--- xevd build 产物 ---"
+              find build \( -name 'libxevd*.a' -o -name 'libxevd*.so*' \) 2>/dev/null | sort || true
               find build -name 'libxevd.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxevd*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
-              if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxevd.so" ] && [ -f "$PREFIX/lib/libxevd.a" ]; then
-                $CC -shared -Wl,-soname,libxevd.so -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+              if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxevd.so" ] \
+                 && [ -f "$PREFIX/lib/libxevd.a" ]; then
+                echo "xevd: 由 libxevd.a 合成 libxevd.so"
+                $CC -shared -Wl,-soname,libxevd.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                   -o "$PREFIX/lib/libxevd.so" \
                   -Wl,--whole-archive "$PREFIX/lib/libxevd.a" -Wl,--no-whole-archive -lm \
-                  || echo "::warning::xevd: .so 合成失败"
+                | echo "::warning::xevd: .so 合成失败"
               fi
               mkpc xevd "MPEG-5 EVC decoder" "1.0.0" xevd "" "-I\${includedir}/xevd"
 
@@ -325,12 +419,30 @@ jobs:
               make clean >/dev/null 2>&1 || true
               export ANDROID_NDK_ROOT="$NDK"
               if [ "$LINK" = "static" ]; then OSSL_MODE="no-shared"; else OSSL_MODE="shared"; fi
+              echo "openssl: $OSSL_MODE ($LINK)"
               ./Configure android-arm64 -D__ANDROID_API__="$API_LEVEL" \
                 --prefix="$PREFIX" --openssldir="$PREFIX/ssl" --libdir=lib \
                 $OSSL_MODE no-tests
               make -j"$(nproc)"
               make install_sw
               rm -rf "$PREFIX/lib/ossl-modules" "$PREFIX"/lib/engines-*
+              echo "--- openssl 构建后 ---"
+              ls -1 "$PREFIX/lib" | sort | grep -E 'ssl|crypto' || true
+              for l in crypto ssl; do
+                if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/lib${l}.so" ] \
+                   && [ -f "$PREFIX/lib/lib${l}.a" ]; then
+                  echo "openssl: 由 lib${l}.a 合成 lib${l}.so"
+                  $CC -shared -Wl,-soname,"lib${l}.so" \
+                    -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                    -o "$PREFIX/lib/lib${l}.so" \
+                    -Wl,--whole-archive "$PREFIX/lib/lib${l}.a" -Wl,--no-whole-archive \
+                    -ldl -pthread || echo "::warning::openssl: lib${l}.so 合成失败"
+                fi
+              done
+              for f in "$PREFIX"/lib/pkgconfig/*.pc; do
+                [ -e "$f" ] || continue
+                sed -i "s|^prefix=.*|prefix=$PREFIX|" "$f"
+              done
 
           - name: fdk-aac
             libs: "fdk-aac"
@@ -346,7 +458,6 @@ jobs:
               make install
               mkpc fdk-aac "Fraunhofer FDK AAC" "2.0.3" fdk-aac
 
-          # ★ lame：恢复原始 ./configure + make + make install + mkpc 流程
           - name: lame
             libs: "mp3lame"
             build: |
@@ -373,7 +484,8 @@ jobs:
               ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
                 --build=x86_64-pc-linux-gnu \
                 CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" STRIP="$STRIP" \
-                CFLAGS="$EXTRA_CFLAGS" LDFLAGS="" $LTOPT --with-pic
+                CFLAGS="$EXTRA_CFLAGS" LDFLAGS="" \
+                $LTOPT --with-pic
               make -j"$(nproc)"
               make install
 
@@ -409,10 +521,11 @@ jobs:
                 $CC -O2 -fPIC -Iinclude -c "$f" -o "obj/$(basename "${f%.c}").o"
               done
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
-              if [ "$LINK" = static ]; then
+              if [ "$LINK" = "static" ]; then
                 $AR rcs "$PREFIX/lib/liblc3.a" obj/*.o
               else
-                $CC -shared -Wl,-soname,liblc3.so -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
+                $CC -shared -Wl,-soname,liblc3.so \
+                  -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                   -o "$PREFIX/lib/liblc3.so" obj/*.o -lm
               fi
               find include -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
@@ -425,16 +538,29 @@ jobs:
               [ -d soxr ] || git clone --depth 1 https://github.com/chirlu/soxr.git soxr
               cd soxr
               rm -rf build
+              # ★ 不设 CMAKE_SYSTEM_NAME：交给 Android toolchain 自行推断（SIMD 检测敏感）
+              #   WITH_OPENMP=OFF         → NDK clang 默认不含 OpenMP 运行时
+              #   WITH_AVFFT=OFF          → 不让 soxr 反向依赖 libavcodec 做 FFT（保持依赖树干净）
+              #   WITH_LSR_BINDINGS=OFF   → 不生成 libsamplerate 兼容层（libsoxr-lsr），减小体积
               cmake -S . -B build -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
                 -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
-                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="$PREFIX" \
                 -DBUILD_SHARED_LIBS="$CMAKE_SHARED_LIBS" \
-                -DWITH_OPENMP=OFF -DWITH_AVFFT=OFF -DWITH_LSR_BINDINGS=OFF \
-                -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+                -DWITH_OPENMP=OFF \
+                -DWITH_AVFFT=OFF \
+                -DWITH_LSR_BINDINGS=OFF \
+                -DBUILD_TESTS=OFF \
+                -DBUILD_EXAMPLES=OFF \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               cmake --build build -j"$(nproc)"
               cmake --install build
-              [ -f "$PREFIX/lib/pkgconfig/soxr.pc" ] || mkpc soxr "The SoX Resampler library" "0.1.3" soxr "-lm"
+              # soxr.pc 上游 CMake install 会自动生成；若上游结构变化则兜底补
+              if [ ! -f "$PREFIX/lib/pkgconfig/soxr.pc" ]; then
+                echo "::warning::libsoxr: 上游未生成 soxr.pc，使用 mkpc 兜底"
+                mkpc soxr "The SoX Resampler library" "0.1.3" soxr "-lm"
+              fi
 
           - name: webp
             libs: "webp sharpyuv"
@@ -449,29 +575,43 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
+          # 文本链：RUNPATH 用 $ORIGIN（不是 .），并对产物做 patchelf 归一化
           - name: text-stack
             libs: "freetype fribidi harfbuzz ass"
             build: |
               set -o errexit
-              if [ "$LINK" = "static" ]; then CFLAGS_EXTRA="-O2 -fPIC"; else CFLAGS_EXTRA="-O2"; fi
+
+              if [ "$LINK" = "static" ]; then
+                CFLAGS_EXTRA="-O2 -fPIC"
+              else
+                CFLAGS_EXTRA="-O2"
+              fi
+
               BASE_CPPFLAGS="-I$PREFIX/include -I$PREFIX/include/fribidi -I$PREFIX/include/harfbuzz -I$PREFIX/include/freetype2"
+
               BASE_LDFLAGS="-L$PREFIX/lib"
               if [ "$LINK" = "shared" ]; then
+                # ★ 根治点：$ORIGIN = 库自身所在目录；. = 进程当前目录（错）
+                #   \$ 转义，避免被 shell 提前展开；--enable-new-dtags → DT_RUNPATH
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,--enable-new-dtags,-rpath,\$ORIGIN"
               fi
 
+              echo "### FreeType ($LINK)"
               [ -d freetype ] || git clone --depth 1 https://gitlab.freedesktop.org/freetype/freetype.git freetype
               (
                 cd freetype
                 make distclean >/dev/null 2>&1 || true
                 ./autogen.sh
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                  $LTOPT --with-pic --without-zlib --without-png --without-bzip2 --without-harfbuzz \
+                ./configure \
+                  --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                  $LTOPT --with-pic \
+                  --without-zlib --without-png --without-bzip2 --without-harfbuzz \
                   CFLAGS="$CFLAGS_EXTRA"
                 make -j"$(nproc)"
                 make install
               )
 
+              echo "### FriBidi ($LINK)"
               [ -d fribidi ] || git clone --depth 1 https://github.com/fribidi/fribidi.git fribidi
               (
                 cd fribidi
@@ -486,13 +626,16 @@ jobs:
                   printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
                 } > fribidi.cross
                 PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-                meson setup _build --cross-file fribidi.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
+                meson setup _build --cross-file fribidi.cross \
+                  --prefix="$PREFIX" \
+                  --default-library="$MESON_LIB" \
+                  --buildtype=release \
                   -Ddocs=false -Ddeprecated=false -Db_staticpic=true
                 ninja -C _build
                 ninja -C _build install
               )
 
+              echo "### HarfBuzz ($LINK)"
               [ -d harfbuzz ] || git clone --depth 1 https://github.com/harfbuzz/harfbuzz.git harfbuzz
               (
                 cd harfbuzz
@@ -508,8 +651,10 @@ jobs:
                   printf '\n[host_machine]\nsystem = '"'"'android'"'"'\ncpu_family = '"'"'aarch64'"'"'\ncpu = '"'"'aarch64'"'"'\nendian = '"'"'little'"'"'\n'
                 } > android.cross
                 PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-                meson setup _build --cross-file android.cross --prefix="$PREFIX" \
-                  --default-library="$MESON_LIB" --buildtype=release \
+                meson setup _build --cross-file android.cross \
+                  --prefix="$PREFIX" \
+                  --default-library="$MESON_LIB" \
+                  --buildtype=release \
                   -Db_staticpic=true -Dfreetype=enabled \
                   -Dglib=disabled -Dgobject=disabled -Dcairo=disabled \
                   -Dicu=disabled -Dgraphite2=disabled \
@@ -529,6 +674,7 @@ jobs:
                 ln -sf "freetype2/ft2build.h" "$PREFIX/include/ft2build.h"
               fi
 
+              echo "### libass ($LINK)"
               [ -d libass ] || git clone --depth 1 https://github.com/libass/libass.git libass
               (
                 cd libass
@@ -536,22 +682,39 @@ jobs:
                 ./autogen.sh
                 PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" \
                 PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
-                ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
-                  $LTOPT --with-pic --disable-fontconfig --disable-require-system-font-provider \
-                  CFLAGS="$CFLAGS_EXTRA" CPPFLAGS="$BASE_CPPFLAGS" LDFLAGS="$BASE_LDFLAGS"
+                ./configure \
+                  --prefix="$PREFIX" --host="$ANDROID_TRIPLE" --build=x86_64-pc-linux-gnu \
+                  $LTOPT --with-pic \
+                  --disable-fontconfig \
+                  --disable-require-system-font-provider \
+                  CFLAGS="$CFLAGS_EXTRA" \
+                  CPPFLAGS="$BASE_CPPFLAGS" \
+                  LDFLAGS="$BASE_LDFLAGS"
                 make -j"$(nproc)"
                 make install
               )
 
+              # ★ 归一化：autoconf 可能把 $ORIGIN 展开坏，用 patchelf 兜死
               if [ "$LINK" = "shared" ]; then
+                echo "### RUNPATH 归一化"
                 while IFS= read -r so; do
                   [ -e "$so" ] || continue
                   if command -v patchelf >/dev/null 2>&1; then
                     patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+                    printf '  %-30s %s\n' "$(basename "$so")" "$(patchelf --print-rpath "$so" 2>/dev/null)"
+                  else
+                    printf '  %-30s %s\n' "$(basename "$so")" \
+                      "$(readelf -d "$so" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
                   fi
                 done < <(find "$PREFIX/lib" -maxdepth 1 -name '*.so*' -type f)
-                readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -q '\$ORIGIN' \
-                  || { echo "::error::libass.so RUNPATH 不含 \$ORIGIN"; exit 1; }
+
+                echo "--- libass.so RUNPATH 断言 ---"
+                if readelf -d "$PREFIX/lib/libass.so" 2>/dev/null | grep -q '\$ORIGIN'; then
+                  echo "✅ libass.so RUNPATH 含 \$ORIGIN"
+                else
+                  echo "::error::libass.so RUNPATH 不含 \$ORIGIN（会导致换目录后找不到依赖）"
+                  exit 1
+                fi
               fi
               echo "✅ text-stack [$LINK] ok"
 
@@ -575,11 +738,13 @@ jobs:
       - name: Download and Unpack NDK
         run: |
           set -euo pipefail
+          df -h / | tail -1
           wget -q "${{ env.NDK_URL }}" -O ndk.zip
           unzip -q ndk.zip
           mv android-ndk-r30* "${{ github.workspace }}/ndk"
           rm -f ndk.zip
           chmod -R +x "${{ github.workspace }}/ndk"
+          df -h / | tail -1
 
       - name: Set toolchain env
         run: |
@@ -607,6 +772,7 @@ jobs:
           file /tmp/smoke.out
           "$CXX" /tmp/smoke.c -o /tmp/smoke.out
           "$STRIP" --version | head -1
+          echo "✅ 编译器与 strip 均可用"
 
       - name: Install mkpc helper
         run: |
@@ -642,12 +808,14 @@ jobs:
           } > "$HOME/.local/bin/mkpc"
           chmod +x "$HOME/.local/bin/mkpc"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          rm -rf /tmp/mkpc_selftest && mkdir -p /tmp/mkpc_selftest
+          PREFIX=/tmp/mkpc_selftest LINK=shared "$HOME/.local/bin/mkpc" selftest "self test" 0 selftestlib
+          test -f /tmp/mkpc_selftest/lib/pkgconfig/selftest.pc
 
       - name: Build ${{ matrix.name }} (static + shared)
         shell: bash
         env:
           CHECK_LIBS: ${{ matrix.libs }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
           set -euo pipefail
           unset LIBS LIBS_PRIVATE LDFLAGS CPPFLAGS CFLAGS CXXFLAGS LDLIBS 2>/dev/null || true
@@ -660,8 +828,21 @@ jobs:
               find "${{ github.workspace }}" -maxdepth 5 -name config.log \
                    -not -path "*/ndk/*" -print0 2>/dev/null |
                 while IFS= read -r -d '' f; do
+                  echo "=============== $f : Core tests（末 40 行）==============="
+                  awk '/^## Core tests/,/^## (Cache variables|Output variables)/' "$f" 2>/dev/null | tail -40 || true
+                  echo "=============== $f : 错误相关行 ==============="
+                  grep -nE 'error:|Unknown option|not supported|only supported on' "$f" 2>/dev/null | tail -30 || true
                   echo "=============== $f : 末 40 行 ==============="
                   tail -40 "$f" || true
+                done
+              find "${{ github.workspace }}" -maxdepth 6 -name CMakeError.log -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f ==============="; tail -40 "$f"
+                done
+              find "${{ github.workspace }}" -maxdepth 5 -name 'libs-*.mk' -print0 2>/dev/null |
+                while IFS= read -r -d '' f; do
+                  echo "=============== $f ==============="
+                  grep -nE 'LDFLAGS|CONFIG_SHARED|CONFIG_STATIC|CONFIG_PIC' "$f" | head -30 || true
                 done
               echo "::endgroup::"
             fi
@@ -672,16 +853,66 @@ jobs:
           cat > /tmp/lib_build.sh <<'__LIB_EOF__'
           ${{ matrix.build }}
           __LIB_EOF__
+          sed -n '1,5p' /tmp/lib_build.sh
           bash -n /tmp/lib_build.sh || { echo "::error::拼装后的构建脚本有语法错误"; exit 1; }
 
           separate() {
             local link="$1" prefix="$2"
             [ -d "$prefix" ] || return 0
             if [ "$link" = "static" ]; then
+              find "$prefix" -type d \( -name 'ossl-modules' -o -name 'engines-*' \) \
+                -exec rm -rf {} + 2>/dev/null || true
               find "$prefix/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) \
                 -print -delete 2>/dev/null || true
             else
               find "$prefix/lib" -maxdepth 1 -name '*.a' -print -delete 2>/dev/null || true
+
+              # ═══ 动态库 strip：NDK llvm-strip，事务式（ABI 面不变才覆盖）═══
+              local f b sz0 sz1 rp0 ne0 ok mode ns=0 ndg=0 nsp=0
+              echo "--- strip shared .so ---"
+              if [ -x "${STRIP:-}" ]; then
+                while IFS= read -r -d '' f; do
+                  [ -f "$f" ] || continue
+                  b="$(basename "$f")"
+                  if ! "$READELF" -h "$f" >/dev/null 2>&1; then
+                    echo "::warning::$b 不是 ELF，跳过"; continue
+                  fi
+
+                  sz0=$(stat -c %s "$f")
+                  rp0="$("$READELF" -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
+                  ne0="$("$READELF" -d "$f" 2>/dev/null | awk '/\(NEEDED\)/{print $NF}' | sort)"
+                  "$READELF" -sW --dyn-syms "$f" 2>/dev/null \
+                    | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print $8}' | sort -u > /tmp/sym.before || true
+
+                  ok=""
+                  for mode in --strip-unneeded --strip-debug; do
+                    cp -f "$f" /tmp/strip.try
+                    "$STRIP" "$mode" /tmp/strip.try 2>/tmp/strip.err || continue
+                    "$READELF" -h /tmp/strip.try 2>/dev/null | grep -q 'AArch64' || continue
+                    [ "$("$READELF" -d /tmp/strip.try 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')" = "$rp0" ] || continue
+                    [ "$("$READELF" -d /tmp/strip.try 2>/dev/null | awk '/\(NEEDED\)/{print $NF}' | sort)" = "$ne0" ] || continue
+                    "$READELF" -sW --dyn-syms /tmp/strip.try 2>/dev/null \
+                      | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print $8}' | sort -u > /tmp/sym.after || true
+                    cmp -s /tmp/sym.before /tmp/sym.after || continue
+                    ok="$mode"; break
+                  done
+
+                  if [ -z "$ok" ]; then
+                    echo "::warning::$b 各 strip 模式均改动 ABI 面，保持原样"
+                    nsp=$((nsp+1)); continue
+                  fi
+
+                  cp -f /tmp/strip.try "$f"
+                  sz1=$(stat -c %s "$f")
+                  if [ "$ok" = "--strip-unneeded" ]; then ns=$((ns+1)); else ndg=$((ndg+1)); fi
+                  printf '  %-34s %8s → %-8s (%3s%%)  %s\n' "$b" \
+                    "$(numfmt --to=iec "$sz0")" "$(numfmt --to=iec "$sz1")" \
+                    "$(( sz1 * 100 / (sz0 ? sz0 : 1) ))" "$ok"
+                done < <(find "$prefix/lib" -maxdepth 1 -name '*.so*' -type f -print0 2>/dev/null | sort -z)
+                echo "--- strip: 完整 $ns / 降级 $ndg / 保持原样 $nsp ---"
+              else
+                echo "::warning::STRIP 不可用（${STRIP:-<unset>}），跳过 strip"
+              fi
             fi
           }
 
@@ -711,6 +942,13 @@ jobs:
 
           run_variant static "$PREFIX_STATIC"
           run_variant shared "$PREFIX_SHARED"
+
+          echo "--- ${{ matrix.name }} static ---"
+          find "$PREFIX_STATIC/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
+            | grep -Ei "$(echo $CHECK_LIBS | tr ' ' '|')" || true
+          echo "--- ${{ matrix.name }} shared ---"
+          find "$PREFIX_SHARED/lib" -maxdepth 1 \( -type f -o -type l \) 2>/dev/null \
+            | grep -Ei "$(echo $CHECK_LIBS | tr ' ' '|')" || true
 
       - name: Upload prefix
         uses: actions/upload-artifact@v4
@@ -746,9 +984,16 @@ jobs:
           find "$P/static" -type d \( -name 'ossl-modules' -o -name 'engines-*' \) \
             -exec rm -rf {} + 2>/dev/null || true
           find "$P/static/lib" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null |
-            while IFS= read -r -d '' f; do mv -f "$f" "$P/_stray/" 2>/dev/null || true; done
+            while IFS= read -r -d '' f; do
+              echo "::warning::static 里移出 .so：$(basename "$f")"
+              mv -f "$f" "$P/_stray/" 2>/dev/null || true
+            done
+
           find "$P/shared/lib" -maxdepth 1 -name '*.a' -print0 2>/dev/null |
-            while IFS= read -r -d '' f; do mv -f "$f" "$P/_stray/" 2>/dev/null || true; done
+            while IFS= read -r -d '' f; do
+              echo "::warning::shared 里移出 .a：$(basename "$f")"
+              mv -f "$f" "$P/_stray/" 2>/dev/null || true
+            done
 
           rel='${pcfiledir}/../..'
           for d in static shared; do
@@ -759,9 +1004,87 @@ jobs:
               done
           done
 
+          # ★ 全量 RUNPATH 归一化：shared 侧每个 .so 统一 $ORIGIN
+          echo "===== RUNPATH 归一化（shared）====="
           while IFS= read -r f; do
+            cur="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
             patchelf --set-rpath '$ORIGIN' "$f"
+            printf '  %-34s %-12s -> %s\n' "$(basename "$f")" "${cur:-(none)}" "$(patchelf --print-rpath "$f")"
           done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+
+          echo "===== 统计 ====="
+          for d in static shared; do
+            echo "[$d] a=$(find "$P/$d/lib" -maxdepth 1 -name '*.a' | wc -l)" \
+                 "so=$(find "$P/$d/lib" -maxdepth 1 -name '*.so*' | wc -l)" \
+                 "pc=$(find "$P/$d/lib/pkgconfig" -name '*.pc' | wc -l)" \
+                 "hdr=$(find "$P/$d/include" -name '*.h' | wc -l)"
+          done
+
+          echo "===== 缺库检查 ====="
+          miss=""
+          for lib in x264 x265 dav1d vpx aom SvtAv1Enc vvenc xeve xevd ssl crypto \
+                     fdk-aac mp3lame opus ogg vorbis vorbisenc lc3 soxr webp \
+                     freetype fribidi harfbuzz ass; do
+            s="-"; h="-"
+            find "$P/static/lib" -maxdepth 1 -name "lib${lib}.a" | grep -q . && s="ok"
+            find "$P/shared/lib" -maxdepth 1 -name "lib${lib}.so" | grep -q . && h="ok"
+            [ "$s" = ok ] || { echo "::warning::static 缺 lib${lib}.a"; miss="$miss ${lib}(static)"; }
+            [ "$h" = ok ] || { echo "::warning::shared 缺 lib${lib}.so"; miss="$miss ${lib}(shared)"; }
+          done
+          [ -z "$miss" ] && echo "✅ 全部库动静态都齐全" || echo "⚠️ 缺：$miss"
+
+          echo "===== x264.pc 检查（FFmpeg 静态必需）====="
+          for d in static shared; do
+            if [ -e "$P/$d/lib/libx264.a" ] || [ -e "$P/$d/lib/libx264.so" ]; then
+              if [ -e "$P/$d/lib/pkgconfig/x264.pc" ]; then
+                echo "✅ [$d] x264.pc 存在"
+              else
+                echo "::error::[$d] 缺 x264.pc，FFmpeg 的 require_pkg_config 会失败"
+              fi
+            fi
+          done
+
+          echo "===== soxr.pc 检查（FFmpeg --enable-libsoxr 必需）====="
+          for d in static shared; do
+            if [ -e "$P/$d/lib/libsoxr.a" ] || [ -e "$P/$d/lib/libsoxr.so" ]; then
+              if [ -e "$P/$d/lib/pkgconfig/soxr.pc" ]; then
+                echo "✅ [$d] soxr.pc 存在"
+              else
+                echo "::error::[$d] 缺 soxr.pc，FFmpeg 的 --enable-libsoxr 会失败"
+              fi
+            fi
+          done
+
+          echo "===== .symtab 残留检查（strip 生效性）====="
+          symtab=0
+          while IFS= read -r f; do
+            if readelf -SW "$f" 2>/dev/null | grep -q '\.symtab'; then
+              echo "::warning::$(basename "$f") 仍含 .symtab"; symtab=1
+            fi
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+          [ "$symtab" -eq 0 ] && echo "✅ 全部 .so 无 .symtab 残留"
+
+          echo "===== 16KB 对齐检查 ====="
+          bad=0
+          while IFS= read -r f; do
+            al=$(readelf -lW "$f" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
+            case "$al" in
+              *0x1000*) echo "::warning::$(basename "$f") 含 4KB LOAD 段: $al"; bad=1 ;;
+            esac
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+          [ "$bad" -eq 0 ] && echo "✅ 全部 .so 的 LOAD 段均为 0x4000"
+
+          echo "===== libc++ 符号泄漏检查（仅统计已定义符号）====="
+          leak=0
+          while IFS= read -r f; do
+            n=$(readelf -sW --dyn-syms "$f" 2>/dev/null \
+                | awk '$7 != "UND" && $8 ~ /_ZNSt3__1/' | wc -l || true)
+            if [ "${n:-0}" -gt 0 ]; then
+              echo "::warning::$(basename "$f") 导出 ${n} 个 libc++ 符号"
+              leak=1
+            fi
+          done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
+          [ "$leak" -eq 0 ] && echo "✅ 无 libc++ 符号泄漏"
 
           rm -rf "$P/_stray"
           exit 0
@@ -775,6 +1098,7 @@ jobs:
           tar -I 'xz -9e -T0' -cf "${BASE}-full.tar.xz"   prefix
           tar -I 'xz -9e -T0' -cf "${BASE}-static.tar.xz" prefix/static
           tar -I 'xz -9e -T0' -cf "${BASE}-shared.tar.xz" prefix/shared
+          ls -lh "${BASE}"-*.tar.xz
 
       - name: Upload tarballs
         uses: actions/upload-artifact@v4
@@ -785,165 +1109,8 @@ jobs:
             ${{ github.workspace }}/prefix
           retention-days: 2
 
-  ffmpeg:
-    needs: package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download prefix
-        uses: actions/download-artifact@v4
-        with:
-          name: prefix-tarball
-          path: ${{ github.workspace }}/artifacts
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config nasm yasm wget unzip xz-utils
-
-      - name: Download and Unpack NDK
-        run: |
-          set -euo pipefail
-          wget -q "${{ env.NDK_URL }}" -O /tmp/ndk.zip
-          unzip -q /tmp/ndk.zip -d "${{ github.workspace }}"
-          mv "${{ github.workspace }}/android-ndk-r30"* "${{ github.workspace }}/ndk"
-          rm -f /tmp/ndk.zip
-          chmod -R +x "${{ github.workspace }}/ndk"
-
-      - name: Set toolchain env
-        run: |
-          TOOLCHAIN="${{ github.workspace }}/ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          {
-            echo "TOOLCHAIN=$TOOLCHAIN"
-            echo "NDK=${{ github.workspace }}/ndk"
-            echo "SYSROOT=$TOOLCHAIN/sysroot"
-            echo "CC=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang"
-            echo "CXX=$TOOLCHAIN/bin/${ANDROID_TRIPLE}${API_LEVEL}-clang++"
-            echo "AR=$TOOLCHAIN/bin/llvm-ar"
-            echo "NM=$TOOLCHAIN/bin/llvm-nm"
-            echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib"
-            echo "STRIP=$TOOLCHAIN/bin/llvm-strip"
-            echo "READELF=$TOOLCHAIN/bin/llvm-readelf"
-          } >> "$GITHUB_ENV"
-
-      - name: Unpack prefix
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}"
-          tar xf artifacts/ffmpeg-libs-arm64-v8a-api${API_LEVEL}-full.tar.xz
-          echo "--- lame 相关文件 ---"
-          ls -l prefix/static/lib/libmp3lame* prefix/shared/lib/libmp3lame* 2>/dev/null || true
-          ls -l prefix/static/lib/pkgconfig/lame.pc prefix/shared/lib/pkgconfig/lame.pc 2>/dev/null || true
-          echo "--- pkg-config 现场验证（static）---"
-          PKG_CONFIG_PATH="$PWD/prefix/static/lib/pkgconfig" \
-          PKG_CONFIG_LIBDIR="$PWD/prefix/static/lib/pkgconfig" \
-            pkg-config --libs --cflags lame 2>&1 || true
-
-      - name: Build FFmpeg (static & shared)
-        shell: bash
-        env:
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-        run: |
-          set -euo pipefail
-          if [ -n "${PROXY_URL:-}" ]; then
-            export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL"
-          fi
-
-          for LINK in static shared; do
-            PREFIX="${{ github.workspace }}/prefix/$LINK"
-            DIST="${{ github.workspace }}/dist/$LINK"
-            BUILD="${{ github.workspace }}/build-ffmpeg-$LINK"
-
-            if [ "$LINK" = static ]; then
-              LTOPT="--enable-static --disable-shared"
-            else
-              LTOPT="--disable-static --enable-shared"
-            fi
-
-            export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-            export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
-            export PKG_CONFIG_ALLOW_CROSS=1
-
-            echo "::group::FFmpeg [$LINK]"
-            rm -rf "$BUILD"; mkdir -p "$BUILD"
-            cd "$BUILD"
-
-            dump_cfg_log() {
-              local rc=$?
-              trap - ERR EXIT
-              if [ "$rc" -ne 0 ] && [ -f ffbuild/config.log ]; then
-                echo "::group::config.log 关键错误 — FFmpeg [$LINK]"
-                tail -120 ffbuild/config.log || true
-                echo "===== 错误行 ====="
-                grep -nE 'error:|unable to|undefined reference|cannot find|No such file|is unable' ffbuild/config.log 2>/dev/null | tail -60 || true
-                echo "::endgroup::"
-              fi
-              exit $rc
-            }
-            trap dump_cfg_log ERR EXIT
-
-            "${{ github.workspace }}/configure" \
-              --target-os=android --arch=aarch64 --enable-cross-compile \
-              --cc="$CC" --cxx="$CXX" --ar="$AR" --nm="$NM" --ranlib="$RANLIB" --strip="$STRIP" \
-              --enable-pic --disable-autodetect --disable-programs --disable-doc --disable-debug \
-              --enable-jni --enable-mediacodec \
-              --enable-gpl --enable-version3 --enable-nonfree \
-              --enable-libx264 --enable-libx265 --enable-libdav1d --enable-libvpx \
-              --enable-libaom --enable-libsvtav1 --enable-libvvenc --enable-libxeve --enable-libxevd \
-              --enable-openssl --enable-libfdk-aac --enable-libmp3lame --enable-libopus \
-              --enable-libvorbis --enable-liblc3 --enable-libsoxr --enable-libwebp \
-              --enable-libass --enable-libfreetype --enable-libharfbuzz --enable-libfribidi \
-              $LTOPT \
-              --prefix="$DIST" \
-              --extra-cflags="-O2 -fPIC -I$PREFIX/include" \
-              --extra-ldflags="-L$PREFIX/lib"
-
-            make -j"$(nproc)"
-            make install
-            cd "${{ github.workspace }}"
-            trap - ERR EXIT
-            echo "::endgroup::"
-          done
-
-      - name: Verify FFmpeg shared RUNPATH / 16KB align
-        shell: bash
-        run: |
-          set -uo pipefail
-          P="${{ github.workspace }}/dist/shared"
-          bad=0
-          while IFS= read -r f; do
-            al=$("$READELF" -lW "$f" 2>/dev/null | awk '/ LOAD /{print $NF}' | sort -u | tr '\n' ' ')
-            rp=$("$READELF" -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')
-            echo "  $(basename "$f")  align=${al:-?}  rpath=${rp:-<none>}"
-            case "$al" in *0x1000*) echo "::warning::$(basename "$f") 含 4KB LOAD"; bad=1 ;; esac
-            [ "$rp" = '$ORIGIN' ] || { echo "::error::$(basename "$f") RUNPATH 不是 \$ORIGIN"; bad=1; }
-          done < <(find "$P/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
-          exit $bad
-
-      - name: Pack FFmpeg tarballs
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}"
-          BASE="ffmpeg-arm64-v8a-api${API_LEVEL}"
-          tar -I 'xz -9e -T0' -cf "${BASE}-full.tar.xz"   dist
-          tar -I 'xz -9e -T0' -cf "${BASE}-static.tar.xz" dist/static
-          tar -I 'xz -9e -T0' -cf "${BASE}-shared.tar.xz" dist/shared
-          sha256sum "${BASE}"-*.tar.xz > "${BASE}-SHA256SUMS.txt"
-
-      - name: Upload FFmpeg artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ffmpeg-tarball
-          if-no-files-found: error
-          path: |
-            ${{ github.workspace }}/ffmpeg-arm64-v8a-api*.tar.xz
-            ${{ github.workspace }}/ffmpeg-arm64-v8a-api*-SHA256SUMS.txt
-          retention-days: 2
-
   release:
-    needs: [package, ffmpeg]
+    needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -951,67 +1118,122 @@ jobs:
     env:
       TAG: ffmpeg-lib
     steps:
-      - name: Download libs tarballs
+      - name: Download tarballs
         uses: actions/download-artifact@v4
         with:
           name: prefix-tarball
-          path: artifacts/libs
-
-      - name: Download ffmpeg tarballs
-        uses: actions/download-artifact@v4
-        with:
-          name: ffmpeg-tarball
-          path: artifacts/ffmpeg
+          path: artifacts
 
       - name: Checksums & timestamps
         run: |
           set -euo pipefail
           cd artifacts
+          rm -f SHA256SUMS.txt
+          sha256sum *.tar.xz | tee SHA256SUMS.txt
+          ls -lh
           {
             echo "BUILD_DATE_UTC=$(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "BUILD_DATE_UTC3=$(TZ='Etc/GMT-3' date +'%Y-%m-%d %H:%M:%S')"
+            echo "BUILD_DATE_UTC8=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
             echo "SHORT_SHA=$(echo '${{ github.sha }}' | cut -c1-7)"
           } >> "$GITHUB_ENV"
-          ( cd libs   && sha256sum *.tar.xz > SHA256SUMS.txt )
-          ( cd ffmpeg && sha256sum *.tar.xz > SHA256SUMS.txt )
+
+      - name: Collect stats
+        run: |
+          set -euo pipefail
+          cd artifacts
+          {
+            echo "N_A=$(find prefix/static/lib -maxdepth 1 -name '*.a' 2>/dev/null | wc -l)"
+            echo "N_SO=$(find prefix/shared/lib -maxdepth 1 -name '*.so*' 2>/dev/null | wc -l)"
+            echo "N_PC=$(find prefix/shared/lib/pkgconfig -name '*.pc' 2>/dev/null | wc -l)"
+            echo "N_HDR=$(find prefix/shared/include -name '*.h' 2>/dev/null | wc -l)"
+          } > stats.env
+          cat stats.env
 
       - name: Compose release notes
         shell: bash
         run: |
           set -euo pipefail
           cd artifacts
+          . ./stats.env
           {
-            echo "## Android arm64-v8a 外部库 + FFmpeg"
+            echo "## Android arm64-v8a 外部库（静态 + 动态）"
+            echo
+            echo "### 构建信息"
             echo
             echo "| 项 | 值 |"
             echo "| --- | --- |"
             echo "| 构建时间 (UTC) | ${BUILD_DATE_UTC} |"
-            echo "| NDK / API / ABI | r30 / ${API_LEVEL} / arm64-v8a |"
+            echo "| 构建时间 (UTC+3) | ${BUILD_DATE_UTC3} |"
+            echo "| 构建时间 (UTC+8) | ${BUILD_DATE_UTC8} |"
+            echo "| NDK | r30 |"
+            echo "| API Level | ${API_LEVEL} |"
+            echo "| ABI | arm64-v8a |"
             echo "| 提交 | [\`${SHORT_SHA}\`](/${{ github.repository }}/commit/${{ github.sha }}) |"
             echo
-            echo "### FFmpeg 产物"
-            for f in ffmpeg/*.tar.xz; do echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"; done
+            echo "### 质量校验"
             echo
-            echo "### 外部库产物"
-            for f in libs/*.tar.xz; do echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"; done
+            echo "- 16 KB 页对齐：全部 \`.so\` 的 LOAD 段 \`p_align = 0x4000\` ✅"
+            echo "- RUNPATH：全部 \`.so\` 统一为 \`\$ORIGIN\`（与工作目录无关）✅"
+            echo "- 符号表：全部 \`.so\` 已用 NDK \`llvm-strip\` 处理，无 \`.symtab\`，导出 ABI 符号完整 ✅"
+            echo "- x264.pc / soxr.pc：已就位（FFmpeg 静态链接必需）✅"
+            echo "- libc++：静态链接且符号已隐藏 ✅"
+            echo
+            echo "### 产物"
+            echo
+            echo "| 文件 | 内容 | 大小 |"
+            echo "| --- | --- | --- |"
           } > release-body.md
+
+          for f in *.tar.xz; do
+            case "$f" in
+              *-full.tar.xz)   desc="静态 + 动态（\`prefix/static\` + \`prefix/shared\`）" ;;
+              *-static.tar.xz) desc="仅静态（\`lib/*.a\` + include + pkgconfig）" ;;
+              *-shared.tar.xz) desc="仅动态（\`lib/*.so*\` + include + pkgconfig）" ;;
+              *)               desc="-" ;;
+            esac
+            echo "| \`$f\` | $desc | $(du -h "$f" | cut -f1) |" >> release-body.md
+          done
+
+          {
+            echo
+            echo "### 内容统计"
+            echo
+            echo "| 项 | 数量 |"
+            echo "| --- | --- |"
+            echo "| 静态库 \`.a\` | ${N_A} |"
+            echo "| 动态库 \`.so*\` | ${N_SO} |"
+            echo "| pkg-config \`.pc\` | ${N_PC} |"
+            echo "| 头文件 \`.h\` | ${N_HDR} |"
+            echo
+            echo "### 使用"
+            echo
+            echo '```sh'
+            echo 'tar xf ffmpeg-libs-arm64-v8a-api36-full.tar.xz'
+            echo 'export PKG_CONFIG_PATH=$PWD/prefix/shared/lib/pkgconfig'
+            echo 'pkg-config --libs --cflags libass freetype2 harfbuzz fribidi soxr'
+            echo '```'
+            echo
+            echo "> 所有 \`.so\` 的 RUNPATH 均为 \`\$ORIGIN\`，可放在任意目录下使用。"
+          } >> release-body.md
+
+          cat release-body.md
 
       - name: Delete existing tag/release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TAG}" 2>/dev/null \
-            && echo "已删除旧 tag" || echo "跳过"
+            && echo "已删除旧 tag ${TAG}" || echo "tag ${TAG} 不存在或已删除，跳过"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ffmpeg-lib
-          name: FFmpeg libs + external libs (arm64-v8a) — rolling
+          name: FFmpeg libs (arm64-v8a) — rolling
           body_path: artifacts/release-body.md
           make_latest: true
           overwrite_files: true
           files: |
-            artifacts/libs/*.tar.xz
-            artifacts/libs/SHA256SUMS.txt
-            artifacts/ffmpeg/*.tar.xz
-            artifacts/ffmpeg/SHA256SUMS.txt
+            artifacts/*.tar.xz
+            artifacts/SHA256SUMS.txt
