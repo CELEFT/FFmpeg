@@ -346,7 +346,7 @@ jobs:
               make install
               mkpc fdk-aac "Fraunhofer FDK AAC" "2.0.3" fdk-aac
 
-          # ★ lame：绕过 LAME 3.100 AM_DISABLE_STATIC，手动编译；并做硬校验
+          # ★ lame：恢复原始 ./configure + make + make install + mkpc 流程
           - name: lame
             libs: "mp3lame"
             build: |
@@ -356,58 +356,12 @@ jobs:
               fi
               cd lame-3.100
               make distclean >/dev/null 2>&1 || true
-
-              mkdir -p "$PREFIX/lib" "$PREFIX/include/lame" obj
-              rm -f obj/*.o
-              cp -f include/lame.h "$PREFIX/include/lame/"
-
-              for f in libmp3lame/*.c; do
-                o="obj/$(echo "$f" | tr '/' '_').o"
-                $CC -O2 -fPIC -Iinclude -Ilibmp3lame -Impglib -c "$f" -o "$o" \
-                  || { echo "::error::编译 $f 失败"; exit 1; }
-              done
-              for f in mpglib/*.c; do
-                case "$(basename "$f")" in dct64_i386.c|decode_i386.c) continue ;; esac
-                o="obj/$(echo "$f" | tr '/' '_').o"
-                $CC -O2 -fPIC -Iinclude -Ilibmp3lame -Impglib -c "$f" -o "$o" \
-                  || { echo "::error::编译 $f 失败"; exit 1; }
-              done
-
-              if [ "$LINK" = static ]; then
-                $AR rcs "$PREFIX/lib/libmp3lame.a" obj/*.o
-                [ -e "$PREFIX/lib/libmp3lame.a" ] || { echo "::error::libmp3lame.a 未生成"; exit 1; }
-                echo "✅ libmp3lame.a ($(du -h "$PREFIX/lib/libmp3lame.a" | cut -f1))"
-                $AR t "$PREFIX/lib/libmp3lame.a" | head -5
-              else
-                $CC -shared -Wl,-soname,libmp3lame.so -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
-                  -o "$PREFIX/lib/libmp3lame.so" obj/*.o -lm
-                [ -e "$PREFIX/lib/libmp3lame.so" ] || { echo "::error::libmp3lame.so 未生成"; exit 1; }
-                echo "✅ libmp3lame.so"
-              fi
-
-              mkdir -p "$PREFIX/lib/pkgconfig"
-              cat > "$PREFIX/lib/pkgconfig/lame.pc" <<EOF
-              prefix=$PREFIX
-              exec_prefix=\${prefix}
-              libdir=\${exec_prefix}/lib
-              includedir=\${prefix}/include
-
-              Name: lame
-              Description: LAME MP3 encoding library
-              Version: 3.100
-              Libs: -L\${libdir} -lmp3lame
-              Libs.private: -lm
-              Cflags: -I\${includedir}
-              EOF
-
-              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-              export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
-              pkg-config --exists --print-errors lame || { echo "::error::lame.pc 不可用"; exit 1; }
-              echo "  lame version: $(pkg-config --modversion lame)"
-              echo "  cflags: $(pkg-config --cflags lame)"
-              echo "  libs: $(pkg-config --libs lame)"
-              [ -f "$PREFIX/include/lame/lame.h" ] || { echo "::error::lame/lame.h 缺失"; exit 1; }
-              echo "✅ lame.pc + 库 + 头文件就绪"
+              sed -i '/lame_init_old/d' include/libmp3lame.sym
+              ./configure --prefix="$PREFIX" --host="$ANDROID_TRIPLE" \
+                $LTOPT --with-pic --disable-frontend --disable-asm
+              make -j"$(nproc)"
+              make install
+              mkpc lame "MP3 encoding library" "3.100" mp3lame
 
           - name: opus
             libs: "opus"
@@ -821,8 +775,6 @@ jobs:
           tar -I 'xz -9e -T0' -cf "${BASE}-full.tar.xz"   prefix
           tar -I 'xz -9e -T0' -cf "${BASE}-static.tar.xz" prefix/static
           tar -I 'xz -9e -T0' -cf "${BASE}-shared.tar.xz" prefix/shared
-          echo "--- 校验 lame 在 tarball 里 ---"
-          tar -tJf "${BASE}-static.tar.xz" | grep -E 'libmp3lame|lame\.pc' || echo "::warning::static tarball 里找不到 lame 相关文件"
 
       - name: Upload tarballs
         uses: actions/upload-artifact@v4
@@ -888,8 +840,6 @@ jobs:
           PKG_CONFIG_PATH="$PWD/prefix/static/lib/pkgconfig" \
           PKG_CONFIG_LIBDIR="$PWD/prefix/static/lib/pkgconfig" \
             pkg-config --libs --cflags lame 2>&1 || true
-          echo "--- libmp3lame.a 归档内容抽样 ---"
-          "$AR" t prefix/static/lib/libmp3lame.a 2>/dev/null | head -5 || echo "::warning::libmp3lame.a 读不出（可能文件缺失/损坏）"
 
       - name: Build FFmpeg (static & shared)
         shell: bash
