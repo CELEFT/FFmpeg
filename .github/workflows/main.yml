@@ -37,7 +37,6 @@ jobs:
                 $LTOPT --enable-pic --disable-cli
               make -j"$(nproc)"
               make install
-              # x264 从不安装 .pc，FFmpeg 的 require_pkg_config 会直接失败 → 必须补
               mkpc x264 "H.264/AVC encoder" "164" x264 "-lm -ldl -lpthread"
 
           - name: x265
@@ -76,7 +75,6 @@ jobs:
             build: |
               set -euo pipefail
 
-              # 用 git 自身校验，避免半成品目录（被 timeout 打断后 .git 存在但对象不完整）被误判为"已存在"
               if ! git -C dav1d rev-parse --verify HEAD >/dev/null 2>&1; then
                 rm -rf dav1d
                 cloned=""
@@ -134,7 +132,6 @@ jobs:
               make distclean >/dev/null 2>&1 || true
               rm -f config.mk config.log vpx_config.h vpx_config.c libs-*.mk
 
-              # ═══ 补丁 A：--enable-shared 平台白名单加入 android ═══
               python3 - <<'PY'
               import re
               from pathlib import Path
@@ -152,7 +149,6 @@ jobs:
                   print("configure: " + new.strip())
               PY
 
-              # ═══ 补丁 B：注释 -static（NDK 只有 libc.so，无 libc.a）═══
               python3 - <<'PY'
               from pathlib import Path
               p = Path("build/make/configure.sh")
@@ -175,16 +171,10 @@ jobs:
               grep -n 'iphonesimulator\*)' configure | sed 's/^/  /' || true
               grep -n 'check_add_ldflags -static' build/make/configure.sh | sed 's/^/  /' || true
 
-              # ═══ 工具链 ═══
               export CC CXX AR RANLIB STRIP
               export AS="$CC"
-              # 不设 LD：webm_io 启用时 configure 末尾 LD=${CXX} 会覆盖外部赋值
-
-              # ═══ 链接标志：只能走环境变量（configure 不认 --extra-ldflags）═══
-              # 转义链：Shell 输出 $$ORIGIN → libs-*.mk 存 $$ORIGIN → Make 展开 $ORIGIN → ld
               export LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,--enable-new-dtags -Wl,-rpath,'\$\$ORIGIN'"
 
-              # $LTOPT / $EXTRA_CFLAGS / $SYSROOT 由 run_variant 与 workflow env 提供
               ./configure \
                 --prefix="$PREFIX" \
                 --force-target=arm64-android-gcc \
@@ -198,7 +188,6 @@ jobs:
                 --disable-unit-tests \
                 --extra-cflags="$EXTRA_CFLAGS -mno-outline-atomics --sysroot=${SYSROOT}"
 
-              # ═══ 门禁 1：CONFIG_* 在 libs-*.mk 里，不是 config.mk ═══
               MK=$(ls libs-*-gcc.mk 2>/dev/null | head -1 || true)
               if [ -z "${MK:-}" ]; then
                 echo "::error::libvpx: 未生成 libs-*-gcc.mk"; ls -la | head -40; exit 1
@@ -244,11 +233,9 @@ jobs:
               fi
               echo "✅ 门禁 1 通过"
 
-              # ═══ 构建 + 安装 ═══
               make -j"$(nproc)"
               make install
 
-              # ═══ 门禁 2：产物 ═══
               if [ -f "$PREFIX/lib/pkgconfig/vpx.pc" ]; then echo "✅ vpx.pc 已安装"
               else echo "::warning::libvpx: 未找到 vpx.pc"; fi
 
@@ -274,12 +261,11 @@ jobs:
                 esac
 
                 if "$READELF" -d "$so" | grep -q 'NEEDED.*libc++_shared.so'; then
-                  echo "::notice::libvpx: 依赖 libc++_shared.so（webm_io/libyuv 启用所致）→ 随包分发"
+                  echo "::notice::libvpx: 依赖 libc++_shared.so → 随包分发"
                   cp -f "$SYSROOT/usr/lib/aarch64-linux-android/libc++_shared.so" "$PREFIX/lib/"
                   "$READELF" -h "$PREFIX/lib/libc++_shared.so" | grep -q 'AArch64' || {
                     echo "::error::libvpx: libc++_shared.so 不是 AArch64"; exit 1; }
                   echo "✅ 已随包分发 aarch64 libc++_shared.so"
-                  echo "::warning::libvpx: release notes 中「libc++ 静态链接」的说法与此不符，需同步更正"
                 else
                   echo "✅ 不依赖 libc++_shared.so"
                 fi
@@ -362,13 +348,10 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xeve*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
-              echo "--- xeve build 产物 ---"
-              find build \( -name 'libxeve*.a' -o -name 'libxeve*.so*' \) 2>/dev/null | sort || true
               find build -name 'libxeve.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxeve*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxeve.so" ] \
                  && [ -f "$PREFIX/lib/libxeve.a" ]; then
-                echo "xeve: 由 libxeve.a 合成 libxeve.so"
                 $CC -shared -Wl,-soname,libxeve.so \
                   -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                   -o "$PREFIX/lib/libxeve.so" \
@@ -396,13 +379,10 @@ jobs:
               mkdir -p "$PREFIX/lib" "$PREFIX/include"
               [ -d inc ] && cp -f inc/*.h "$PREFIX/include/" 2>/dev/null || true
               find . -maxdepth 3 -name 'xevd*.h' -not -path './build/*' -exec cp -f {} "$PREFIX/include/" \;
-              echo "--- xevd build 产物 ---"
-              find build \( -name 'libxevd*.a' -o -name 'libxevd*.so*' \) 2>/dev/null | sort || true
               find build -name 'libxevd.a'   -exec cp -af  {} "$PREFIX/lib/" \; 2>/dev/null || true
               find build -name 'libxevd*.so*' -exec cp -aLf {} "$PREFIX/lib/" \; 2>/dev/null || true
               if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/libxevd.so" ] \
                  && [ -f "$PREFIX/lib/libxevd.a" ]; then
-                echo "xevd: 由 libxevd.a 合成 libxevd.so"
                 $CC -shared -Wl,-soname,libxevd.so \
                   -Wl,--enable-new-dtags,-rpath,'$ORIGIN' \
                   -o "$PREFIX/lib/libxevd.so" \
@@ -426,8 +406,6 @@ jobs:
               make -j"$(nproc)"
               make install_sw
               rm -rf "$PREFIX/lib/ossl-modules" "$PREFIX"/lib/engines-*
-              echo "--- openssl 构建后 ---"
-              ls -1 "$PREFIX/lib" | sort | grep -E 'ssl|crypto' || true
               for l in crypto ssl; do
                 if [ "$LINK" = "shared" ] && [ ! -e "$PREFIX/lib/lib${l}.so" ] \
                    && [ -f "$PREFIX/lib/lib${l}.a" ]; then
@@ -538,10 +516,6 @@ jobs:
               [ -d soxr ] || git clone --depth 1 https://github.com/chirlu/soxr.git soxr
               cd soxr
               rm -rf build
-              # ★ 不设 CMAKE_SYSTEM_NAME：交给 Android toolchain 自行推断（SIMD 检测敏感）
-              #   WITH_OPENMP=OFF         → NDK clang 默认不含 OpenMP 运行时
-              #   WITH_AVFFT=OFF          → 不让 soxr 反向依赖 libavcodec 做 FFT（保持依赖树干净）
-              #   WITH_LSR_BINDINGS=OFF   → 不生成 libsamplerate 兼容层（libsoxr-lsr），减小体积
               cmake -S . -B build -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
                 -DANDROID_ABI="$TARGET_ABI" -DANDROID_PLATFORM="android-$API_LEVEL" \
@@ -556,7 +530,6 @@ jobs:
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON
               cmake --build build -j"$(nproc)"
               cmake --install build
-              # soxr.pc 上游 CMake install 会自动生成；若上游结构变化则兜底补
               if [ ! -f "$PREFIX/lib/pkgconfig/soxr.pc" ]; then
                 echo "::warning::libsoxr: 上游未生成 soxr.pc，使用 mkpc 兜底"
                 mkpc soxr "The SoX Resampler library" "0.1.3" soxr "-lm"
@@ -575,7 +548,6 @@ jobs:
               make install
               mkpc libwebp "WebP image codec" "1.5.0" webp
 
-          # 文本链：RUNPATH 用 $ORIGIN（不是 .），并对产物做 patchelf 归一化
           - name: text-stack
             libs: "freetype fribidi harfbuzz ass"
             build: |
@@ -591,8 +563,6 @@ jobs:
 
               BASE_LDFLAGS="-L$PREFIX/lib"
               if [ "$LINK" = "shared" ]; then
-                # ★ 根治点：$ORIGIN = 库自身所在目录；. = 进程当前目录（错）
-                #   \$ 转义，避免被 shell 提前展开；--enable-new-dtags → DT_RUNPATH
                 BASE_LDFLAGS="$BASE_LDFLAGS -Wl,--enable-new-dtags,-rpath,\$ORIGIN"
               fi
 
@@ -694,7 +664,6 @@ jobs:
                 make install
               )
 
-              # ★ 归一化：autoconf 可能把 $ORIGIN 展开坏，用 patchelf 兜死
               if [ "$LINK" = "shared" ]; then
                 echo "### RUNPATH 归一化"
                 while IFS= read -r so; do
@@ -867,7 +836,6 @@ jobs:
             else
               find "$prefix/lib" -maxdepth 1 -name '*.a' -print -delete 2>/dev/null || true
 
-              # ═══ 动态库 strip：NDK llvm-strip，事务式（ABI 面不变才覆盖）═══
               local f b sz0 sz1 rp0 ne0 ok mode ns=0 ndg=0 nsp=0
               echo "--- strip shared .so ---"
               if [ -x "${STRIP:-}" ]; then
@@ -1004,7 +972,6 @@ jobs:
               done
           done
 
-          # ★ 全量 RUNPATH 归一化：shared 侧每个 .so 统一 $ORIGIN
           echo "===== RUNPATH 归一化（shared）====="
           while IFS= read -r f; do
             cur="$(readelf -d "$f" 2>/dev/null | sed -n 's/.*RUNPATH.*\[\(.*\)\].*/\1/p')"
@@ -1033,29 +1000,17 @@ jobs:
           done
           [ -z "$miss" ] && echo "✅ 全部库动静态都齐全" || echo "⚠️ 缺：$miss"
 
-          echo "===== x264.pc 检查（FFmpeg 静态必需）====="
+          echo "===== x264.pc / soxr.pc 检查 ====="
           for d in static shared; do
             if [ -e "$P/$d/lib/libx264.a" ] || [ -e "$P/$d/lib/libx264.so" ]; then
-              if [ -e "$P/$d/lib/pkgconfig/x264.pc" ]; then
-                echo "✅ [$d] x264.pc 存在"
-              else
-                echo "::error::[$d] 缺 x264.pc，FFmpeg 的 require_pkg_config 会失败"
-              fi
+              [ -e "$P/$d/lib/pkgconfig/x264.pc" ] && echo "✅ [$d] x264.pc 存在" || echo "::error::[$d] 缺 x264.pc"
             fi
-          done
-
-          echo "===== soxr.pc 检查（FFmpeg --enable-libsoxr 必需）====="
-          for d in static shared; do
             if [ -e "$P/$d/lib/libsoxr.a" ] || [ -e "$P/$d/lib/libsoxr.so" ]; then
-              if [ -e "$P/$d/lib/pkgconfig/soxr.pc" ]; then
-                echo "✅ [$d] soxr.pc 存在"
-              else
-                echo "::error::[$d] 缺 soxr.pc，FFmpeg 的 --enable-libsoxr 会失败"
-              fi
+              [ -e "$P/$d/lib/pkgconfig/soxr.pc" ] && echo "✅ [$d] soxr.pc 存在" || echo "::error::[$d] 缺 soxr.pc"
             fi
           done
 
-          echo "===== .symtab 残留检查（strip 生效性）====="
+          echo "===== .symtab 残留检查 ====="
           symtab=0
           while IFS= read -r f; do
             if readelf -SW "$f" 2>/dev/null | grep -q '\.symtab'; then
@@ -1074,7 +1029,7 @@ jobs:
           done < <(find "$P/shared/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null)
           [ "$bad" -eq 0 ] && echo "✅ 全部 .so 的 LOAD 段均为 0x4000"
 
-          echo "===== libc++ 符号泄漏检查（仅统计已定义符号）====="
+          echo "===== libc++ 符号泄漏检查 ====="
           leak=0
           while IFS= read -r f; do
             n=$(readelf -sW --dyn-syms "$f" 2>/dev/null \
@@ -1219,19 +1174,15 @@ jobs:
 
           cat release-body.md
 
-      - name: Delete existing tag/release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${TAG}" 2>/dev/null \
-            && echo "已删除旧 tag ${TAG}" || echo "tag ${TAG} 不存在或已删除，跳过"
-
-      - name: Publish release
+      # ★ 直接覆盖同名 tag/release：不删不建，action 会更新已存在的 release 并覆盖附件
+      - name: Publish release (overwrite tag)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ffmpeg-lib
           name: FFmpeg libs (arm64-v8a) — rolling
           body_path: artifacts/release-body.md
+          draft: false
+          prerelease: false
           make_latest: true
           overwrite_files: true
           files: |
