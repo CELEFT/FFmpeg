@@ -80,7 +80,6 @@ jobs:
                 echo "已启用代理：$PROXY_URL"
               fi
 
-              # 用 git 自身校验，避免半成品目录（被 timeout 打断后 .git 存在但对象不完整）被误判为"已存在"
               if ! git -C dav1d rev-parse --verify HEAD >/dev/null 2>&1; then
                 rm -rf dav1d
                 cloned=""
@@ -406,6 +405,7 @@ jobs:
               make install
               mkpc fdk-aac "Fraunhofer FDK AAC" "2.0.3" fdk-aac
 
+          # ★ lame：手工写带绝对路径的 lame.pc + pkg-config / test -f 当场双重验证
           - name: lame
             libs: "mp3lame"
             build: |
@@ -420,7 +420,37 @@ jobs:
                 $LTOPT --with-pic --disable-frontend --disable-asm
               make -j"$(nproc)"
               make install
-              mkpc lame "MP3 encoding library" "3.100" mp3lame
+
+              # ★ LAME 3.100 自己不生成 lame.pc；手工写入绝对路径版本
+              mkdir -p "$PREFIX/lib/pkgconfig"
+              cat > "$PREFIX/lib/pkgconfig/lame.pc" <<EOF
+              prefix=$PREFIX
+              exec_prefix=\${prefix}
+              libdir=\${exec_prefix}/lib
+              includedir=\${prefix}/include
+
+              Name: lame
+              Description: LAME MP3 encoding library
+              Version: 3.100
+              Libs: -L\${libdir} -lmp3lame
+              Libs.private: -lm
+              Cflags: -I\${includedir}
+              EOF
+
+              export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+              export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+              echo "--- pkg-config 验证 lame ---"
+              pkg-config --exists --print-errors lame || { echo "::error::lame.pc 仍不可用"; exit 1; }
+              ver=$(pkg-config --modversion lame)
+              echo "  lame version: $ver"
+              pkg-config --cflags --libs lame
+
+              [ -f "$PREFIX/include/lame/lame.h" ] || {
+                echo "::error::lame/lame.h 未安装到 $PREFIX/include/lame/"
+                find "$PREFIX/include" -name 'lame.h' | head
+                exit 1
+              }
+              echo "✅ lame.pc 与头文件就绪"
 
           - name: opus
             libs: "opus"
@@ -983,9 +1013,6 @@ jobs:
           tar xf artifacts/ffmpeg-libs-arm64-v8a-api${API_LEVEL}-full.tar.xz
           ls -d prefix/static prefix/shared
 
-      # ★ 本步骤是本次修复的核心：
-      #   1) 去掉 --sysroot / --extra-ldflags / --extra-libs / --cpu=armv8-a
-      #   2) 失败时自动把 ffbuild/config.log 里的错误行直接打到 Actions 日志里
       - name: Build FFmpeg (static & shared)
         shell: bash
         env:
@@ -1015,7 +1042,6 @@ jobs:
             rm -rf "$BUILD"; mkdir -p "$BUILD"
             cd "$BUILD"
 
-            # ★ 失败时把 config.log 关键错误直接打到日志，无需下载/上传
             dump_cfg_log() {
               local rc=$?
               trap - ERR EXIT
@@ -1031,7 +1057,6 @@ jobs:
             }
             trap dump_cfg_log ERR EXIT
 
-            # ★ 精简版 configure：去掉 --sysroot / --extra-ldflags / --extra-libs / --cpu
             "${{ github.workspace }}/configure" \
               --target-os=android \
               --arch=aarch64 \
