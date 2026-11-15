@@ -795,11 +795,27 @@ static struct mpeg4_bit_rate_values calculate_mpeg4_bit_rates(MOVTrack *track)
     return bit_rates;
 }
 
+static int esds_has_decoder_specific_info(enum AVCodecID codec_id)
+{
+    switch (codec_id) {
+    case AV_CODEC_ID_AAC:
+    case AV_CODEC_ID_MP4ALS:
+    case AV_CODEC_ID_MPEG4:
+    case AV_CODEC_ID_VORBIS:
+    case AV_CODEC_ID_DVD_SUBTITLE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int mov_write_esds_tag(AVIOContext *pb, MOVTrack *track) // Basic
 {
     struct mpeg4_bit_rate_values bit_rates = calculate_mpeg4_bit_rates(track);
     int64_t pos = avio_tell(pb);
-    int decoder_specific_info_len = track->extradata_size[track->last_stsd_index] ?
+    int write_dsi = track->extradata_size[track->last_stsd_index] &&
+                    esds_has_decoder_specific_info(track->par->codec_id);
+    int decoder_specific_info_len = write_dsi ?
                                     5 + track->extradata_size[track->last_stsd_index] : 0;
 
     avio_wb32(pb, 0); // size
@@ -835,7 +851,7 @@ static int mov_write_esds_tag(AVIOContext *pb, MOVTrack *track) // Basic
     avio_wb32(pb, bit_rates.max_bit_rate); // maxbitrate
     avio_wb32(pb, bit_rates.avg_bit_rate);
 
-    if (track->extradata_size[track->last_stsd_index]) {
+    if (write_dsi) {
         // DecoderSpecific info descriptor
         put_descr(pb, 0x05, track->extradata_size[track->last_stsd_index]);
         avio_write(pb, track->extradata[track->last_stsd_index],
@@ -3232,11 +3248,11 @@ static int mov_write_tmcd_tag(AVIOContext *pb, MOVTrack *track)
     return update_size(pb, pos);
 }
 
-static int mov_write_gpmd_tag(AVIOContext *pb, const MOVTrack *track)
+static int mov_write_bin_data_tag(AVIOContext *pb, uint32_t tag)
 {
     int64_t pos = avio_tell(pb);
     avio_wb32(pb, 0); /* size */
-    ffio_wfourcc(pb, "gpmd");
+    avio_wl32(pb, tag);
     avio_wb32(pb, 0); /* Reserved */
     avio_wb16(pb, 0); /* Reserved */
     avio_wb16(pb, 1); /* Data-reference index */
@@ -3268,7 +3284,10 @@ static int mov_write_stsd_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext
     else if (track->par->codec_tag == MKTAG('t','m','c','d'))
         ret = mov_write_tmcd_tag(pb, track);
     else if (track->par->codec_tag == MKTAG('g','p','m','d'))
-        ret = mov_write_gpmd_tag(pb, track);
+        ret = mov_write_bin_data_tag(pb, track->par->codec_tag);
+    else if (track->tag == MOV_MP4_DJMD_TAG ||
+             track->tag == MOV_MP4_DBGI_TAG)
+        ret = mov_write_bin_data_tag(pb, track->tag);
 
     if (ret < 0)
         return ret;
@@ -3615,6 +3634,13 @@ static int mov_write_gmhd_tag(AVIOContext *pb, MOVTrack *track)
         ffio_wfourcc(pb, "gpmd");
         avio_wb32(pb, 0); /* version */
         update_size(pb, gpmd_pos);
+    } else if (track->tag == MOV_MP4_DBGI_TAG) {
+        avio_wb32(pb, 12);
+        avio_wl32(pb, MOV_MP4_DBGI_TAG);
+        avio_wb32(pb, 0);
+    } else if (track->tag == MOV_MP4_DJMD_TAG) {
+        avio_wb32(pb, 8);
+        avio_wl32(pb, MOV_MP4_DJMD_TAG);
     }
     return update_size(pb, pos);
 }
@@ -3707,6 +3733,12 @@ static int mov_write_hdlr_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack *tra
         } else if (track->par->codec_tag == MKTAG('g','p','m','d')) {
             hdlr_type = "meta";
             descr = "GoPro MET"; // GoPro Metadata
+        } else if (track->tag == MOV_MP4_DJMD_TAG) {
+            hdlr_type = "meta";
+            descr = "CAM meta";
+        } else if (track->tag == MOV_MP4_DBGI_TAG) {
+            hdlr_type = "meta";
+            descr = "CAM dbgi";
         } else {
             av_log(s, AV_LOG_WARNING,
                    "Unknown hdlr_type for %s, writing dummy values\n",
@@ -3956,7 +3988,9 @@ static int mov_write_minf_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContext
             mov_write_nmhd_tag(pb);
         else
             mov_write_gmhd_tag(pb, track);
-    } else if (track->tag == MKTAG('g','p','m','d')) {
+    } else if (track->tag == MKTAG('g','p','m','d') ||
+               track->tag == MOV_MP4_DJMD_TAG ||
+               track->tag == MOV_MP4_DBGI_TAG) {
         mov_write_gmhd_tag(pb, track);
     }
     if (track->mode == MODE_MOV) /* ISO 14496-12 8.4.3.1 specifies hdlr only within mdia or meta boxes */
@@ -5173,6 +5207,8 @@ static int mov_write_chpl_tag(AVIOContext *pb, AVFormatContext *s)
 
         if ((t = av_dict_get(c->metadata, "title", NULL, 0))) {
             int len = FFMIN(strlen(t->value), 255);
+            while (len > 252 && (t->value[len] & 0xC0) == 0x80)
+                len--;
             avio_w8(pb, len);
             avio_write(pb, t->value, len);
         } else
@@ -5207,6 +5243,9 @@ static int mov_write_udta_tag(AVIOContext *pb, MOVMuxContext *mov,
         mov_write_string_metadata(s, pb_buf, "\251nam", "title",       0);
         mov_write_string_metadata(s, pb_buf, "\251aut", "author",      0);
         mov_write_string_metadata(s, pb_buf, "\251alb", "album",       0);
+        /* mov_read_udta_string() already maps this atom back to "composer";
+         * without it a mov to mov remux dropped the tag on the floor. */
+        mov_write_string_metadata(s, pb_buf, "\251com", "composer",    0);
         mov_write_string_metadata(s, pb_buf, "\251day", "date",        0);
         mov_write_string_metadata(s, pb_buf, "\251swr", "encoder",     0);
         // currently ignored by mov.c
@@ -7490,7 +7529,10 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     sd = av_packet_side_data_get(pkt->side_data, pkt->side_data_elems, AV_PKT_DATA_SKIP_SAMPLES);
     if (sd && sd->size >= 10 && trk->par->frame_size) {
-        duration = FFMAX(av_rescale_q(trk->par->frame_size, (AVRational){ 1, trk->par->sample_rate },
+        int coded_samples = av_get_audio_frame_duration2(trk->par, pkt->size);
+        if (coded_samples <= 0)
+            coded_samples = trk->par->frame_size;
+        duration = FFMAX(av_rescale_q(coded_samples, (AVRational){ 1, trk->par->sample_rate },
                                       trk->st->time_base), pkt->duration);
         if (mov->use_editlist)
             pkt->duration = duration;
@@ -8371,6 +8413,17 @@ static int mov_init(AVFormatContext *s)
     if (mov->flags & FF_MOV_FLAG_CMAF)
         mov->flags |= FF_MOV_FLAG_FRAGMENT | FF_MOV_FLAG_EMPTY_MOOV |
                       FF_MOV_FLAG_DEFAULT_BASE_MOOF | FF_MOV_FLAG_NEGATIVE_CTS_OFFSETS;
+
+    /* global_sidx is inserted in a second pass, shifting all fragments. Use
+     * moof-relative addressing so that tfhd offsets remain valid after that
+     * shift, unless absolute offsets are already avoided (omit_tfhd_offset,
+     * ISMV) or no sidx is inserted (hybrid_fragmented). */
+    if (mov->flags & FF_MOV_FLAG_GLOBAL_SIDX &&
+        mov->flags & FF_MOV_FLAG_FRAGMENT &&
+        !(mov->flags & (FF_MOV_FLAG_OMIT_TFHD_OFFSET |
+                        FF_MOV_FLAG_HYBRID_FRAGMENTED)) &&
+        mov->mode != MODE_ISM)
+        mov->flags |= FF_MOV_FLAG_DEFAULT_BASE_MOOF;
 
     if (mov->flags & FF_MOV_FLAG_EMPTY_MOOV && s->flags & AVFMT_FLAG_AUTO_BSF) {
         av_log(s, AV_LOG_VERBOSE, "Empty MOOV enabled; disabling automatic bitstream filtering\n");
@@ -9492,6 +9545,8 @@ static const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_DVD_SUBTITLE,    MKTAG('m', 'p', '4', 's') },
     { AV_CODEC_ID_MOV_TEXT,        MKTAG('t', 'x', '3', 'g') },
     { AV_CODEC_ID_BIN_DATA,        MKTAG('g', 'p', 'm', 'd') },
+    { AV_CODEC_ID_BIN_DATA,        MOV_MP4_DJMD_TAG          },
+    { AV_CODEC_ID_BIN_DATA,        MOV_MP4_DBGI_TAG          },
     { AV_CODEC_ID_MPEGH_3D_AUDIO,  MKTAG('m', 'h', 'm', '1') },
     { AV_CODEC_ID_TTML,            MOV_MP4_TTML_TAG          },
     { AV_CODEC_ID_TTML,            MOV_ISMV_TTML_TAG         },

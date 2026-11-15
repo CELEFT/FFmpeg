@@ -18,15 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <float.h>
+#include <math.h>
 #include <stdbool.h>
 
 #include "libavutil/avassert.h"
+#include "libavutil/intmath.h"
 #include "libavutil/mem.h"
 #include "libavutil/refstruct.h"
 
 #include "ops.h"
 #include "uops.h"
 #include "uops_list.h"
+#include "swscale_internal.h"
 
 int ff_sws_uop_cmp(const SwsUOp *a, const SwsUOp *b)
 {
@@ -198,6 +202,19 @@ void ff_sws_uop_list_remove_at(SwsUOpList *uops, int index, int count)
     uops->num_ops = end;
 }
 
+void ff_sws_uop_list_print(void *log, int lev, const SwsUOpList *uops)
+{
+    if (av_log_get_level() < lev)
+        return;
+
+    av_log(log, lev, "Compiled micro-ops:\n");
+    for (int i = 0; i < uops->num_ops; i++) {
+        char name[SWS_UOP_NAME_MAX];
+        ff_sws_uop_name(&uops->ops[i], name);
+        av_log(log, lev, "    %s\n", name);
+    }
+}
+
 int ff_sws_dither_height(const SwsDitherUOp *dither)
 {
     int max_offset = 0;
@@ -206,8 +223,12 @@ int ff_sws_dither_height(const SwsDitherUOp *dither)
     return (1 << dither->size_log2) + max_offset;
 }
 
-static SwsPixelType pixel_type_to_int(const SwsPixelType type)
+/* Conditionally promotes a pixel type to integer only if allowed by the flags */
+static SwsPixelType pixel_type_to_int(SwsUOpFlags flags, const SwsPixelType type)
 {
+    if (!(flags & SWS_UOP_FLAG_PUNNING))
+        return type;
+
     switch (ff_sws_pixel_type_size(type)) {
     case 1: return SWS_PIXEL_U8;
     case 2: return SWS_PIXEL_U16;
@@ -219,26 +240,32 @@ static SwsPixelType pixel_type_to_int(const SwsPixelType type)
     return SWS_PIXEL_NONE;
 }
 
-static bool exact_product_f32(float a, float b)
+static int significant_bits_f32(float f)
 {
-    volatile float prod   = a * b;
-    volatile float result = b ? prod / b : 0.0f;
-    return !b || result == a;
+    int exp;
+    const uint32_t mant = ldexpf(frexpf(fabsf(f), &exp), FLT_MANT_DIG);
+    return mant ? FLT_MANT_DIG - ff_ctz(mant) : 0;
 }
 
 static bool exact_prod(SwsPixel coef, const SwsOpPad *input)
 {
     if (ff_sws_pixel_type_is_int(input->type))
         return true;
-    else if (!input->min.den || !input->max.den)
-        return false; /* unknown bounds */
 
-    const SwsPixel min = ff_sws_pixel_from_q64(input->type, input->min);
-    const SwsPixel max = ff_sws_pixel_from_q64(input->type, input->max);
     switch (input->type) {
-    case SWS_PIXEL_F32:
-        return exact_product_f32(coef.f32, min.f32) &&
-               exact_product_f32(coef.f32, max.f32);
+    case SWS_PIXEL_F32: {
+        const int bits = significant_bits_f32(coef.f32);
+        if (bits <= 1)
+            return true; /* power of two */
+        if (!(input->flags & SWS_COMP_EXACT) || input->min.den != 1 || input->max.den != 1)
+            return false; /* not only integers, or unknown bounds */
+
+        const uint64_t lo = FFABS64U(input->min.num), hi = FFABS64U(input->max.num);
+        const uint64_t max = FFMAX(lo, hi);
+        if (max >= 1ULL << FLT_MANT_DIG)
+            return false;
+        return bits + (max ? av_log2(max) + 1 : 0) <= FLT_MANT_DIG;
+    }
     }
 
     av_unreachable("Invalid pixel type!");
@@ -274,7 +301,7 @@ static int translate_rw_op(SwsContext *ctx, SwsUOpList *ops, SwsUOpFlags flags,
 
     /* Non-filtered reads don't care about the exact pixel contents */
     if (!op->rw.filter.op)
-        uop.type = pixel_type_to_int(op->rw.type);
+        uop.type = pixel_type_to_int(flags, op->rw.type);
 
     const bool is_read = op->op == SWS_OP_READ;
     if (op->rw.filter.op) {
@@ -327,11 +354,11 @@ static int count_idx(const int *arr, size_t size, int val)
     return num;
 }
 
-static int translate_swizzle(SwsUOpList *ops, const SwsOp *op)
+static int translate_swizzle(SwsUOpList *ops, SwsUOpFlags flags, const SwsOp *op)
 {
     SwsUOp uop = {
         .uop  = SWS_UOP_PERMUTE,
-        .type = pixel_type_to_int(ff_sws_op_input_type(op)),
+        .type = pixel_type_to_int(flags, ff_sws_op_input_type(op)),
         .mask = ff_sws_comp_mask_needed(op),
     };
     SwsMoveUOp *par = &uop.par.move;
@@ -458,7 +485,7 @@ static int translate_dither_op(SwsUOpList *ops, SwsUOpFlags flags, const SwsOp *
      * typically 320 bytes for a 16x16 dither matrix. */
     const int stride   = size * sizeof(SwsPixel);
     const int num_rows = ff_sws_dither_height(&uop.par.dither);
-    SwsPixel *matrix = uop.data.ptr = av_refstruct_allocz(num_rows * stride);
+    SwsPixel *matrix = uop.data.ptr = ff_refstruct_calloc(num_rows, stride);
     if (!matrix)
         return AVERROR(ENOMEM);
 
@@ -478,13 +505,16 @@ static int translate_linear_op(SwsContext *ctx, SwsUOpList *ops,
         .uop  = SWS_UOP_LINEAR,
     };
 
+    const SwsPixel one = ff_sws_pixel_from_q64(uop.type, (AVRational64) {1, 1});
     const uint32_t mask = ff_sws_linear_mask(&op->lin);
     const bool bitexact = ctx->flags & SWS_BITEXACT;
     uint32_t exact = 0;
 
     for (int i = 0; i < 4; i++) {
         if (!SWS_OP_NEEDED(op, i) || !(mask & SWS_MASK_ROW(i))) {
-            uop.par.lin.zero |= SWS_MASK_ROW(i);
+            uop.par.lin.zero |= SWS_MASK_ROW(i) ^ SWS_MASK(i, i);
+            uop.par.lin.one |= SWS_MASK(i, i);
+            uop.data.mat4x5[i][i] = one;
             continue;
         }
         uop.mask |= SWS_COMP(i);
@@ -524,7 +554,7 @@ static int translate_op(SwsContext *ctx, SwsUOpList *uops, SwsUOpFlags flags,
     case SWS_OP_WRITE:
         return translate_rw_op(ctx, uops, flags, op);
     case SWS_OP_SWIZZLE:
-        return translate_swizzle(uops, op);
+        return translate_swizzle(uops, flags, op);
     case SWS_OP_DITHER:
         return translate_dither_op(uops, flags, op);
     case SWS_OP_LINEAR:
@@ -573,8 +603,8 @@ static int translate_op(SwsContext *ctx, SwsUOpList *uops, SwsUOpFlags flags,
             const AVRational64 v = op->clear.value[i];
             const SwsPixelType type = op->clear.type[i];
             const SwsPixel px = ff_sws_pixel_from_q64(type, v);
-            uop.type = pixel_type_to_int(type);
-            uop.data.vec4[i] = px;
+            uop.type = pixel_type_to_int(flags, type);
+            uop.data.vec4[i] = ff_sws_pixel_expand32(type, px);
             if (v.num == 0)
                 uop.par.clear.zero |= SWS_COMP(i);
             else if (ff_sws_pixel_is_1s(type, px))
@@ -596,7 +626,7 @@ static int translate_op(SwsContext *ctx, SwsUOpList *uops, SwsUOpFlags flags,
         break;
     case SWS_OP_SWAP_BYTES:
         uop.uop = SWS_UOP_SWAP_BYTES;
-        uop.type = pixel_type_to_int(uop.type);
+        uop.type = pixel_type_to_int(flags, uop.type);
         break;
     case SWS_OP_LUT_3D:
         uop.uop = SWS_UOP_LUT_3D;

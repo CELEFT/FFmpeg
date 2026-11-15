@@ -51,6 +51,7 @@ void ff_vvc_unref_frame(VVCFrameContext *fc, VVCFrame *frame, int flags)
     if (!(frame->flags & ~VVC_FRAME_FLAG_CORRUPT))
         frame->flags = 0;
     if (!frame->flags) {
+        av_refstruct_unref(&frame->hwaccel_picture_private);
         av_frame_unref(frame->frame);
 
         if (frame->needs_fg) {
@@ -69,7 +70,6 @@ void ff_vvc_unref_frame(VVCFrameContext *fc, VVCFrame *frame, int flags)
         av_refstruct_unref(&frame->rpl_tab);
 
         frame->collocated_ref = NULL;
-        av_refstruct_unref(&frame->hwaccel_picture_private);
     }
 }
 
@@ -145,7 +145,10 @@ static VVCFrame *alloc_frame(VVCContext *s, VVCFrameContext *fc)
         frame->sps = av_refstruct_ref_c(fc->ps.sps);
         frame->pps = av_refstruct_ref_c(fc->ps.pps);
 
-        frame->rpl = av_refstruct_allocz(s->current_frame.nb_units * sizeof(RefPicListTab));
+        size_t rpl_size;
+        if (av_size_mult(s->current_frame.nb_units, sizeof(RefPicListTab), &rpl_size) < 0)
+            goto fail;
+        frame->rpl = av_refstruct_allocz(rpl_size);
         if (!frame->rpl)
             goto fail;
         frame->nb_rpl_elems = s->current_frame.nb_units;
@@ -594,6 +597,8 @@ int ff_vvc_slice_rpl(VVCContext *s, VVCFrameContext *fc, SliceContext *sc)
                 return ret;
             }
         }
+        if (rsh->num_ref_idx_active[lx] > rpl->nb_refs)
+            return AVERROR_INVALIDDATA;
         if (ph->r->ph_temporal_mvp_enabled_flag &&
             (!rsh->sh_collocated_from_l0_flag) == lx &&
             rsh->sh_collocated_ref_idx < rpl->nb_refs) {

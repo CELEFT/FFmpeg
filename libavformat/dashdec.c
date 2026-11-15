@@ -34,6 +34,7 @@
 #include "url.h"
 
 #define INITIAL_BUFFER_SIZE 32768
+#define MAX_TIMELINE_SEGMENTS (1 << 24)
 
 struct fragment {
     int64_t url_offset;
@@ -1123,6 +1124,16 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         av_log(s, AV_LOG_ERROR, "Unknown format of Representation node id '%s' \n",
                rep->id ? rep->id : "");
         goto free;
+    }
+
+    int64_t nb_timeline_segments = 0;
+    for (int i = 0; i < rep->n_timelines; i++) {
+        nb_timeline_segments += av_clip64(rep->timelines[i]->repeat, 0, INT_MAX) + 1;
+        if (nb_timeline_segments > MAX_TIMELINE_SEGMENTS) {
+            av_log(s, AV_LOG_ERROR, "Too many segments in SegmentTimeline\n");
+            ret = AVERROR_INVALIDDATA;
+            goto free;
+        }
     }
 
     if (rep->fragment_duration > 0 && !rep->fragment_timescale)
@@ -2509,6 +2520,7 @@ set_seq_num:
                (int64_t)pls->cur_seq_no);
     } else if (pls->fragment_duration > 0) {
         pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
+        pls->cur_seq_no = FFMAX(pls->cur_seq_no, pls->first_seq_no);
     } else {
         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
         pls->cur_seq_no = pls->first_seq_no;
@@ -2516,6 +2528,7 @@ set_seq_num:
     pls->cur_timestamp = 0;
     pls->cur_seg_offset = 0;
     pls->init_sec_buf_read_offset = 0;
+    pls->is_restart_needed = 0;
     ret = dry_run ? 0 : reopen_demux_for_component(s, pls);
 
     return ret;

@@ -749,10 +749,9 @@ static void av1_frame_replace(AV1Frame *dst, const AV1Frame *src)
 
     dst->raw_frame_header = src->raw_frame_header;
 
-    ff_progress_frame_replace(&dst->pf, &src->pf);
-
     av_refstruct_replace(&dst->hwaccel_picture_private,
                           src->hwaccel_picture_private);
+    ff_progress_frame_replace(&dst->pf, &src->pf);
 
     dst->spatial_id = src->spatial_id;
     dst->temporal_id = src->temporal_id;
@@ -1073,7 +1072,9 @@ static int export_film_grain(AVCodecContext *avctx, AVFrame *frame)
 {
     AV1DecContext *s = avctx->priv_data;
     const AV1RawFilmGrainParams *film_grain = &s->cur_frame.film_grain;
-    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(frame->format);
+    /* Use the negotiated software format for chroma subsampling,
+     * since frame->format may be a hardware pixel format. */
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
     AVFilmGrainParams *fgp;
     AVFilmGrainAOMParams *aom;
 

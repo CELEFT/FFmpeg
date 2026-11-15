@@ -47,6 +47,12 @@ FATE_MOV_FFPROBE-$(call DEMDEC, MOV, HEVC) += fate-mov-dovi-hvce-mp4-read
 
 FATE_MOV_FFPROBE-$(call DEMDEC, MOV, H264) += fate-mov-vfr-bframes-duration
 
+# vpcC set to 3/3/3, with no colr box
+FATE_MOV_FFPROBE-$(call DEMDEC, MOV, VP9) += fate-mov-vpcc-reserved-color-tags
+fate-mov-vpcc-reserved-color-tags: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -v error \
+    -show_entries stream=color_primaries,color_transfer,color_space -of default=nw=1 \
+    $(TARGET_SAMPLES)/mov/vpcc-reserved-color-tags.mp4
+
 FATE_MOV_FFPROBE-$(CONFIG_MOV_DEMUXER) += fate-ffprobe-stream-entries-tmcd \
                                        fate-ffprobe-group-stream-entries-tmcd \
                                        fate-ffprobe-show-groups-tmcd
@@ -157,7 +163,7 @@ fate-mov-aac-2048-priming-preroll: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_e
 
 # Where a seek lands.
 FATE_MOV_FFPROBE-$(call DEMDEC, MOV, AAC) += fate-mov-aac-2048-priming-seek-landing
-fate-mov-aac-2048-priming-seek-landing: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -read_intervals 2.3%+\#3 -show_entries packet=pts,dts,duration -print_format compact $(TARGET_SAMPLES)/mov/aac-2048-priming.mov
+fate-mov-aac-2048-priming-seek-landing: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -seek_flags preroll -read_intervals 2.3%+\#3 -show_entries packet=pts,dts,duration -print_format compact $(TARGET_SAMPLES)/mov/aac-2048-priming.mov
 
 # Seeking into the stream must not drop samples to the container's priming.
 FATE_MOV-$(call FRAMECRC, MOV, AAC, PCM_S16LE_ENCODER ARESAMPLE_FILTER VOLUME_FILTER) += fate-mov-aac-2048-priming-seek
@@ -202,6 +208,16 @@ fate-mov-t35-rndr-track: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries str
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, OGG_DEMUXER VORBIS_DECODER) \
                           += fate-mov-mp4-chapters
 fate-mov-mp4-chapters: CMD = transcode ogg $(TARGET_SAMPLES)/vorbis/vorbis_chapter_extension_demo.ogg mp4 "-c copy" "-c copy -t 0.1" "-show_chapters"
+
+# Seek in a fragmented file with a chapter track: the chapter track's samples
+# all sit in the first fragment, and its own seek must not send the read
+# position of the seeked video stream back there.
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call TRANSCODE, MPEG4, MP4 MOV, OGG_DEMUXER VORBIS_DECODER TESTSRC2_FILTER FORMAT_FILTER SINE_FILTER) \
+                          += fate-mov-mp4-frag-chapters-seek
+fate-mov-mp4-frag-chapters-seek: CMD = transcode ogg $(TARGET_SAMPLES)/vorbis/vorbis_chapter_extension_demo.ogg mp4 \
+  "-filter_complex testsrc2=size=64x64:rate=25:duration=12,format=yuv420p[v] -filter_complex sine=d=12[a] -map [v] -map [a] -map_chapters 0 -c:v mpeg4 -c:a pcm_s16le -g 60 -bf 2 -movflags frag_keyframe -frag_duration 1000000" \
+  "-c copy -t 0.1" \
+  "-use_mfra_for pts -read_intervals 8%+\#40 -show_entries packet=stream_index,pts,dts,pos -print_format compact"
 
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call TRANSCODE, PNG, MP4 MOV, MJPEG_DECODER SCALE_FILTER) \
                           += fate-mov-cover-image
@@ -342,6 +358,12 @@ FATE_MOV_FFMPEG_SAMPLES-$(call REMUX, MP4 MOV, AAC_PARSER) \
                           += fate-mov-mp4-edst-remainder
 fate-mov-mp4-edst-remainder: CMD = stream_remux mov $(TARGET_SAMPLES)/audiomatch/tones_fdkaac_44100_stereo_aac_lc.m4a "" mp4 "" "" "-c:a copy"
 
+# A colr box can carry reserved colour values; they must not reach the stream
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MOV, QTRLE_DECODER) += fate-mov-colr-reserved-color-tags
+fate-mov-colr-reserved-color-tags: CMD = stream_remux mov $(TARGET_SAMPLES)/qtrle/aletrek-rle.mov "" mov \
+    "-map 0:v -frames:v 1 -color_primaries 3 -color_trc 3 -colorspace 3" "" "-c:v copy" \
+    "-select_streams v -show_entries stream=color_primaries,color_transfer,color_space -of default=nw=1"
+
 # format-level branding: major_brand, minor_version, compatible_brands should be deleted on re-encode
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call ENCDEC, AAC AAC, NUT MOV) += fate-mov-reenc-delete-format-metadata
 fate-mov-reenc-delete-format-metadata: CMD = transcode mov $(TARGET_SAMPLES)/cover_art/Owner-iTunes_9.0.3.15.m4a nut "-map 0:a:0 -c:a aac -bitexact -t 0.1" "-c copy -t 0.1" "-show_entries format_tags" "" "" "" null
@@ -392,8 +414,19 @@ fate-mov-pcm-remux: REF = 389df40a487ac8397ba20bda472434d7
 
 FATE_MOV_FFMPEG-$(call TRANSCODE, RAWVIDEO, MOV, TESTSRC_FILTER SETPTS_FILTER) += fate-mov-vfr
 fate-mov-vfr: CMD = md5 -filter_complex testsrc=size=2x2:duration=1,setpts=N*N:strip_fps=1 -c rawvideo -fflags +bitexact -f mov
+
+FATE_MOV_FFMPEG-$(call TRANSCODE, DFPWM, MOV, LAVFI_INDEV SINE_FILTER ATRIM_FILTER PCM_S16LE_DECODER ARESAMPLE_FILTER) += fate-mov-dfpwm-last-packet
+fate-mov-dfpwm-last-packet: CMD = transcode lavfi "sine=r=48000,atrim=end_sample=85" mov "-auto_conversion_filters -c:a dfpwm -movie_timescale 48000" "-c copy"
 fate-mov-vfr: CMP = oneline
 fate-mov-vfr: REF = 1558b4a9398d8635783c93f84eb5a60d
+
+# The QuickTime user data list has to carry the composer atom the demuxer
+# already reads: without it a mov to mov remux dropped the tag.
+FATE_MOV_FFMPEG_FFPROBE-$(call TRANSCODE, PCM_S16LE, MOV, WAV_DEMUXER ARESAMPLE_FILTER) += fate-mov-composer-metadata
+fate-mov-composer-metadata: tests/data/asynth-44100-2.wav
+fate-mov-composer-metadata: CMD = transcode wav ./tests/data/asynth-44100-2.wav mov \
+    "-af aresample -c:a pcm_s16le -t 0.05 -metadata composer=Bach" \
+    "-af aresample -c:a pcm_s16le" "-show_entries format_tags"
 
 FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, COLOR_FILTER SETPTS_FILTER MPEG4_ENCODER \
                                       MOV_MUXER MOV_DEMUXER FILE_PROTOCOL)      \
@@ -592,6 +625,15 @@ fate-mov-stereo3d-sbs-mp4: tests/data/vsynth1.yuv
 fate-mov-stereo3d-sbs-mp4: CMD = transcode rawvideo $(TARGET_PATH)/tests/data/vsynth1.yuv mp4 \
   "-c:v mpeg4 -qscale:v 10 -stereo3d:v sbsl -strict unofficial -frames:v 2" \
   "-c:v copy" "-show_entries stream_side_data_list" "" "" "-s 352x288 -pix_fmt yuv420p"
+
+# chpl titles are limited to 255 bytes; truncation must not split a UTF-8
+# character. 3gp is used because MP4/MOV read the chapter track, not chpl.
+tests/data/chpl-utf8.ffmeta: TAG = COPY
+tests/data/chpl-utf8.ffmeta: $(SRC_PATH)/tests/chpl-utf8.ffmeta | tests/data
+	$(M)cp $< $@
+fate-mov-chpl-utf8: tests/data/chpl-utf8.ffmeta
+FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, COLOR_FILTER MPEG4_ENCODER FFMETADATA_DEMUXER TGP_MUXER MOV_DEMUXER FILE_PROTOCOL) += fate-mov-chpl-utf8
+fate-mov-chpl-utf8: CMD = run_with_temp "$(FFMPEG) -nostdin -v error -filter_complex color=c=black:s=2x2:r=1 -f ffmetadata -i $(TARGET_PATH)/tests/data/chpl-utf8.ffmeta -map_chapters 0 -frames:v 1 -c:v mpeg4 -threads 1 -flags +bitexact -fflags +bitexact -f 3gp -y" "ffprobe$(PROGSSUF)$(EXESUF) -loglevel error -bitexact -show_chapters" 3gp
 
 FATE_FFMPEG += $(FATE_MOV_FFMPEG-yes)
 FATE_FFMPEG_FFPROBE += $(FATE_MOV_FFMPEG_FFPROBE-yes)

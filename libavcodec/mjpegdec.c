@@ -761,6 +761,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
                 s->avctx->pix_fmt,
                 AV_PIX_FMT_NONE,
             };
+            av_refstruct_unref(&s->hwaccel_picture_private);
             s->hwaccel_pix_fmt = ff_get_format(s->avctx, pix_fmts);
             if (s->hwaccel_pix_fmt < 0)
                 return AVERROR(EINVAL);
@@ -824,15 +825,25 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
 
     if (s->avctx->hwaccel) {
         const FFHWAccel *hwaccel = ffhwaccel(s->avctx->hwaccel);
-        s->hwaccel_picture_private =
-            av_mallocz(hwaccel->frame_priv_data_size);
-        if (!s->hwaccel_picture_private)
-            return AVERROR(ENOMEM);
+        if (!s->raw_image_buffer) {
+            av_log(s->avctx, AV_LOG_ERROR, "SOF without SOI\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        /* A previous frame may have been aborted before its end_frame call,
+         * leaving the private data behind. */
+        av_refstruct_unref(&s->hwaccel_picture_private);
+
+        ret = ff_hwaccel_frame_priv_alloc(s->avctx, &s->hwaccel_picture_private);
+        if (ret < 0)
+            return ret;
 
         ret = hwaccel->start_frame(s->avctx, NULL, s->raw_image_buffer,
                                    s->raw_image_buffer_size);
-        if (ret < 0)
+        if (ret < 0) {
+            av_refstruct_unref(&s->hwaccel_picture_private);
             return ret;
+        }
     }
 
     return 0;
@@ -1109,6 +1120,8 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
         if (s->rct || s->pegasus_rct)
             return AVERROR_INVALIDDATA;
     }
+    if ((s->rct || s->pegasus_rct) && nb_components != s->nb_components)
+        return AVERROR_INVALIDDATA;
 
     av_fast_malloc(&s->ljpeg_buffer, &s->ljpeg_buffer_size,
                    (unsigned)s->mb_width * 4 * sizeof(s->ljpeg_buffer[0][0]));
@@ -2429,6 +2442,8 @@ int ff_mjpeg_decode_frame_from_buf(AVCodecContext *avctx, AVFrame *frame,
     s->total_ls_decoded_height = 0;
 
     s->buf_size = buf_size;
+    s->raw_image_buffer      = NULL;
+    s->raw_image_buffer_size = 0;
 
     av_exif_free(&s->exif_metadata);
     av_freep(&s->stereo3d);
@@ -2582,7 +2597,7 @@ eoi_parser:
                 if (ret < 0)
                     return ret;
 
-                av_freep(&s->hwaccel_picture_private);
+                av_refstruct_unref(&s->hwaccel_picture_private);
             }
             if ((ret = av_frame_ref(frame, s->picture_ptr)) < 0)
                 return ret;
@@ -2784,6 +2799,14 @@ the_end:
             }
         }
     }
+    if (avctx->codec_id != AV_CODEC_ID_SMVJPEG &&
+        (avctx->codec_tag == MKTAG('A', 'V', 'R', 'n') ||
+         avctx->codec_tag == MKTAG('A', 'V', 'D', 'J')) &&
+        avctx->coded_height > s->orig_height) {
+        frame->height   = AV_CEIL_RSHIFT(avctx->coded_height, avctx->lowres);
+        frame->crop_top = frame->height - avctx->height;
+    }
+
     if (s->flipped && !s->rgb && !s->bayer) {
         ret = av_pix_fmt_get_chroma_sub_sample(avctx->pix_fmt, &hshift, &vshift);
         if (ret)
@@ -2908,14 +2931,6 @@ the_end:
             av_log(avctx, AV_LOG_WARNING, "couldn't attach EXIF metadata\n");
     }
 
-    if (avctx->codec_id != AV_CODEC_ID_SMVJPEG &&
-        (avctx->codec_tag == MKTAG('A', 'V', 'R', 'n') ||
-         avctx->codec_tag == MKTAG('A', 'V', 'D', 'J')) &&
-        avctx->coded_height > s->orig_height) {
-        frame->height   = AV_CEIL_RSHIFT(avctx->coded_height, avctx->lowres);
-        frame->crop_top = frame->height - avctx->height;
-    }
-
 the_end_no_picture:
     av_log(avctx, AV_LOG_DEBUG, "decode frame unused %td bytes\n",
            buf_end - buf_ptr);
@@ -2941,6 +2956,7 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_INFO, "Single field\n");
     }
 
+    av_refstruct_unref(&s->hwaccel_picture_private);
     av_frame_free(&s->picture);
     s->picture_ptr = NULL;
 
@@ -2965,7 +2981,6 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
 
     reset_icc_profile(s);
 
-    av_freep(&s->hwaccel_picture_private);
     av_freep(&s->jls_state);
 
     return 0;
@@ -2975,6 +2990,8 @@ static av_cold void decode_flush(AVCodecContext *avctx)
 {
     MJpegDecodeContext *s = avctx->priv_data;
     s->got_picture = 0;
+
+    av_refstruct_unref(&s->hwaccel_picture_private);
 
     s->smv_next_frame = 0;
     av_frame_unref(s->smv_frame);

@@ -267,6 +267,8 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
     av_url_split(proto, sizeof(proto), auth, sizeof(auth),
                  hostname, sizeof(hostname), &port,
                  path1, sizeof(path1), s->location);
+    if (strpbrk(hostname, "\r\n"))
+        return AVERROR(EINVAL);
 
     av_freep(&s->host);
     s->host = av_strdup(hostname);
@@ -342,6 +344,9 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
     }
 
     ff_url_join(buf, sizeof(buf), lower_proto, NULL, hostname, port, NULL);
+
+    if (s->hd && strcmp(s->hd->filename, buf))
+        ffurl_closep(&s->hd);
 
     if (!s->hd) {
         s->nb_connections++;
@@ -864,6 +869,9 @@ static int http_open(URLContext *h, const char *uri, int flags,
     ret = http_open_cnx(h, options, 0);
 bail_out:
     if (ret < 0) {
+#if CONFIG_ZLIB
+        inflateEnd(&s->inflate_stream);
+#endif
         av_dict_free(&s->chained_options);
         av_dict_free(&s->cookie_dict);
         av_dict_free(&s->redirect_cache);
@@ -2556,6 +2564,9 @@ static int http_proxy_open(URLContext *h, const char *uri, int flags)
     path = pathbuf;
     if (*path == '/')
         path++;
+    for (const char *p = path; *p; p++)
+        if ((uint8_t)*p <= ' ' || *p == 0x7f)
+            return AVERROR(EINVAL);
 
     ff_url_join(lower_url, sizeof(lower_url), "tcp", NULL, hostname, port,
                 NULL);

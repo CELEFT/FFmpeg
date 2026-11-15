@@ -66,7 +66,7 @@
 #include "internal.h"
 #include "isom.h"
 #include "matroska.h"
-#include "oggdec.h"
+#include "libavformat/vorbis/comment.h"
 /* For ff_codec_get_id(). */
 #include "riff.h"
 #include "rmsipr.h"
@@ -2183,7 +2183,7 @@ static int matroska_parse_flac(AVFormatContext *s,
             AVDictionary *dict = NULL;
             AVDictionaryEntry *chmask;
 
-            ff_vorbis_comment(s, &dict, p, block_size, 0);
+            ff_vorbis_comment_read(s, &dict, p, block_size, 0);
             chmask = av_dict_get(dict, "WAVEFORMATEXTENSIBLE_CHANNEL_MASK", NULL, 0);
             if (chmask) {
                 uint64_t mask = strtol(chmask->value, NULL, 0);
@@ -2912,8 +2912,7 @@ static int mka_parse_audio(MatroskaTrack *track, AVStream *st,
     if (track->codec_delay > 0) {
         par->initial_padding = av_rescale_q(track->codec_delay,
                                             (AVRational){1, 1000000000},
-                                            (AVRational){1, par->codec_id == AV_CODEC_ID_OPUS ?
-                                                            48000 : par->sample_rate});
+                                            (AVRational){1, par->sample_rate});
         sti->skip_samples = par->initial_padding;
     }
     if (track->seek_preroll > 0) {
@@ -3506,7 +3505,8 @@ static int matroska_read_header(AVFormatContext *s)
 
     if (!matroska->time_scale)
         matroska->time_scale = 1000000;
-    if (isnan(matroska->duration))
+    if (isnan(matroska->duration) || matroska->duration < 0 ||
+        matroska->duration >= (double)INT64_MAX / matroska->time_scale)
         matroska->duration = 0;
     if (matroska->duration)
         matroska->ctx->duration = matroska->duration * matroska->time_scale *

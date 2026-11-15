@@ -107,6 +107,24 @@ FATE_FFMPEG-$(call FILTERDEMDEC, AMIX ARESAMPLE SINE, RAWVIDEO, \
 fate-shortest: tests/data/vsynth1.yuv
 fate-shortest: CMD = framecrc -auto_conversion_filters -f lavfi -i "sine=3000:d=10" -f lavfi -i "sine=1000:d=1" -sws_flags +accurate_rnd+bitexact -fflags +bitexact -flags +bitexact -idct simple -f rawvideo -s 352x288 -pix_fmt yuv420p -i $(TARGET_PATH)/tests/data/vsynth1.yuv -filter_complex "[0:a:0][1:a:0]amix=inputs=2[audio]" -map 2:v:0 -map "[audio]" -sws_flags +accurate_rnd+bitexact -fflags +bitexact -flags +bitexact -idct simple -dct fastint -qscale 10 -threads 1 -c:v mpeg4 -c:a ac3_fixed -shortest
 
+# -shortest used to stall when the audio frames reaching the sync queue were
+# smaller than the encoder frame size: the audio FIFO grew until
+# av_fifo_write() returned ENOSPC. Both sources share one lavfi input:
+# video produces two frames, but input EOF waits for the audio sink too,
+# so audio can run ahead without -re. d=45 (360000 frames at n=1) leaves
+# room for frames drained by the heartbeat over the 1 MiB / sizeof(void*)
+# FIFO limit (262144 entries on 32-bit, 131072 on 64-bit).
+FATE_FFMPEG-$(call ALLYES, LAVFI_INDEV COLOR_FILTER ANULLSRC_FILTER \
+                           ARESAMPLE_FILTER AFORMAT_FILTER \
+                           FORMAT_FILTER PCM_U8_DECODER \
+                           WRAPPED_AVFRAME_DECODER MPEG4_ENCODER \
+                           AAC_ENCODER NULL_MUXER) \
+                           += fate-ffmpeg-shortest-small-audio-frames
+fate-ffmpeg-shortest-small-audio-frames: CMP = null
+fate-ffmpeg-shortest-small-audio-frames: CMD = ffmpeg -auto_conversion_filters \
+    -f lavfi -i "color=s=16x16:r=1:d=2[out0];anullsrc=r=8000:cl=mono:n=1:d=45[out1]" \
+    -map 0:v -map 0:a -c:v mpeg4 -c:a aac -shortest -shortest_buf_duration 0.1 -f null -
+
 # test interleaving video with a sparse subtitle stream
 FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MATROSKA,, COLOR_FILTER VOBSUB_DEMUXER \
                            RAWVIDEO_ENCODER MATROSKA_MUXER) += fate-shortest-sub
@@ -424,6 +442,22 @@ fate-ffmpeg-filter-in-eof: CMD = framecrc                                       
     -filter_complex "[0][1]concat" -c:v rawvideo
 FATE_FFMPEG-$(call FRAMECRC, RAWVIDEO, RAWVIDEO, CONCAT_FILTER) += fate-ffmpeg-filter-in-eof
 
+# Test that the CLI does not deadlock when a filtergraph closes one of its
+# looped inputs (here via trim returning EOF) while other inputs are still
+# active; the closed input must no longer be chosen for receiving frames.
+# cf. #25548
+fate-ffmpeg-filter-closed-input: tests/data/vsynth1.yuv
+fate-ffmpeg-filter-closed-input: CMD = framecrc -auto_conversion_filters -filter_complex_threads 1 \
+    -stream_loop -1 -f rawvideo -s 352x288 -pix_fmt yuv420p -i $(TARGET_PATH)/tests/data/vsynth1.yuv \
+    -stream_loop -1 -f rawvideo -s 352x288 -pix_fmt yuv420p -i $(TARGET_PATH)/tests/data/vsynth1.yuv \
+    -stream_loop -1 -f rawvideo -s 352x288 -pix_fmt yuv420p -i $(TARGET_PATH)/tests/data/vsynth1.yuv \
+    -stream_loop -1 -f rawvideo -s 352x288 -pix_fmt yuv420p -i $(TARGET_PATH)/tests/data/vsynth1.yuv \
+    -filter_complex "[2:v][1:v]scale2ref=w=iw:h=ih[m][s1];[3:v][s1]scale2ref=w=iw:h=ih[f][s2];[f][m]alphamerge[k];[s2]vflip[bg];[bg][k]overlay=format=yuv420,null,null,null,null,null,null,null,null,trim=duration=1.64,setpts=PTS-STARTPTS[l];[0:v][l]overlay=format=yuv420:eof_action=pass[v]" \
+    -map "[v]" -t 3 -c:v rawvideo
+FATE_FFMPEG-$(call FRAMECRC, RAWVIDEO, RAWVIDEO, SCALE_FILTER SCALE2REF_FILTER \
+    ALPHAMERGE_FILTER VFLIP_FILTER OVERLAY_FILTER NULL_FILTER TRIM_FILTER      \
+    SETPTS_FILTER) += fate-ffmpeg-filter-closed-input
+
 # Test termination on streamcopy with -t as an output option.
 fate-ffmpeg-streamcopy-t: tests/data/vsynth1.yuv
 fate-ffmpeg-streamcopy-t: CMP = null
@@ -469,3 +503,7 @@ FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER) += fate-ffmpeg-heif
 # binding the internal filtegraph with a caller defined filtergraph
 fate-ffmpeg-heif-merge-filtergraph: CMD = framecrc -i $(TARGET_SAMPLES)/heif-conformance/C007.heic -filter_complex "sws_flags=+accurate_rnd+bitexact\;[0:g:0]scale=w=1280:h=720[out]" -map "[out]"
 FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER SCALE_FILTER) += fate-ffmpeg-heif-merge-filtergraph
+
+# alpha merging
+fate-ffmpeg-heif-merge-alpha: CMD = framecrc -auto_conversion_filters -i $(TARGET_SAMPLES)/heif/alpha.heic
+FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER SCALE_FILTER) += fate-ffmpeg-heif-merge-alpha

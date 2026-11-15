@@ -1,8 +1,10 @@
 /auenc
+/demux_probe
 /id3v2
 /id3v2enc
 /fifo_muxer
 /imf
+/mpegts_probe
 /mkdir
 /noproxy
 /rename
@@ -14,4 +16,3 @@
 /seek_utils
 /http
 /ogg_pages
-/hls

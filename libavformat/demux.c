@@ -186,7 +186,7 @@ static int init_input(AVFormatContext *s, const char *filename,
                                   s, 0, s->format_probesize);
 }
 
-static int codec_close(FFStream *sti);
+static int codec_close(AVFormatContext *s, FFStream *sti);
 
 static int update_stream_avctx(AVFormatContext *s)
 {
@@ -200,7 +200,7 @@ static int update_stream_avctx(AVFormatContext *s)
 
         if (avcodec_is_open(sti->avctx)) {
             av_log(s, AV_LOG_DEBUG, "Demuxer context update while decoder is open, closing and trying to re-open\n");
-            ret = codec_close(sti);
+            ret = codec_close(s, sti);
             sti->info->found_decoder = 0;
             if (ret < 0)
                 return ret;
@@ -1360,7 +1360,7 @@ static int64_t ts_to_samples(AVStream *st, int64_t ts)
     return av_rescale(ts, st->time_base.num * st->codecpar->sample_rate, st->time_base.den);
 }
 
-static int codec_close(FFStream *sti)
+static int codec_close(AVFormatContext *s, FFStream *sti)
 {
     AVCodecContext *avctx_new = NULL;
     AVCodecParameters *par_tmp = NULL;
@@ -1369,7 +1369,7 @@ static int codec_close(FFStream *sti)
 
     new_codec =
       (sti->avctx->codec_id != sti->pub.codecpar->codec_id) ?
-      avcodec_find_decoder(sti->pub.codecpar->codec_id) :
+      find_probe_decoder(s, &sti->pub, sti->pub.codecpar->codec_id) :
       sti->avctx->codec;
 
     avctx_new = avcodec_alloc_context3(new_codec);
@@ -1451,7 +1451,7 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
         if (sti->need_context_update) {
             if (avcodec_is_open(sti->avctx)) {
                 av_log(s, AV_LOG_DEBUG, "Demuxer context update while decoder is open, closing and trying to re-open\n");
-                ret = codec_close(sti);
+                ret = codec_close(s, sti);
                 sti->info->found_decoder = 0;
                 if (ret < 0)
                     return ret;
@@ -1583,7 +1583,8 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
                 if (first) {
                     if (par->initial_padding > 0)
                         skip = par->initial_padding;
-                } else if (!(sti->seek_to_start && pkt->pts != AV_NOPTS_VALUE && !in_priming)) {
+                } else if (sti->seek_preroll &&
+                           !(sti->seek_to_start && pkt->pts != AV_NOPTS_VALUE && !in_priming)) {
                     // Past the first packet, the decoder also misses what
                     // came before.
                     skip = FFMAX(skip, par->seek_preroll);
@@ -2973,8 +2974,15 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
                     sti->info->codec_info_duration = FFMIN(pkt->pts - st->start_time, sti->info->codec_info_duration + pkt->duration);
                 } else
                     sti->info->codec_info_duration += pkt->duration;
-                sti->info->codec_info_duration_fields += sti->parser && sti->need_parsing && fields
-                                                         ? sti->parser->repeat_pict + 1 : 2;
+                /* A corrupt packet may hold only part of a frame. Keep its
+                 * duration in the probing budget, but exclude it from FPS. */
+                if (avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                    !(pkt->flags & AV_PKT_FLAG_CORRUPT) &&
+                    pkt->duration < INT64_MAX - sti->info->fps_duration) {
+                    sti->info->fps_duration += pkt->duration;
+                    sti->info->codec_info_duration_fields += sti->parser && sti->need_parsing && fields
+                                                             ? sti->parser->repeat_pict + 1 : 2;
+                }
             }
         }
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -3074,18 +3082,18 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             /* estimate average framerate if not set by demuxer */
             if (sti->info->codec_info_duration_fields &&
                 !st->avg_frame_rate.num &&
-                sti->info->codec_info_duration) {
+                sti->info->fps_duration) {
                 int best_fps      = 0;
                 double best_error = 0.01;
                 AVRational codec_frame_rate = avctx->framerate;
 
-                if (sti->info->codec_info_duration        >= INT64_MAX / st->time_base.num / 2||
+                if (sti->info->fps_duration               >= INT64_MAX / st->time_base.num / 2||
                     sti->info->codec_info_duration_fields >= INT64_MAX / st->time_base.den ||
-                    sti->info->codec_info_duration        < 0)
+                    sti->info->fps_duration               < 0)
                     continue;
                 av_reduce(&st->avg_frame_rate.num, &st->avg_frame_rate.den,
                           sti->info->codec_info_duration_fields * (int64_t) st->time_base.den,
-                          sti->info->codec_info_duration * 2 * (int64_t) st->time_base.num, 60000);
+                          sti->info->fps_duration * 2 * (int64_t) st->time_base.num, 60000);
 
                 /* Round guessed framerate to a "standard" framerate if it's
                  * within 1% of the original estimate. */
@@ -3274,7 +3282,7 @@ find_stream_info_err:
         }
 
         if (avcodec_is_open(sti->avctx)) {
-            err = codec_close(sti);
+            err = codec_close(ic, sti);
             if (err < 0 && ret >= 0)
                 ret = err;
         }
